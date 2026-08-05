@@ -22,9 +22,10 @@ pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
 pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 15_000;
 
 /// How many times a UserOperation may be held for an unaffordable market before it is rejected.
-/// The delayed inbox backs off 5s → 5min, so 12 attempts ≈ 30 minutes of waiting — long enough to
-/// ride out ordinary volatility, short enough to stay inside the 1-hour status-record TTL so the
-/// wallet can still read the outcome.
+/// The delayed inbox doubles 5s → 5min and then holds there (5+10+20+40+80+160, then 300 each), so
+/// 12 attempts spend ~35 minutes waiting before the 13th evaluation rejects. Long enough to ride
+/// out ordinary volatility, and short enough to stay inside the 1-hour status-record TTL so the
+/// wallet can still read the outcome rather than getting `not_found`.
 pub const DEFAULT_SETTLEMENT_HOLD_MAX_ATTEMPTS: u32 = 12;
 
 /// Amount retained for the next treasury transfer without preventing a lightly funded chain from
