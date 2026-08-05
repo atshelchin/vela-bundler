@@ -12,6 +12,21 @@ use std::{
 /// Default in-band reimbursement multiplier: 1.4x the simulated outer transaction cost.
 pub const DEFAULT_SETTLEMENT_MARKUP_BPS: u64 = 14_000;
 
+/// Lowest outer fee cap the executor will sign for, as basis points of the latest base fee (the
+/// tip is added on top). The normal cap is 2x base fee — headroom for inclusion, not real cost,
+/// since a transaction only ever pays `base fee + tip`. When a payer's signed reimbursement
+/// cannot fund the 2x cap the executor may reprice down to what they did pay, but never below
+/// this floor: the relay cannot bump a signed transaction (the outbox broadcasts exact bytes), so
+/// an underpriced transaction would wedge its lane's nonce. 1.5x survives three consecutive
+/// blocks of maximum EIP-1559 base-fee growth (1.125^3 ≈ 1.42).
+pub const DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS: u64 = 15_000;
+
+/// How many times a UserOperation may be held for an unaffordable market before it is rejected.
+/// The delayed inbox backs off 5s → 5min, so 12 attempts ≈ 30 minutes of waiting — long enough to
+/// ride out ordinary volatility, short enough to stay inside the 1-hour status-record TTL so the
+/// wallet can still read the outcome.
+pub const DEFAULT_SETTLEMENT_HOLD_MAX_ATTEMPTS: u32 = 12;
+
 /// Amount retained for the next treasury transfer without preventing a lightly funded chain from
 /// serving the UserOperation that caused a relayer top-up.
 pub const DEFAULT_TREASURY_FLOOR_WEI: u128 = 100_000_000_000_000;
@@ -104,6 +119,8 @@ pub struct ExecutorConfig {
     pub gas_buffer_bps: u64,
     pub fixed_gas_buffer: u64,
     pub settlement_markup_bps: u64,
+    pub settlement_inclusion_floor_bps: u64,
+    pub settlement_hold_max_attempts: u32,
     pub relayer_float_min_wei: u128,
     pub relayer_float_target_wei: u128,
     pub relayer_float_cost_multiplier: u64,
@@ -303,6 +320,21 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
             "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS cannot be below 10000".into(),
         ));
     }
+    let settlement_inclusion_floor_bps = u64_value(
+        "VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS",
+        DEFAULT_SETTLEMENT_INCLUSION_FLOOR_BPS,
+    )?;
+    // At or below the base fee the transaction is not includable at all, and the executor has no
+    // fee-bump path to rescue it.
+    if settlement_inclusion_floor_bps <= 10_000 {
+        return Err(ConfigError(
+            "VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS must be above 10000".into(),
+        ));
+    }
+    let settlement_hold_max_attempts = u32_value(
+        "VELA_RELAY_EXECUTOR_SETTLEMENT_HOLD_MAX_ATTEMPTS",
+        DEFAULT_SETTLEMENT_HOLD_MAX_ATTEMPTS,
+    )?;
     let relayer_float_min_wei =
         u128_value("VELA_RELAY_EXECUTOR_FLOAT_MIN_WEI", 500_000_000_000_000)?;
     let relayer_float_target_wei = u128_value(
@@ -357,6 +389,8 @@ fn executor_config() -> Result<ExecutorConfig, ConfigError> {
         gas_buffer_bps: u64_value("VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,
         fixed_gas_buffer: u64_value("VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER", 30_000)?,
         settlement_markup_bps,
+        settlement_inclusion_floor_bps,
+        settlement_hold_max_attempts,
         relayer_float_min_wei,
         relayer_float_target_wei,
         // Keep an unpriced chain's relayer float comfortably ahead of the immediate bundle

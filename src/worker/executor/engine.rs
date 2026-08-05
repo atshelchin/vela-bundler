@@ -46,8 +46,9 @@ use super::{
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
     settlement::{
-        ChainAssetConfig, SettlementInput, SettlementLog, StablecoinConfig, USD_PRICE_DECIMALS,
-        evaluate_batch, parse_reimbursement, verify_stable_transfer_logs,
+        ChainAssetConfig, SettlementEvaluation, SettlementInput, SettlementLog, StablecoinConfig,
+        USD_PRICE_DECIMALS, affordable_fee_per_gas, evaluate_batch, inclusion_floor_fee_per_gas,
+        parse_reimbursement, verify_stable_transfer_logs,
     },
     simulation::{SimulationResult, SimulationVerdict, simulate_bundle, simulate_individually},
     transaction::{
@@ -118,6 +119,9 @@ struct BundleReplayAudit {
 #[derive(Clone, Debug)]
 struct TransactionContext {
     estimated_gas: U256,
+    /// Kept alongside the cap so a repriced bundle can still tell whether its lower cap clears
+    /// the inclusion floor.
+    base_fee_per_gas: u128,
     max_fee_per_gas: u128,
     max_priority_fee_per_gas: u128,
     nonce: u64,
@@ -1021,7 +1025,7 @@ impl ExecutorEngine {
                 .collect::<Vec<_>>(),
             self.treasury_address,
         );
-        let context = self
+        let mut context = self
             .transaction_context(chain_id, relayer, entry_point, &calldata)
             .await?;
         let allocations = allocate_bundle_gas(
@@ -1036,16 +1040,15 @@ impl ExecutorEngine {
             self.config.fixed_gas_buffer,
         )
         .ok_or_else(|| ExecutorItemError("bundle gas allocation overflow".into()))?;
-        let costs = allocations
-            .iter()
-            .map(|gas| {
-                native_cost(*gas, context.max_fee_per_gas)
-                    .ok_or_else(|| ExecutorItemError("bundle native cost overflow".into()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
         let settlement = self
-            .evaluate_settlement(chain_id, chain_assets, native_symbol, &survivors, &costs)
+            .settle_at_affordable_fee(
+                chain_id,
+                chain_assets,
+                native_symbol,
+                &survivors,
+                &allocations,
+                &mut context,
+            )
             .await?;
         // Settlement evidence must come from the exact final handleOps simulation. Individual
         // simulations run against a different pre-state; a prior operation in this bundle can
@@ -1068,38 +1071,53 @@ impl ExecutorEngine {
                 self.treasury_address,
                 &bundle_logs,
             );
-            if !evaluation.accepted() || !stable_logs_valid {
-                let reason = settlement_rejection_reason(
-                    evaluation.paid_amount,
-                    evaluation.required_amount,
-                    stable_logs_valid,
-                );
-                self.store
-                    .mark_rejected_with_executor_reason(
-                        &candidate.hash_string,
-                        "in_band_settlement",
-                        &reason,
-                    )
-                    .await
-                    .map_err(store_item_error)?;
-                results[candidate.result_index] = Some(Ok(()));
-                rejected_any = true;
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    payment_asset = ?evaluation.payment_asset,
-                    paid = %evaluation.paid_amount,
-                    required = %evaluation.required_amount,
-                    stable_logs_valid,
-                    "in-band settlement rejected UserOperation"
-                );
-                self.notify_executor_issue(
-                    chain_id,
-                    "in_band_settlement",
-                    &candidate.hash_string,
-                    &reason,
-                );
+            if evaluation.accepted() && stable_logs_valid {
+                continue;
             }
+            // A shortfall that survived repricing means the market is momentarily above what this
+            // payer signed for. Gas prices come back down; a signature the user already gave
+            // should wait for that rather than be thrown away. Holding moves the operation to the
+            // durable delayed inbox, which retries with backoff and — unlike leaving it on the
+            // Iggy offset — does not stall every other payer queued behind it.
+            if evaluation.is_shortfall()
+                && stable_logs_valid
+                && self
+                    .hold_for_affordable_market(chain_id, candidate, evaluation, results)
+                    .await?
+            {
+                rejected_any = true;
+                continue;
+            }
+            let reason = settlement_rejection_reason(
+                evaluation.paid_amount,
+                evaluation.required_amount,
+                stable_logs_valid,
+            );
+            self.store
+                .mark_rejected_with_executor_reason(
+                    &candidate.hash_string,
+                    "in_band_settlement",
+                    &reason,
+                )
+                .await
+                .map_err(store_item_error)?;
+            results[candidate.result_index] = Some(Ok(()));
+            rejected_any = true;
+            tracing::warn!(
+                chain_id,
+                user_operation_hash = %candidate.hash_string,
+                payment_asset = ?evaluation.payment_asset,
+                paid = %evaluation.paid_amount,
+                required = %evaluation.required_amount,
+                stable_logs_valid,
+                "in-band settlement rejected UserOperation"
+            );
+            self.notify_executor_issue(
+                chain_id,
+                "in_band_settlement",
+                &candidate.hash_string,
+                &reason,
+            );
         }
         if rejected_any {
             // Reassemble on the next queue delivery so the cost allocation and aggregate estimate
@@ -1787,11 +1805,180 @@ impl ExecutorEngine {
 
         Ok(TransactionContext {
             estimated_gas,
+            base_fee_per_gas: base_fee,
             max_fee_per_gas,
             max_priority_fee_per_gas: tip,
             nonce,
             relayer_balance,
         })
+    }
+
+    /// Parks a UserOperation whose signed reimbursement the current market has priced out.
+    ///
+    /// Returns `true` when the operation is now owned by the delayed inbox and the caller should
+    /// drop it from this bundle, `false` when its waiting budget is spent and it must be rejected
+    /// so the wallet can tell the user to resend at today's prices. A hold that exceeds the budget
+    /// leaves one scheduled delayed entry behind; the next claim sees a durable `rejected` status,
+    /// acks, and removes it.
+    async fn hold_for_affordable_market(
+        &self,
+        chain_id: u64,
+        candidate: &Candidate,
+        evaluation: &SettlementEvaluation,
+        results: &mut [Option<Result<(), UserOperationHandlerError>>],
+    ) -> Result<bool, ExecutorItemError> {
+        let attempt = match self
+            .store
+            .defer_user_operation(&candidate.delayed_operation, self.delayed_payload_ttl())
+            .await
+        {
+            Ok(attempt) => attempt,
+            Err(error) => {
+                tracing::warn!(
+                    chain_id,
+                    user_operation_hash = %candidate.hash_string,
+                    %error,
+                    "could not hold UserOperation for a cheaper market"
+                );
+                return Ok(false);
+            }
+        };
+        if attempt > self.config.settlement_hold_max_attempts {
+            tracing::warn!(
+                chain_id,
+                user_operation_hash = %candidate.hash_string,
+                attempt,
+                paid = %evaluation.paid_amount,
+                required = %evaluation.required_amount,
+                "in-band reimbursement stayed unaffordable for the whole hold budget"
+            );
+            return Ok(false);
+        }
+        let reason = settlement_hold_reason(
+            evaluation.paid_amount,
+            evaluation.required_amount,
+            attempt,
+            self.config.settlement_hold_max_attempts,
+        );
+        self.record_executor_deferred(
+            chain_id,
+            &candidate.hash_string,
+            "in_band_settlement_hold",
+            &reason,
+        )
+        .await;
+        // Redis owns a complete copy now, so letting Iggy advance keeps at-least-once execution
+        // while unblocking every operation queued behind this one.
+        results[candidate.result_index] = Some(Ok(()));
+        tracing::info!(
+            chain_id,
+            user_operation_hash = %candidate.hash_string,
+            attempt,
+            paid = %evaluation.paid_amount,
+            required = %evaluation.required_amount,
+            "holding UserOperation until the market fits its signed reimbursement"
+        );
+        Ok(true)
+    }
+
+    /// Settles the bundle at a fee the payers can actually fund.
+    ///
+    /// The quoted cap is `2 × base fee + tip`. That multiple buys inclusion headroom, not cost —
+    /// the chain only ever charges `base fee + tip` — so a reimbursement that falls short of the
+    /// requirement at the quoted cap is usually still a perfectly good payment at a lower one.
+    /// Rather than refuse a signature the user already gave, the executor treats that signed
+    /// reimbursement as the budget and reprices the outer transaction down into it, provided the
+    /// result still clears the inclusion floor. The markup survives untouched: the requirement is
+    /// linear in the cap, so paying `markup × gas × new cap` still covers `markup ×` whatever the
+    /// chain charges, which can never exceed the new cap.
+    ///
+    /// Repricing only ever lowers the cap, so an operation accepted at the quoted fee stays
+    /// accepted. Anything still short after this is genuinely unaffordable at the current market
+    /// and is held, not rejected — see the settlement gate in `execute_bundle`.
+    async fn settle_at_affordable_fee(
+        &self,
+        chain_id: u64,
+        chain_assets: &ChainAssetConfig,
+        native_symbol: &str,
+        candidates: &[Candidate],
+        allocations: &[U256],
+        context: &mut TransactionContext,
+    ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
+        let costs_at = |fee: u128| -> Result<Vec<U256>, ExecutorItemError> {
+            allocations
+                .iter()
+                .map(|gas| {
+                    native_cost(*gas, fee)
+                        .ok_or_else(|| ExecutorItemError("bundle native cost overflow".into()))
+                })
+                .collect()
+        };
+
+        let quoted_fee = context.max_fee_per_gas;
+        let settlement = self
+            .evaluate_settlement(
+                chain_id,
+                chain_assets,
+                native_symbol,
+                candidates,
+                &costs_at(quoted_fee)?,
+            )
+            .await?;
+        // Nothing to renegotiate, or a rejection no price can cure (malformed calldata, an
+        // unsupported asset): leave the quote alone and let the gate speak.
+        if settlement.all_accepted()
+            || settlement
+                .operations
+                .iter()
+                .any(|evaluation| !evaluation.accepted() && !evaluation.is_shortfall())
+        {
+            return Ok(settlement);
+        }
+
+        let Some(affordable) = affordable_fee_per_gas(quoted_fee, &settlement.operations) else {
+            return Ok(settlement);
+        };
+        let Some(floor) = inclusion_floor_fee_per_gas(
+            context.base_fee_per_gas,
+            context.max_priority_fee_per_gas,
+            self.config.settlement_inclusion_floor_bps,
+        ) else {
+            return Ok(settlement);
+        };
+        if affordable < floor || affordable >= quoted_fee {
+            tracing::info!(
+                chain_id,
+                quoted_fee,
+                affordable,
+                floor,
+                base_fee = context.base_fee_per_gas,
+                "in-band reimbursement cannot fund an includable outer fee"
+            );
+            return Ok(settlement);
+        }
+
+        let repriced = self
+            .evaluate_settlement(
+                chain_id,
+                chain_assets,
+                native_symbol,
+                candidates,
+                &costs_at(affordable)?,
+            )
+            .await?;
+        if !repriced.all_accepted() {
+            return Ok(settlement);
+        }
+        tracing::info!(
+            chain_id,
+            quoted_fee,
+            repriced_fee = affordable,
+            base_fee = context.base_fee_per_gas,
+            tip = context.max_priority_fee_per_gas,
+            "repriced the outer transaction to the signed in-band budget"
+        );
+        context.max_fee_per_gas = affordable;
+        Ok(repriced)
     }
 
     async fn evaluate_settlement(
@@ -3303,6 +3490,16 @@ fn treasury_affordable_top_up(
 ) -> Option<U256> {
     let amount = capped_amount.min(treasury_balance.saturating_sub(protected_treasury));
     (amount >= deficit).then_some(amount)
+}
+
+/// The diagnostic a held operation carries while it waits. Deliberately distinct from
+/// `settlement_rejection_reason` — a wallet polling the status endpoint must be able to tell
+/// "still going, waiting for gas to come down" from "this will never execute".
+fn settlement_hold_reason(paid: U256, required: U256, attempt: u32, max_attempts: u32) -> String {
+    format!(
+        "waiting for network fees to fit the signed in-band reimbursement: paid={paid}, required={required}, shortfall={}, attempt={attempt}/{max_attempts}",
+        required.saturating_sub(paid)
+    )
 }
 
 fn settlement_rejection_reason(paid: U256, required: U256, stable_logs_valid: bool) -> String {

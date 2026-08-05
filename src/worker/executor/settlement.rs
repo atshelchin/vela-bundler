@@ -73,6 +73,62 @@ impl SettlementEvaluation {
     pub(crate) fn accepted(&self) -> bool {
         self.rejection.is_none()
     }
+
+    /// A shortfall is the one rejection a lower outer fee, or simply a calmer market, can still
+    /// satisfy: the payment itself parsed and went to the right recipient, there just was not
+    /// enough of it at the price this attempt quoted. Every other rejection is a property of the
+    /// signed calldata and can never become payable.
+    pub(crate) fn is_shortfall(&self) -> bool {
+        matches!(
+            self.rejection,
+            Some(SettlementRejection::InsufficientPayment)
+        )
+    }
+
+    /// What fraction of the required amount this operation actually paid, in basis points,
+    /// saturating at `u64::MAX`. Asset-agnostic: `paid` and `required` are always in the same
+    /// unit, and the requirement is linear in the outer fee, so this ratio applied to the quoted
+    /// fee gives the fee this payer can afford. A zero requirement reads as fully paid.
+    pub(crate) fn paid_ratio_bps(&self) -> u64 {
+        if self.required_amount.is_zero() {
+            return 10_000;
+        }
+        let scaled = widen_u256(self.paid_amount) * widen_u256(U256::from(10_000u64));
+        let ratio = scaled / widen_u256(self.required_amount);
+        u64::try_from(ratio).unwrap_or(u64::MAX)
+    }
+}
+
+/// The outer fee cap a bundle's weakest payer can fund, given the fee this attempt quoted.
+///
+/// The quoted cap is `2 × base fee + tip`, which is inclusion headroom rather than cost — the
+/// transaction only ever pays `base fee + tip`. So when a payer falls short of the requirement at
+/// the quoted cap, repricing the bundle down to what they did pay keeps the relay's markup fully
+/// intact: the reimbursement covers `markup × gas × new cap`, and the chain can never charge more
+/// than `new cap`. Returns `None` when nothing is affordable.
+pub(crate) fn affordable_fee_per_gas(
+    quoted_max_fee_per_gas: u128,
+    evaluations: &[SettlementEvaluation],
+) -> Option<u128> {
+    let weakest = evaluations
+        .iter()
+        .map(SettlementEvaluation::paid_ratio_bps)
+        .min()?;
+    let affordable = quoted_max_fee_per_gas.checked_mul(u128::from(weakest.min(10_000)))? / 10_000;
+    (affordable > 0).then_some(affordable)
+}
+
+/// The lowest fee cap worth signing: `floor_bps` of the base fee, plus the tip. Below this the
+/// transaction risks sitting unmined, and the executor has no fee-bump path to rescue it.
+pub(crate) fn inclusion_floor_fee_per_gas(
+    base_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    floor_bps: u64,
+) -> Option<u128> {
+    base_fee_per_gas
+        .checked_mul(u128::from(floor_bps))
+        .map(|scaled| scaled / 10_000)?
+        .checked_add(max_priority_fee_per_gas)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -546,14 +602,112 @@ mod tests {
     use alloy::primitives::{Address, B256, U256, address, keccak256};
 
     use super::{
-        ChainAssetConfig, ReimbursementParseError, SettlementInput, SettlementLog,
-        SettlementRejection, StablecoinConfig, evaluate_batch, native_to_usd_stable_ceil,
-        parse_reimbursement, verify_stable_transfer_logs,
+        ChainAssetConfig, Reimbursement, ReimbursementParseError, SettlementEvaluation,
+        SettlementInput, SettlementLog, SettlementRejection, StablecoinConfig,
+        affordable_fee_per_gas, evaluate_batch, inclusion_floor_fee_per_gas,
+        native_to_usd_stable_ceil, parse_reimbursement, verify_stable_transfer_logs,
     };
 
     const RECIPIENT: Address = address!("1111111111111111111111111111111111111111");
     const STABLECOIN: Address = address!("2222222222222222222222222222222222222222");
     const SENDER: Address = address!("6666666666666666666666666666666666666666");
+
+    fn evaluation(
+        paid: u128,
+        required: u128,
+        rejection: Option<SettlementRejection>,
+    ) -> SettlementEvaluation {
+        SettlementEvaluation {
+            reimbursement: Reimbursement::default(),
+            gas_native_cost: U256::from(required),
+            payment_asset: None,
+            paid_amount: U256::from(paid),
+            required_amount: U256::from(required),
+            rejection,
+        }
+    }
+
+    #[test]
+    fn a_fully_paid_operation_reprices_to_nothing_lower() {
+        let paid = evaluation(1_000, 1_000, None);
+        assert_eq!(paid.paid_ratio_bps(), 10_000);
+        assert_eq!(affordable_fee_per_gas(100, &[paid]), Some(100));
+    }
+
+    #[test]
+    fn the_weakest_payer_sets_the_bundle_fee() {
+        // 99.13% paid — the exact shortfall from issue #137's rejected payroll.
+        let short = evaluation(
+            4_603_572_816_058_075_872,
+            4_643_859_330_530_512_244,
+            Some(SettlementRejection::InsufficientPayment),
+        );
+        assert_eq!(short.paid_ratio_bps(), 9_913);
+        let generous = evaluation(3_000, 1_000, None);
+        // 100 gwei quoted → the bundle reprices to what the weakest payer funded, not the average.
+        assert_eq!(
+            affordable_fee_per_gas(100_000_000_000, &[generous, short]),
+            Some(99_130_000_000),
+        );
+    }
+
+    #[test]
+    fn repricing_never_raises_the_quoted_fee() {
+        let overpaid = evaluation(10_000, 1_000, None);
+        assert_eq!(affordable_fee_per_gas(500, &[overpaid]), Some(500));
+    }
+
+    #[test]
+    fn a_zero_requirement_reads_as_fully_paid() {
+        assert_eq!(evaluation(0, 0, None).paid_ratio_bps(), 10_000);
+    }
+
+    #[test]
+    fn a_payment_far_below_the_requirement_reprices_toward_zero() {
+        let dust = evaluation(1, 1_000_000, Some(SettlementRejection::InsufficientPayment));
+        assert_eq!(dust.paid_ratio_bps(), 0);
+        assert_eq!(affordable_fee_per_gas(100, &[dust]), None);
+    }
+
+    #[test]
+    fn only_an_insufficient_payment_counts_as_a_shortfall() {
+        assert!(evaluation(1, 2, Some(SettlementRejection::InsufficientPayment)).is_shortfall());
+        for terminal in [
+            SettlementRejection::MalformedCallData,
+            SettlementRejection::ArithmeticOverflow,
+            SettlementRejection::UnsupportedPaymentCombination,
+        ] {
+            assert!(!evaluation(1, 2, Some(terminal)).is_shortfall());
+        }
+        assert!(!evaluation(2, 2, None).is_shortfall());
+    }
+
+    #[test]
+    fn the_inclusion_floor_scales_the_base_fee_and_adds_the_tip() {
+        // 1.5x of a 100 gwei base fee, plus a 30 gwei tip.
+        assert_eq!(
+            inclusion_floor_fee_per_gas(100_000_000_000, 30_000_000_000, 15_000),
+            Some(180_000_000_000),
+        );
+    }
+
+    #[test]
+    fn the_issue_137_shortfall_still_clears_the_inclusion_floor() {
+        // The rejected payroll: 5,478,008 gas at a 2x base-fee cap, 0.87% underpaid.
+        let base_fee = 93_000_000_000u128;
+        let tip = 94_000_000_000u128;
+        let quoted = base_fee * 2 + tip;
+        let short = evaluation(
+            9_913,
+            10_000,
+            Some(SettlementRejection::InsufficientPayment),
+        );
+        let affordable = affordable_fee_per_gas(quoted, &[short]).unwrap();
+        let floor = inclusion_floor_fee_per_gas(base_fee, tip, 15_000).unwrap();
+        assert!(affordable >= floor, "affordable={affordable} floor={floor}");
+        // And the repriced cap still covers what the chain actually charges.
+        assert!(affordable >= base_fee + tip);
+    }
 
     #[test]
     fn parses_values_above_u128_without_saturation() {
