@@ -35,6 +35,7 @@ pub const DEFAULT_CONSUMER_GROUP: &str = "vela-relay-user-operations-v1";
 const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_EMPTY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEFAULT_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
 const DEFAULT_BATCH_SIZE: u32 = 100;
 const MAX_BATCH_SIZE: u32 = 10_000;
 
@@ -159,21 +160,36 @@ impl UserOperationConsumerConfig {
 }
 
 #[derive(Debug)]
-pub struct UserOperationConsumerError(String);
+pub struct UserOperationConsumerError {
+    message: String,
+    session: bool,
+}
 
 impl UserOperationConsumerError {
     fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self {
+            message: message.into(),
+            session: false,
+        }
     }
 
     fn iggy(action: &'static str, error: IggyError) -> Self {
-        Self(format!("{action}: {error}"))
+        Self {
+            message: format!("{action}: {error}"),
+            session: crate::utils::iggy::is_session_error(&error),
+        }
+    }
+
+    /// True when the shared Iggy client's session is dead (dropped, deauthenticated, or forgotten
+    /// by the server) and no retry on the same client can succeed — only a fresh connection can.
+    pub fn is_session_error(&self) -> bool {
+        self.session
     }
 }
 
 impl Display for UserOperationConsumerError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(&self.message)
     }
 }
 
@@ -192,13 +208,7 @@ impl UserOperationConsumer {
         handler: Arc<dyn UserOperationHandler>,
     ) -> Result<Self, UserOperationConsumerError> {
         config.validate()?;
-        let client =
-            IggyClient::from_connection_string(&config.connection_string).map_err(|error| {
-                UserOperationConsumerError::iggy("invalid Iggy consumer connection", error)
-            })?;
-        client.connect().await.map_err(|error| {
-            UserOperationConsumerError::iggy("could not connect Iggy consumer", error)
-        })?;
+        let client = connect_client(&config).await?;
 
         Ok(Self {
             client: Arc::new(client),
@@ -222,7 +232,7 @@ impl UserOperationConsumer {
     /// Starts from an already-discovered topology, avoiding a duplicate metadata request during
     /// worker readiness initialization.
     pub async fn run_with_discovered_chain_streams(
-        self,
+        mut self,
         streams: Vec<ChainStream>,
         shutdown: CancellationToken,
     ) -> Result<(), UserOperationConsumerError> {
@@ -259,6 +269,29 @@ impl UserOperationConsumer {
                             self.handler.clone(),
                             &shutdown,
                         ),
+                        Err(error) if error.is_session_error() => {
+                            tracing::warn!(
+                                %error,
+                                "Iggy consumer session is dead, rebuilding the connection"
+                            );
+                            if self.rebuild_connection(&mut active, &mut retiring, &shutdown).await {
+                                match self.discover_chain_streams().await {
+                                    Ok(streams) => reconcile_dispatchers(
+                                        &mut active,
+                                        &mut retiring,
+                                        streams,
+                                        self.client.clone(),
+                                        self.config.clone(),
+                                        self.handler.clone(),
+                                        &shutdown,
+                                    ),
+                                    Err(error) => tracing::warn!(
+                                        %error,
+                                        "Iggy chain stream discovery failed after reconnect"
+                                    ),
+                                }
+                            }
+                        }
                         Err(error) => {
                             tracing::warn!(%error, "Iggy chain stream discovery failed");
                         }
@@ -282,6 +315,72 @@ impl UserOperationConsumer {
         }
         Ok(())
     }
+
+    /// Replaces a dead shared client with a freshly connected one.
+    ///
+    /// Every dispatcher holds a clone of the dead client, so they are all stopped first; the
+    /// caller re-reconciles them against the new client afterwards. Connection attempts retry
+    /// with capped exponential backoff until they succeed or shutdown is requested. Returns
+    /// false only when shutdown interrupted the rebuild.
+    async fn rebuild_connection(
+        &mut self,
+        active: &mut HashMap<u64, StreamDispatcher>,
+        retiring: &mut Vec<JoinHandle<()>>,
+        shutdown: &CancellationToken,
+    ) -> bool {
+        for (_, dispatcher) in active.drain() {
+            dispatcher.shutdown.cancel();
+            retiring.push(dispatcher.task);
+        }
+        for task in retiring.drain(..) {
+            if let Err(error) = task.await {
+                tracing::warn!(?error, "Iggy stream dispatcher stopped unexpectedly");
+            }
+        }
+        if let Err(error) = self.client.shutdown().await {
+            tracing::debug!(%error, "could not cleanly shut down the dead Iggy consumer client");
+        }
+
+        let mut backoff = self.config.retry_interval;
+        loop {
+            let connected = tokio::select! {
+                _ = shutdown.cancelled() => return false,
+                result = connect_client(&self.config) => result,
+            };
+            match connected {
+                Ok(client) => {
+                    self.client = Arc::new(client);
+                    tracing::info!("Iggy consumer connection re-established");
+                    return true;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        retry_in_secs = backoff.as_secs(),
+                        "could not re-establish Iggy consumer connection"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return false,
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+        }
+    }
+}
+
+async fn connect_client(
+    config: &UserOperationConsumerConfig,
+) -> Result<IggyClient, UserOperationConsumerError> {
+    let client =
+        IggyClient::from_connection_string(&config.connection_string).map_err(|error| {
+            UserOperationConsumerError::iggy("invalid Iggy consumer connection", error)
+        })?;
+    client.connect().await.map_err(|error| {
+        UserOperationConsumerError::iggy("could not connect Iggy consumer", error)
+    })?;
+    Ok(client)
 }
 
 struct StreamDispatcher {
@@ -1006,6 +1105,21 @@ mod tests {
         let mut message = IggyMessage::from_str(&payload.to_string()).unwrap();
         message.header.offset = offset;
         message
+    }
+
+    #[test]
+    fn propagates_session_classification_from_iggy_errors() {
+        use iggy::prelude::IggyError;
+
+        use super::UserOperationConsumerError;
+
+        assert!(
+            UserOperationConsumerError::iggy("test", IggyError::Unauthenticated).is_session_error()
+        );
+        assert!(
+            !UserOperationConsumerError::iggy("test", IggyError::InvalidCommand).is_session_error()
+        );
+        assert!(!UserOperationConsumerError::new("test").is_session_error());
     }
 
     #[test]

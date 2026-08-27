@@ -6,12 +6,15 @@ use std::{
 };
 
 use iggy::prelude::{
-    Client, CompressionAlgorithm, Identifier, IggyClient, IggyDuration, IggyExpiry, IggyMessage,
+    CompressionAlgorithm, Identifier, IggyClient, IggyDuration, IggyError, IggyExpiry, IggyMessage,
     MaxTopicSize, MessageClient, Partitioning, StreamClient, TopicClient,
 };
 use serde_json::Value;
 
-use crate::utils::config::IggyConfig;
+use crate::utils::{
+    config::IggyConfig,
+    iggy::{ReconnectingIggyClient, is_session_error},
+};
 
 /// Retention of automatically provisioned UserOperation topics. Redis delayed payloads must live
 /// at least this long after their latest retry because their original Iggy offset is acknowledged.
@@ -24,7 +27,7 @@ pub(crate) const USER_OPERATION_QUEUE_RETENTION: Duration = Duration::from_secs(
 /// was appended: the connection can fail after Iggy commits but before its acknowledgement arrives.
 #[derive(Clone)]
 pub struct UserOperationQueue {
-    client: Arc<IggyClient>,
+    client: ReconnectingIggyClient,
     topic: Identifier,
     topic_name: String,
     enqueue_timeout: Duration,
@@ -33,16 +36,41 @@ pub struct UserOperationQueue {
 
 #[derive(Clone)]
 struct ChainTopologyProvisioner {
-    client: Arc<IggyClient>,
+    client: ReconnectingIggyClient,
     provision_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Debug)]
-pub struct UserOperationQueueError(&'static str);
+pub struct UserOperationQueueError {
+    message: &'static str,
+    session: bool,
+}
+
+impl UserOperationQueueError {
+    fn new(message: &'static str) -> Self {
+        Self {
+            message,
+            session: false,
+        }
+    }
+
+    fn iggy(message: &'static str, error: &IggyError) -> Self {
+        Self {
+            message,
+            session: is_session_error(error),
+        }
+    }
+
+    /// True when the failure came from a dead Iggy session, so a retry only makes sense on a
+    /// freshly rebuilt connection.
+    fn is_session_error(&self) -> bool {
+        self.session
+    }
+}
 
 impl Display for UserOperationQueueError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.0)
+        formatter.write_str(self.message)
     }
 }
 
@@ -53,22 +81,22 @@ impl UserOperationQueue {
     /// producer credentials, but can use separately privileged credentials in production. It
     /// creates a stream only when the first producer write proves the stream or topic is absent.
     pub async fn connect(config: &IggyConfig) -> Result<Self, UserOperationQueueError> {
-        let client = IggyClient::from_connection_string(&config.url)
-            .map_err(|_| UserOperationQueueError("invalid Iggy connection configuration"))?;
-        client
-            .connect()
-            .await
-            .map_err(|_| UserOperationQueueError("could not connect to Iggy"))?;
+        let client =
+            ReconnectingIggyClient::connect(&config.url, "producer", config.enqueue_timeout)
+                .await
+                .map_err(|_| UserOperationQueueError::new("could not connect to Iggy"))?;
 
-        let provisioner_client = IggyClient::from_connection_string(&config.provisioner_url)
-            .map_err(|_| {
-                UserOperationQueueError("invalid Iggy provisioner connection configuration")
-            })?;
-        provisioner_client.connect().await.map_err(|_| {
-            UserOperationQueueError("could not connect to Iggy topology provisioner")
+        let provisioner_client = ReconnectingIggyClient::connect(
+            &config.provisioner_url,
+            "topology-provisioner",
+            config.enqueue_timeout,
+        )
+        .await
+        .map_err(|_| {
+            UserOperationQueueError::new("could not connect to Iggy topology provisioner")
         })?;
         let topology_provisioner = ChainTopologyProvisioner {
-            client: Arc::new(provisioner_client),
+            client: provisioner_client,
             provision_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
 
@@ -76,7 +104,7 @@ impl UserOperationQueue {
             .topic
             .as_str()
             .try_into()
-            .map_err(|_| UserOperationQueueError("invalid Iggy topic name"))?;
+            .map_err(|_| UserOperationQueueError::new("invalid Iggy topic name"))?;
         tracing::info!(
             topic = %config.topic,
             automatic_topology_provisioning = true,
@@ -84,7 +112,7 @@ impl UserOperationQueue {
         );
 
         Ok(Self {
-            client: Arc::new(client),
+            client,
             topic,
             topic_name: config.topic.clone(),
             enqueue_timeout: config.enqueue_timeout,
@@ -106,7 +134,7 @@ impl UserOperationQueue {
         operation: &Value,
     ) -> Result<(), UserOperationQueueError> {
         let payload = serde_json::to_string(operation).map_err(|_| {
-            UserOperationQueueError("could not serialize UserOperation queue entry")
+            UserOperationQueueError::new("could not serialize UserOperation queue entry")
         })?;
         let stream = stream_for_chain(chain_id)?;
         let stream_name = stream_name_for_chain(chain_id);
@@ -124,7 +152,9 @@ impl UserOperationQueue {
                     ),
                 )
                 .await
-                .map_err(|_| UserOperationQueueError("Iggy topology provisioning timed out"))??;
+                .map_err(|_| {
+                    UserOperationQueueError::new("Iggy topology provisioning timed out")
+                })??;
                 if !topology_was_created {
                     return Err(send_error);
                 }
@@ -139,13 +169,36 @@ impl UserOperationQueue {
         stream: &Identifier,
         payload: &str,
     ) -> Result<(), UserOperationQueueError> {
+        let client = self.client.get().await;
+        match self.append_with(&client, stream, payload).await {
+            // A dead session fails every command until the shared client is rebuilt. The retry
+            // is safe under the at-least-once admission contract: consumers are idempotent, so a
+            // write that committed before the session died only produces a duplicate.
+            Err(error) if error.is_session_error() => {
+                self.client
+                    .reconnect_if_current(&client)
+                    .await
+                    .map_err(|_| UserOperationQueueError::new("could not reconnect to Iggy"))?;
+                let client = self.client.get().await;
+                self.append_with(&client, stream, payload).await
+            }
+            result => result,
+        }
+    }
+
+    async fn append_with(
+        &self,
+        client: &IggyClient,
+        stream: &Identifier,
+        payload: &str,
+    ) -> Result<(), UserOperationQueueError> {
         let message = IggyMessage::from_str(payload)
-            .map_err(|_| UserOperationQueueError("UserOperation queue entry is invalid"))?;
+            .map_err(|_| UserOperationQueueError::new("UserOperation queue entry is invalid"))?;
         let mut messages = [message];
 
         match tokio::time::timeout(
             self.enqueue_timeout,
-            self.client.send_messages(
+            client.send_messages(
                 stream,
                 &self.topic,
                 &Partitioning::balanced(),
@@ -155,10 +208,11 @@ impl UserOperationQueue {
         .await
         {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(_)) => Err(UserOperationQueueError(
+            Ok(Err(error)) => Err(UserOperationQueueError::iggy(
                 "Iggy rejected the UserOperation queue entry",
+                &error,
             )),
-            Err(_) => Err(UserOperationQueueError(
+            Err(_) => Err(UserOperationQueueError::new(
                 "Iggy UserOperation queue write timed out",
             )),
         }
@@ -178,25 +232,51 @@ impl ChainTopologyProvisioner {
         topic_name: &str,
     ) -> Result<bool, UserOperationQueueError> {
         let _lock = self.provision_lock.lock().await;
-        let stream_was_missing = self
-            .client
+        let client = self.client.get().await;
+        match Self::ensure_with_client(&client, stream, stream_name, topic, topic_name).await {
+            Err(error) if error.is_session_error() => {
+                self.client
+                    .reconnect_if_current(&client)
+                    .await
+                    .map_err(|_| {
+                        UserOperationQueueError::new(
+                            "could not reconnect to Iggy topology provisioner",
+                        )
+                    })?;
+                let client = self.client.get().await;
+                Self::ensure_with_client(&client, stream, stream_name, topic, topic_name).await
+            }
+            result => result,
+        }
+    }
+
+    async fn ensure_with_client(
+        client: &IggyClient,
+        stream: &Identifier,
+        stream_name: &str,
+        topic: &Identifier,
+        topic_name: &str,
+    ) -> Result<bool, UserOperationQueueError> {
+        let stream_was_missing = client
             .get_stream(stream)
             .await
-            .map_err(|_| UserOperationQueueError("could not inspect Iggy chain stream"))?
+            .map_err(|error| {
+                UserOperationQueueError::iggy("could not inspect Iggy chain stream", &error)
+            })?
             .is_none();
         if stream_was_missing {
-            self.create_stream_if_missing(stream, stream_name).await?;
+            Self::create_stream_if_missing(client, stream, stream_name).await?;
         }
 
-        let topic_was_missing = self
-            .client
+        let topic_was_missing = client
             .get_topic(stream, topic)
             .await
-            .map_err(|_| UserOperationQueueError("could not inspect Iggy chain topic"))?
+            .map_err(|error| {
+                UserOperationQueueError::iggy("could not inspect Iggy chain topic", &error)
+            })?
             .is_none();
         if topic_was_missing {
-            self.create_topic_if_missing(stream, topic, topic_name)
-                .await?;
+            Self::create_topic_if_missing(client, stream, topic, topic_name).await?;
         }
 
         if stream_was_missing || topic_was_missing {
@@ -210,38 +290,38 @@ impl ChainTopologyProvisioner {
     }
 
     async fn create_stream_if_missing(
-        &self,
+        client: &IggyClient,
         stream: &Identifier,
         stream_name: &str,
     ) -> Result<(), UserOperationQueueError> {
-        if self.client.create_stream(stream_name).await.is_ok() {
+        if client.create_stream(stream_name).await.is_ok() {
             return Ok(());
         }
 
-        if self
-            .client
+        if client
             .get_stream(stream)
             .await
-            .map_err(|_| UserOperationQueueError("could not inspect Iggy chain stream"))?
+            .map_err(|error| {
+                UserOperationQueueError::iggy("could not inspect Iggy chain stream", &error)
+            })?
             .is_some()
         {
             return Ok(());
         }
 
-        Err(UserOperationQueueError(
+        Err(UserOperationQueueError::new(
             "could not create Iggy chain stream",
         ))
     }
 
     async fn create_topic_if_missing(
-        &self,
+        client: &IggyClient,
         stream: &Identifier,
         topic: &Identifier,
         topic_name: &str,
     ) -> Result<(), UserOperationQueueError> {
         let expiry = IggyExpiry::ExpireDuration(IggyDuration::new(USER_OPERATION_QUEUE_RETENTION));
-        if self
-            .client
+        if client
             .create_topic(
                 stream,
                 topic_name,
@@ -257,17 +337,20 @@ impl ChainTopologyProvisioner {
             return Ok(());
         }
 
-        if self
-            .client
+        if client
             .get_topic(stream, topic)
             .await
-            .map_err(|_| UserOperationQueueError("could not inspect Iggy chain topic"))?
+            .map_err(|error| {
+                UserOperationQueueError::iggy("could not inspect Iggy chain topic", &error)
+            })?
             .is_some()
         {
             return Ok(());
         }
 
-        Err(UserOperationQueueError("could not create Iggy chain topic"))
+        Err(UserOperationQueueError::new(
+            "could not create Iggy chain topic",
+        ))
     }
 }
 
@@ -275,7 +358,7 @@ fn stream_for_chain(chain_id: u64) -> Result<Identifier, UserOperationQueueError
     stream_name_for_chain(chain_id)
         .as_str()
         .try_into()
-        .map_err(|_| UserOperationQueueError("invalid Iggy stream name for chain"))
+        .map_err(|_| UserOperationQueueError::new("invalid Iggy stream name for chain"))
 }
 
 fn stream_name_for_chain(chain_id: u64) -> String {

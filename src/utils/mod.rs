@@ -1,5 +1,6 @@
 pub mod alchemy;
 pub mod config;
+pub(crate) mod iggy;
 pub mod logging;
 pub mod market;
 pub mod rpc;
