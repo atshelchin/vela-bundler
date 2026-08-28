@@ -45,17 +45,19 @@ one-operation-in-flight invariant.
 
 ```bash
 # Transition tables: only the core defines one.
-grep -rn "allowed = {" src/ vela-relay-core/src/ | grep -v test
+grep -rn "allowed = {" src/ | grep -v test              # expect 0
 # The test-only mirror must be gone:
-grep -rn "transition_is_allowed" src/
-# Backoff doubling must not remain in Lua:
-grep -n "delay \* 2" src/app/user_operation_store.rs
-# Reimbursement parsing exists once:
-grep -rln "TRUSTED_MULTISEND" src/ vela-relay-core/src/
+grep -rn "fn transition_is_allowed" src/                # expect 0
+# Backoff doubling must not remain in Lua (the store test asserting its
+# absence is the only permitted match):
+grep -n "delay \* 2" src/app/user_operation_store.rs | grep -v assert   # expect 0
+# Reimbursement parsing exists once (the admission test fixture string in the
+# core's test module is the only other TRUSTED_MULTISEND occurrence):
+grep -rln "fn parse_reimbursement" src/ vela-relay-core/src/   # expect core only
 ```
 
-Expected: transition table and backoff live only under `vela-relay-core/src/`;
-`TRUSTED_MULTISEND` appears in exactly one crate (Story 6 done).
+Verified 2026-08-28: all four checks pass; the single production
+`TRUSTED_MULTISEND` lives in `vela-relay-core/src/settlement.rs`.
 
 ## Gate 4 — Behavior equivalence (per story)
 

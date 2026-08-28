@@ -169,10 +169,10 @@ own PR.
 
 ## Phase 9: Polish & Cross-Cutting
 
-- [ ] T044 [P] Update `README.md` Architecture section and `vela-relay-core/src/lib.rs` / `src/lib.rs`(or `main.rs`) doctrine headers to describe the core/shell split, mirroring p256-index's crate-level rustdoc style
-- [ ] T045 [P] Sweep for dead re-export shims left by T004/T005/T020 that no longer have external users; inline or keep deliberately with a comment
-- [ ] T046 Full quickstart pass (Gates 0–5) on the final merged state; record the Gate 2 wall-clock time and total core test count in the PR/summary against SC-001/SC-005
-- [ ] T047 Verify SC-004 counts: exactly one definition each for the transition table, hold backoff, reimbursement parser (Gate 3 greps as CI-runnable script or documented check)
+- [x] T044 [P] `README.md` gained an Architecture section describing the two-crate core/shell split, the crux per-unit-of-work drivers, and the Spec Kit governance; `vela-relay-core/src/lib.rs` carries the doctrine rustdoc and the root `Cargo.toml` the shell doctrine comment (p256 style)
+- [x] T045 [P] Shim audit: every re-export shim has live users (`utils::tempo` via the engine's module alias; vault/alchemy/abi/receipt/transaction/cost/settlement via their historical paths) — all kept deliberately, each carrying a moved-to-core doc comment
+- [x] T046 Full gate pass 2026-08-28: fmt OK; clippy 7 warnings (= baseline; started at 9); **core 94 + shell 101 = 195 tests** (baseline 160), core suite **0.07 s** with a dependency tree containing **0 IO/runtime crates** (SC-001/SC-003/SC-005 met)
+- [x] T047 SC-004 verified: transition tables in shell 0, test-only FSM mirror 0, backoff doubling in Lua 0, `parse_reimbursement` defined only in the core (the one extra `TRUSTED_MULTISEND` string is a core test fixture); commands recorded in quickstart Gate 3
 
 ---
 
