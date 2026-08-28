@@ -35,7 +35,11 @@ rules, so at-least-once alarm firing is idempotent by construction.
 ### LaneDO — one per (chain, lane): the execution unit
 
 - **Id**: `{chain_id}:{lane}` where lane = `vault::relayer_index_for_sender`
-  (pure core fn, pool width 10 — unchanged).
+  (pure core fn). Width defaults to 10 (parity with the docker deployment,
+  whose Iggy fixed routing pins it there) and is a 1..=100 deployment policy
+  on this shell — the derivable relayer pool is 100 EOAs and routing here is
+  computed, not partition-bound (research.md R11). Each lane owns one relayer
+  EOA's nonce sequence on its chain.
 - **Owns**: the prepared bundle intent (create-only), the broadcast-seen cache
   (30 s), the delayed inbox (payload + attempt counter + due time per parked
   operation), the bundle→members index, and the reconcile schedule.

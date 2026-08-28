@@ -170,6 +170,31 @@ waits to preserve serialization. Intake fetch handlers are stateless and
 scale unbounded; the platform's stated ceilings (5,000 msg/s/queue, ~1,000
 req/s/DO) sit far above SC-004 targets with per-entity sharding.
 
+## R11 — Lane width: 10 by default, up to the pool's 100 as deployment policy
+
+**Facts**: `OPERATOR_SECRET` derives a pool of `RELAYER_POOL_SIZE = 100`
+relayer EOAs (`relayer-#0..99`, chain-agnostic addresses); the docker shell
+routes across `RELAYER_ROUTING_WIDTH = 10` of them, and its config REJECTS any
+other width solely because "the Iggy queue uses fixed routing" (fixed
+partition count). The 100-EOA pool is already core vocabulary.
+
+**Decision**: the CF shell keeps width 10 as its default (posture parity with
+the docker deployment) but treats `VELA_RELAY_RELAYER_COUNT` as a genuine
+1..=100 deployment policy: routing is computed per envelope
+(`relayer_index_for_sender(sender, width)`), LaneDOs are addressed
+`{chain}:{lane}`, and no fixed-partition constraint exists on this platform.
+Raising width multiplies execution parallelism per chain (up to 100 LaneDOs)
+without touching any business rule.
+
+**Trade-offs (operator-facing, documented in the deploy checklist)**: more
+active EOAs = proportionally more float capital locked per chain and a longer
+cold-start funding phase (treasury funding stays serialized per chain — one
+outstanding funding transaction, by existing core rule); width is fixed per
+deployment lifetime (changing it remaps sender→lane and strands in-flight
+lane state), so it must be chosen at provisioning time. Invisible to API
+consumers; no parity impact because the CF deployment holds its own keys
+(FR-010).
+
 ## R10 — Execution ownership (FR-010)
 
 **Decision**: a per-deployment `EXECUTION_CHAINS` allowlist consulted by
