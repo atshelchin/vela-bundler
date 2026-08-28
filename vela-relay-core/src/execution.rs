@@ -35,7 +35,7 @@ use crate::{
     },
     task::{
         PreparedBundleIntent, PreparedFundingIntent, QueuedUserOperation, RoutedUserOperation,
-        StoredUserOperation, UserOperation,
+        StoredUserOperation, UserOperation, UserOperationStatus,
     },
     vault::relayer_index_for_sender,
 };
@@ -1780,6 +1780,76 @@ async fn execute_tempo_bundle(
         results.durable(candidate.result_index);
     }
     Ok(())
+}
+
+/// Classification of a prepared bundle's members against their lifecycle
+/// records, deciding whether a persisted outbox may be replayed, marked, or
+/// cleared. Errors are integrity refusals with byte-frozen texts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct BundleReplayAudit {
+    pub active: usize,
+    pub awaiting_submission: usize,
+    pub terminal: usize,
+    pub expired: usize,
+}
+
+pub fn audit_bundle_replay(
+    intent: &PreparedBundleIntent,
+    records: &[Option<StoredUserOperation>],
+) -> Result<BundleReplayAudit, String> {
+    if records.len() != intent.user_operation_hashes.len() {
+        return Err("Redis returned incomplete prepared bundle membership".to_owned());
+    }
+
+    let mut audit = BundleReplayAudit::default();
+    for (hash, record) in intent.user_operation_hashes.iter().zip(records) {
+        let Some(record) = record else {
+            audit.expired += 1;
+            continue;
+        };
+        if record.chain_id != intent.chain_id
+            || !record.entry_point.eq_ignore_ascii_case(&intent.entry_point)
+        {
+            return Err(format!(
+                "prepared bundle member {hash} no longer matches its chain and EntryPoint"
+            ));
+        }
+
+        match record.status {
+            UserOperationStatus::Queued | UserOperationStatus::NotSubmitted => {
+                if !record.admitted {
+                    return Err(format!(
+                        "prepared bundle member {hash} is no longer admitted"
+                    ));
+                }
+                audit.active += 1;
+                audit.awaiting_submission += 1;
+            }
+            UserOperationStatus::Submitted => {
+                if !record
+                    .transaction_hash
+                    .as_ref()
+                    .is_some_and(|transaction_hash| {
+                        transaction_hash.eq_ignore_ascii_case(&intent.transaction_hash)
+                    })
+                {
+                    return Err(format!(
+                        "prepared bundle member {hash} belongs to another transaction"
+                    ));
+                }
+                audit.active += 1;
+            }
+            UserOperationStatus::Rejected
+            | UserOperationStatus::Included
+            | UserOperationStatus::Failed => audit.terminal += 1,
+            UserOperationStatus::NotFound => {
+                return Err(format!(
+                    "prepared bundle member {hash} has an invalid stored status"
+                ));
+            }
+        }
+    }
+    Ok(audit)
 }
 
 /// Distinguishes a future keyed nonce (durable defer) from a stale nonce
@@ -3586,6 +3656,63 @@ mod tests {
         driver.assert_settled(&[ItemResolution::Failed {
             reason: "UserOperation execution was deferred".into(),
         }]);
+    }
+
+    #[test]
+    fn bundle_replay_audit_classifies_members_and_refuses_integrity_breaks() {
+        use super::audit_bundle_replay;
+        let fixture = fixture(280);
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: CHAIN_ID,
+            lane: fixture.routed.lane,
+            entry_point: ENTRY_POINT.into(),
+            raw_transaction: "0x02".into(),
+            transaction_hash: "0xbundle".into(),
+            nonce: 1,
+            user_operation_hashes: vec!["0x01".into(), "0x02".into(), "0x03".into(), "0x04".into()],
+        };
+        let mut queued = fixture.record.clone();
+        queued.status = UserOperationStatus::Queued;
+        let mut submitted = fixture.record.clone();
+        submitted.status = UserOperationStatus::Submitted;
+        submitted.transaction_hash = Some("0xBUNDLE".into());
+        let mut included = fixture.record.clone();
+        included.status = UserOperationStatus::Included;
+
+        let audit = audit_bundle_replay(
+            &intent,
+            &[Some(queued.clone()), Some(submitted), Some(included), None],
+        )
+        .unwrap();
+        assert_eq!(audit.active, 2);
+        assert_eq!(audit.awaiting_submission, 1);
+        assert_eq!(audit.terminal, 1);
+        assert_eq!(audit.expired, 1);
+
+        // Integrity refusals, byte-frozen.
+        assert_eq!(
+            audit_bundle_replay(&intent, &[Some(queued.clone())]).unwrap_err(),
+            "Redis returned incomplete prepared bundle membership"
+        );
+        let mut unadmitted = queued.clone();
+        unadmitted.admitted = false;
+        assert_eq!(
+            audit_bundle_replay(&intent, &[Some(unadmitted), None, None, None],).unwrap_err(),
+            "prepared bundle member 0x01 is no longer admitted"
+        );
+        let mut foreign = fixture.record.clone();
+        foreign.status = UserOperationStatus::Submitted;
+        foreign.transaction_hash = Some("0xother".into());
+        assert_eq!(
+            audit_bundle_replay(&intent, &[Some(foreign), None, None, None]).unwrap_err(),
+            "prepared bundle member 0x01 belongs to another transaction"
+        );
+        let mut moved = queued;
+        moved.chain_id += 1;
+        assert_eq!(
+            audit_bundle_replay(&intent, &[Some(moved), None, None, None]).unwrap_err(),
+            "prepared bundle member 0x01 no longer matches its chain and EntryPoint"
+        );
     }
 
     /// Walks triage + simulation for a single candidate and returns the

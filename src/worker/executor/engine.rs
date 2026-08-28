@@ -19,7 +19,6 @@ use crate::{
     app::{
         ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent,
         USER_OPERATION_QUEUE_RETENTION, UserOperationStatusStore,
-        rpc::types::UserOperationStatusKind,
     },
     utils::{
         config::ExecutorConfig,
@@ -83,14 +82,6 @@ struct ResolvedChainAssets {
 struct CachedMarketPrice {
     expires_at: Instant,
     price: U256,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct BundleReplayAudit {
-    active: usize,
-    awaiting_submission: usize,
-    terminal: usize,
-    expired: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -857,61 +848,7 @@ impl ExecutorEngine {
             .get_many(&intent.user_operation_hashes)
             .await
             .map_err(store_item_error)?;
-        if records.len() != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "Redis returned incomplete prepared bundle membership".into(),
-            ));
-        }
-
-        let mut audit = BundleReplayAudit::default();
-        for (hash, record) in intent.user_operation_hashes.iter().zip(records) {
-            let Some(record) = record else {
-                audit.expired += 1;
-                continue;
-            };
-            if record.chain_id != intent.chain_id
-                || !record.entry_point.eq_ignore_ascii_case(&intent.entry_point)
-            {
-                return Err(ExecutorItemError(format!(
-                    "prepared bundle member {hash} no longer matches its chain and EntryPoint"
-                )));
-            }
-
-            match record.status {
-                UserOperationStatusKind::Queued | UserOperationStatusKind::NotSubmitted => {
-                    if !record.admitted {
-                        return Err(ExecutorItemError(format!(
-                            "prepared bundle member {hash} is no longer admitted"
-                        )));
-                    }
-                    audit.active += 1;
-                    audit.awaiting_submission += 1;
-                }
-                UserOperationStatusKind::Submitted => {
-                    if !record
-                        .transaction_hash
-                        .as_ref()
-                        .is_some_and(|transaction_hash| {
-                            transaction_hash.eq_ignore_ascii_case(&intent.transaction_hash)
-                        })
-                    {
-                        return Err(ExecutorItemError(format!(
-                            "prepared bundle member {hash} belongs to another transaction"
-                        )));
-                    }
-                    audit.active += 1;
-                }
-                UserOperationStatusKind::Rejected
-                | UserOperationStatusKind::Included
-                | UserOperationStatusKind::Failed => audit.terminal += 1,
-                UserOperationStatusKind::NotFound => {
-                    return Err(ExecutorItemError(format!(
-                        "prepared bundle member {hash} has an invalid stored status"
-                    )));
-                }
-            }
-        }
-        Ok(audit)
+        core_execution::audit_bundle_replay(intent, &records).map_err(ExecutorItemError)
     }
 
     async fn clear_obsolete_bundle_intent(
@@ -2666,6 +2603,7 @@ fn parse_quantity(value: &str) -> Option<U256> {
 // funding policy in their core modules.
 use vela_relay_core::broadcast::{nonce_too_low, parse_hex_bytes};
 use vela_relay_core::execution as core_execution;
+use vela_relay_core::execution::BundleReplayAudit;
 use vela_relay_core::funding::TOP_UP_GAS_LIMIT;
 use vela_relay_core::settlement::parse_market_usd_price;
 
