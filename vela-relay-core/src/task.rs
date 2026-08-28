@@ -192,3 +192,16 @@ pub struct PreparedBundleIntent {
     pub nonce: u64,
     pub user_operation_hashes: Vec<String>,
 }
+
+/// A signed treasury transfer persisted before broadcast. Only one funding transaction may be
+/// outstanding per chain, which serializes the treasury nonce across all relayer lanes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PreparedFundingIntent {
+    pub chain_id: u64,
+    pub relayer: String,
+    pub amount_wei: u128,
+    pub raw_transaction: String,
+    pub transaction_hash: String,
+    pub nonce: u64,
+}

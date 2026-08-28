@@ -18,19 +18,24 @@ use std::collections::HashSet;
 
 use alloy::primitives::{Address, B256, U256};
 use crux_core::{App, Command, macros::effect};
+use serde_json::Value;
 
 use crate::{
     abi::{PackedOperation, handle_ops_calldata, user_operation_hash},
     cost::allocate_bundle_gas,
-    funding::{NATIVE_TOP_UP_USD_CAP, native_amount_for_usd_cap},
+    funding::{
+        NATIVE_TOP_UP_USD_CAP, native_amount_for_usd_cap, native_top_up_reserve,
+        plan_native_top_up, plan_tempo_top_up, treasury_affordable_top_up,
+    },
     hold::{HoldDecision, decide_hold},
+    receipt::receipt_succeeded,
     settlement::{
         ChainAssetConfig, FeeContext, SettlementDecision, SettlementLog, decide_settlement,
         has_stablecoin_payment, settlement_rejection_reason, verify_stable_transfer_logs,
     },
     task::{
-        PreparedBundleIntent, QueuedUserOperation, RoutedUserOperation, StoredUserOperation,
-        UserOperation,
+        PreparedBundleIntent, PreparedFundingIntent, QueuedUserOperation, RoutedUserOperation,
+        StoredUserOperation, UserOperation,
     },
     vault::relayer_index_for_sender,
 };
@@ -51,6 +56,13 @@ pub struct ExecutionPolicy {
     pub is_tempo: bool,
     /// The settlement recipient / treasury address (derived by the shell).
     pub treasury: Address,
+    /// This lane's relayer address (derived by the shell).
+    pub relayer: Address,
+    // Native relayer-float policy (validated config).
+    pub relayer_float_cost_multiplier: u64,
+    pub relayer_float_target_wei: u128,
+    pub relayer_float_min_wei: u128,
+    pub treasury_floor_wei: u128,
 }
 
 /// Everything the program needs to know about one lane batch at start.
@@ -130,6 +142,24 @@ pub struct SignedBundle {
     pub raw_transaction_hex: String,
     pub transaction_hash: String,
     pub nonce: u64,
+}
+
+/// A native treasury → relayer transfer the shell signs with the treasury key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TreasurySignRequest {
+    pub nonce: u64,
+    pub amount: U256,
+    pub max_fee_per_gas: u128,
+    pub max_priority_fee_per_gas: u128,
+}
+
+/// A pathUSD treasury → relayer transfer the shell signs with the treasury key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TempoTreasurySignRequest {
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub amount: U256,
 }
 
 /// The Tempo `0x76` plan the shell signs (fee token is always pathUSD, tip 0).
@@ -232,13 +262,67 @@ pub enum ExecutionOperation {
         calldata: Vec<u8>,
     },
     FetchMarketPrice,
-    /// Composite: treasury lease + probe + sign + broadcast of a top-up (T034).
-    EnsureRelayerFunded {
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-        top_up_max: U256,
+    // --- treasury funding (sequenced here) ---
+    AcquireTreasuryLease,
+    EnsureTreasuryLease,
+    ReleaseTreasuryLease,
+    LoadPreparedFunding,
+    SaveFundingIntent {
+        intent: PreparedFundingIntent,
+    },
+    ClearFundingIntent {
+        transaction_hash: String,
+    },
+    FetchTreasuryContext,
+    /// Tempo variant: also estimates the pathUSD transfer's gas (raw, the
+    /// buffer is applied here).
+    FetchTempoTreasuryContext {
+        transfer_amount: U256,
+    },
+    SignTreasuryTransfer {
+        request: TreasurySignRequest,
+    },
+    SignTreasuryPathUsd {
+        request: TempoTreasurySignRequest,
+    },
+    AcquireReceiptProbe {
+        transaction_hash: String,
+    },
+    FetchTransactionReceipt {
+        transaction_hash: String,
+    },
+    RecordTreasuryShortfall {
+        treasury_balance: U256,
+        required_treasury: U256,
+        requested: U256,
+        minimum: U256,
+        top_up_gas_cost: U256,
+    },
+    RecordTempoTreasuryShortfall {
+        treasury_balance: U256,
+        required_treasury: U256,
+        top_up: U256,
+        top_up_gas_limit: u64,
+        top_up_gas_cost: U256,
+    },
+    RecordPartialTopUp {
+        requested: U256,
+        submitted: U256,
+        minimum: U256,
+    },
+    RecordFundingSubmitted {
+        amount: U256,
+        transaction_hash: String,
+        tempo: bool,
+    },
+    RecordUnprovenFunding {
+        transaction_hash: String,
+        ambiguous: bool,
+        reason: String,
+    },
+    NoteFundingReceipt {
+        intent: PreparedFundingIntent,
+        success: bool,
     },
     SignBundle {
         request: BundleSignRequest,
@@ -285,13 +369,6 @@ pub enum ExecutionOperation {
     FetchTempoContext,
     SignTempoBundle {
         request: TempoSignRequest,
-    },
-    /// Composite: treasury lease + probe + sign + broadcast of a pathUSD
-    /// top-up (decomposes with the funding batch).
-    EnsureTempoRelayerFunded {
-        relayer_path_usd_balance: U256,
-        required_prefund: U256,
-        outer_max_fee: u128,
     },
 }
 
@@ -394,8 +471,20 @@ pub enum ExecutionOutcome {
     Price {
         price: U256,
     },
-    Funding {
-        ready: bool,
+    FundingIntent {
+        intent: Option<PreparedFundingIntent>,
+    },
+    TreasuryContext {
+        nonce: u64,
+        balance: U256,
+    },
+    TempoTreasuryContext {
+        nonce: u64,
+        balance: U256,
+        raw_gas_estimate: u64,
+    },
+    Receipt {
+        receipt: Option<Value>,
     },
     Signed {
         signed: SignedBundle,
@@ -1305,33 +1394,27 @@ async fn execute_with_lane_lease(
         .unwrap_or(U256::from(policy.top_up_max_wei));
 
     // The current bundle takes precedence over filling the relayer float.
-    if context.relayer_balance < prefund {
-        match request(
+    if context.relayer_balance < prefund
+        && !ensure_native_funding(
             ctx,
-            ExecutionOperation::EnsureRelayerFunded {
-                relayer_balance: context.relayer_balance,
-                required_prefund: prefund,
-                max_fee_per_gas: context.max_fee_per_gas,
-                max_priority_fee_per_gas: context.max_priority_fee_per_gas,
-                top_up_max,
-            },
+            policy,
+            chain_id,
+            context.relayer_balance,
+            prefund,
+            context.max_fee_per_gas,
+            context.max_priority_fee_per_gas,
+            top_up_max,
         )
-        .await
-        {
-            ExecutionOutcome::Funding { ready: true } => {}
-            ExecutionOutcome::Funding { ready: false } => {
-                record_candidates_deferred(
-                    ctx,
-                    &survivors,
-                    "funding",
-                    "waiting for relayer funding transaction confirmation",
-                )
-                .await;
-                return Ok(());
-            }
-            ExecutionOutcome::Failed { message } => return Err(message),
-            _ => return Err("unexpected shell response".to_owned()),
-        }
+        .await?
+    {
+        record_candidates_deferred(
+            ctx,
+            &survivors,
+            "funding",
+            "waiting for relayer funding transaction confirmation",
+        )
+        .await;
+        return Ok(());
     }
     ensure_lane_lease(ctx).await?;
 
@@ -1579,31 +1662,25 @@ async fn execute_tempo_bundle(
         crate::tempo::tempo_cost_in_path_usd(U256::from(gas_limit), U256::from(outer_max_fee))
             .ok_or_else(|| "Tempo pathUSD cost overflow".to_owned())?;
     // The current bundle takes precedence over filling the pathUSD float.
-    if relayer_path_usd_balance < required_prefund.max(U256::from(crate::tempo::TEMPO_FLOAT_MIN)) {
-        match request(
+    if relayer_path_usd_balance < required_prefund.max(U256::from(crate::tempo::TEMPO_FLOAT_MIN))
+        && !ensure_tempo_funding(
             ctx,
-            ExecutionOperation::EnsureTempoRelayerFunded {
-                relayer_path_usd_balance,
-                required_prefund,
-                outer_max_fee,
-            },
+            &start.policy,
+            chain_id,
+            relayer_path_usd_balance,
+            required_prefund,
+            outer_max_fee,
         )
-        .await
-        {
-            ExecutionOutcome::Funding { ready: true } => {}
-            ExecutionOutcome::Funding { ready: false } => {
-                record_candidates_deferred(
-                    ctx,
-                    &survivors,
-                    "funding",
-                    "waiting for relayer pathUSD funding transaction confirmation",
-                )
-                .await;
-                return Ok(());
-            }
-            ExecutionOutcome::Failed { message } => return Err(message),
-            _ => return Err("unexpected shell response".to_owned()),
-        }
+        .await?
+    {
+        record_candidates_deferred(
+            ctx,
+            &survivors,
+            "funding",
+            "waiting for relayer pathUSD funding transaction confirmation",
+        )
+        .await;
+        return Ok(());
     }
     ensure_lane_lease(ctx).await?;
 
@@ -1783,6 +1860,537 @@ async fn resolve_nonce_mismatches(
             _ => results.durable(candidate.result_index),
         }
     }
+}
+
+/// Native relayer funding under the treasury lease: prepared-intent resume,
+/// the float plan, affordability, sign/persist, and the funding broadcast.
+/// Returns whether the relayer is ready (`false` = a top-up is pending).
+#[allow(clippy::too_many_arguments)]
+async fn ensure_native_funding(
+    ctx: &Ctx,
+    policy: &ExecutionPolicy,
+    chain_id: u64,
+    relayer_balance: U256,
+    required_prefund: U256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    top_up_max: U256,
+) -> Result<bool, String> {
+    match request(ctx, ExecutionOperation::AcquireTreasuryLease).await {
+        ExecutionOutcome::LeaseAcquired { acquired: true } => {}
+        _ => return Ok(false),
+    }
+    let result = native_funding_locked(
+        ctx,
+        policy,
+        chain_id,
+        relayer_balance,
+        required_prefund,
+        max_fee_per_gas,
+        max_priority_fee_per_gas,
+        top_up_max,
+    )
+    .await;
+    let _ = request(ctx, ExecutionOperation::ReleaseTreasuryLease).await;
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn native_funding_locked(
+    ctx: &Ctx,
+    policy: &ExecutionPolicy,
+    chain_id: u64,
+    relayer_balance: U256,
+    required_prefund: U256,
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+    top_up_max: U256,
+) -> Result<bool, String> {
+    match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+        ExecutionOutcome::FundingIntent { intent: None } => {}
+        ExecutionOutcome::FundingIntent {
+            intent: Some(intent),
+        } => {
+            resume_funding(ctx, &intent).await?;
+            return Ok(false);
+        }
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    let plan = plan_native_top_up(
+        relayer_balance,
+        required_prefund,
+        policy.relayer_float_cost_multiplier,
+        policy.relayer_float_target_wei,
+        policy.relayer_float_min_wei,
+        top_up_max,
+    )
+    .map_err(|error| error.to_string())?;
+    let (nonce, treasury_balance) =
+        match request(ctx, ExecutionOperation::FetchTreasuryContext).await {
+            ExecutionOutcome::TreasuryContext { nonce, balance } => (nonce, balance),
+            ExecutionOutcome::Failed { message } => return Err(message),
+            _ => return Err("unexpected shell response".to_owned()),
+        };
+    let protected_treasury = native_top_up_reserve(max_fee_per_gas, policy.treasury_floor_wei)
+        .map_err(|error| error.to_string())?;
+    let top_up_gas_cost = protected_treasury - U256::from(policy.treasury_floor_wei);
+    // If the treasury can satisfy this bundle but not the preferred float,
+    // make a partial top-up. The next bundle will replenish the float when
+    // more treasury funds arrive.
+    let Some(amount) = treasury_affordable_top_up(
+        plan.amount_capped,
+        plan.deficit,
+        treasury_balance,
+        protected_treasury,
+    ) else {
+        let required_treasury = plan
+            .deficit
+            .checked_add(protected_treasury)
+            .ok_or_else(|| "treasury balance requirement overflow".to_owned())?;
+        let _ = request(
+            ctx,
+            ExecutionOperation::RecordTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                requested: plan.amount_capped,
+                minimum: plan.deficit,
+                top_up_gas_cost,
+            },
+        )
+        .await;
+        return Err(
+            "treasury balance cannot cover the current UserOperation prefund, top-up gas, and reserve floor"
+                .to_owned(),
+        );
+    };
+    if amount < plan.amount_capped {
+        let _ = request(
+            ctx,
+            ExecutionOperation::RecordPartialTopUp {
+                requested: plan.amount_capped,
+                submitted: amount,
+                minimum: plan.deficit,
+            },
+        )
+        .await;
+    }
+    let amount_u128 =
+        u128::try_from(amount).map_err(|_| "top-up amount exceeds uint128".to_owned())?;
+
+    ensure_treasury_lease(ctx).await?;
+    let signed = match request(
+        ctx,
+        ExecutionOperation::SignTreasuryTransfer {
+            request: TreasurySignRequest {
+                nonce,
+                amount,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+            },
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Signed { signed } => signed,
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let intent = PreparedFundingIntent {
+        chain_id,
+        relayer: policy.relayer.to_string(),
+        amount_wei: amount_u128,
+        raw_transaction: signed.raw_transaction_hex.clone(),
+        transaction_hash: signed.transaction_hash.clone(),
+        nonce: signed.nonce,
+    };
+    ensure_treasury_lease(ctx).await?;
+    match request(
+        ctx,
+        ExecutionOperation::SaveFundingIntent {
+            intent: intent.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Saved { saved: true } => {}
+        ExecutionOutcome::Saved { saved: false } => {
+            match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+                ExecutionOutcome::FundingIntent {
+                    intent: Some(existing),
+                } => {
+                    resume_funding(ctx, &existing).await?;
+                    return Ok(false);
+                }
+                ExecutionOutcome::FundingIntent { intent: None } => {
+                    return Err("another treasury relayer top-up is pending".to_owned());
+                }
+                ExecutionOutcome::Failed { message } => return Err(message),
+                _ => return Err("unexpected shell response".to_owned()),
+            }
+        }
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    broadcast_funding(ctx, &intent).await?;
+    let _ = request(
+        ctx,
+        ExecutionOperation::RecordFundingSubmitted {
+            amount,
+            transaction_hash: intent.transaction_hash.clone(),
+            tempo: false,
+        },
+    )
+    .await;
+    Ok(false)
+}
+
+/// Tempo pathUSD variant: flat float target, all-or-nothing affordability.
+async fn ensure_tempo_funding(
+    ctx: &Ctx,
+    policy: &ExecutionPolicy,
+    chain_id: u64,
+    relayer_path_usd_balance: U256,
+    required_prefund: U256,
+    outer_max_fee: u128,
+) -> Result<bool, String> {
+    match request(ctx, ExecutionOperation::AcquireTreasuryLease).await {
+        ExecutionOutcome::LeaseAcquired { acquired: true } => {}
+        _ => return Ok(false),
+    }
+    let result = tempo_funding_locked(
+        ctx,
+        policy,
+        chain_id,
+        relayer_path_usd_balance,
+        required_prefund,
+        outer_max_fee,
+    )
+    .await;
+    let _ = request(ctx, ExecutionOperation::ReleaseTreasuryLease).await;
+    result
+}
+
+async fn tempo_funding_locked(
+    ctx: &Ctx,
+    policy: &ExecutionPolicy,
+    chain_id: u64,
+    relayer_path_usd_balance: U256,
+    required_prefund: U256,
+    outer_max_fee: u128,
+) -> Result<bool, String> {
+    match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+        ExecutionOutcome::FundingIntent { intent: None } => {}
+        ExecutionOutcome::FundingIntent {
+            intent: Some(intent),
+        } => {
+            resume_funding(ctx, &intent).await?;
+            return Ok(false);
+        }
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    let Some(amount) = plan_tempo_top_up(relayer_path_usd_balance, required_prefund)
+        .map_err(|_| "Tempo relayer funding amount underflow".to_owned())?
+    else {
+        return Ok(true);
+    };
+    let amount_u128 =
+        u128::try_from(amount).map_err(|_| "Tempo relayer top-up exceeds uint128".to_owned())?;
+    let (nonce, treasury_balance, raw_gas_estimate) = match request(
+        ctx,
+        ExecutionOperation::FetchTempoTreasuryContext {
+            transfer_amount: amount,
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::TempoTreasuryContext {
+            nonce,
+            balance,
+            raw_gas_estimate,
+        } => (nonce, balance, raw_gas_estimate),
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let top_up_gas_limit = crate::tempo::buffered_top_up_gas_limit(raw_gas_estimate)
+        .ok_or_else(|| "Tempo pathUSD top-up gas buffer overflow".to_owned())?;
+    let top_up_gas_cost = crate::tempo::tempo_cost_in_path_usd(
+        U256::from(top_up_gas_limit),
+        U256::from(outer_max_fee),
+    )
+    .ok_or_else(|| "Tempo pathUSD cost overflow".to_owned())?;
+    let required_treasury = amount
+        .checked_add(top_up_gas_cost)
+        .and_then(|value| value.checked_add(U256::from(crate::tempo::TEMPO_TREASURY_FLOOR)))
+        .ok_or_else(|| "Tempo treasury balance requirement overflow".to_owned())?;
+    if treasury_balance < required_treasury {
+        let _ = request(
+            ctx,
+            ExecutionOperation::RecordTempoTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                top_up: amount,
+                top_up_gas_limit,
+                top_up_gas_cost,
+            },
+        )
+        .await;
+        return Err(
+            "Tempo treasury pathUSD is below top-up amount, gas, and reserve floor".to_owned(),
+        );
+    }
+
+    ensure_treasury_lease(ctx).await?;
+    let signed = match request(
+        ctx,
+        ExecutionOperation::SignTreasuryPathUsd {
+            request: TempoTreasurySignRequest {
+                nonce,
+                gas_limit: top_up_gas_limit,
+                max_fee_per_gas: outer_max_fee,
+                amount,
+            },
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Signed { signed } => signed,
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let intent = PreparedFundingIntent {
+        chain_id,
+        relayer: policy.relayer.to_string(),
+        amount_wei: amount_u128,
+        raw_transaction: signed.raw_transaction_hex.clone(),
+        transaction_hash: signed.transaction_hash.clone(),
+        nonce: signed.nonce,
+    };
+    ensure_treasury_lease(ctx).await?;
+    match request(
+        ctx,
+        ExecutionOperation::SaveFundingIntent {
+            intent: intent.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Saved { saved: true } => {}
+        ExecutionOutcome::Saved { saved: false } => {
+            match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+                ExecutionOutcome::FundingIntent {
+                    intent: Some(existing),
+                } => {
+                    resume_funding(ctx, &existing).await?;
+                    return Ok(false);
+                }
+                ExecutionOutcome::FundingIntent { intent: None } => {
+                    return Err("another Tempo treasury relayer top-up is pending".to_owned());
+                }
+                ExecutionOutcome::Failed { message } => return Err(message),
+                _ => return Err("unexpected shell response".to_owned()),
+            }
+        }
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    broadcast_funding(ctx, &intent).await?;
+    let _ = request(
+        ctx,
+        ExecutionOperation::RecordFundingSubmitted {
+            amount,
+            transaction_hash: intent.transaction_hash.clone(),
+            tempo: true,
+        },
+    )
+    .await;
+    Ok(false)
+}
+
+async fn ensure_treasury_lease(ctx: &Ctx) -> Result<(), String> {
+    match request(ctx, ExecutionOperation::EnsureTreasuryLease).await {
+        ExecutionOutcome::LeaseHeld { held: true } => Ok(()),
+        ExecutionOutcome::LeaseHeld { held: false } => Err("executor lease was lost".to_owned()),
+        ExecutionOutcome::Failed { message } => Err(message),
+        _ => Err("unexpected shell response".to_owned()),
+    }
+}
+
+/// The funding-transfer broadcast: like the bundle broadcast but without a
+/// stale-nonce path — the treasury nonce is serialized by its lease.
+async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(), String> {
+    crate::broadcast::validate_raw_transaction(&intent.raw_transaction, &intent.transaction_hash)
+        .map_err(|error| error.to_string())?;
+    match request(
+        ctx,
+        ExecutionOperation::CheckBroadcastSeen {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Seen { seen: true } => return Ok(()),
+        ExecutionOutcome::Seen { seen: false } => {}
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    let raw = crate::broadcast::parse_hex_bytes(&intent.raw_transaction)
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default();
+    let reply = match request(
+        ctx,
+        ExecutionOperation::BroadcastRaw {
+            raw_transaction: raw,
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Sent { reply } => reply,
+        ExecutionOutcome::Failed { message } => {
+            forget_funding_broadcast(ctx, intent).await;
+            return Err(message);
+        }
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    match reply {
+        BroadcastReply::Accepted { transaction_hash }
+            if transaction_hash.eq_ignore_ascii_case(&intent.transaction_hash) =>
+        {
+            let _ = request(
+                ctx,
+                ExecutionOperation::RememberBroadcast {
+                    transaction_hash: intent.transaction_hash.clone(),
+                },
+            )
+            .await;
+            Ok(())
+        }
+        BroadcastReply::Accepted { .. } => {
+            forget_funding_broadcast(ctx, intent).await;
+            Err("RPC returned a different funding transaction hash".to_owned())
+        }
+        BroadcastReply::Ambiguous { reason } => {
+            forget_funding_broadcast(ctx, intent).await;
+            let _ = request(
+                ctx,
+                ExecutionOperation::RecordUnprovenFunding {
+                    transaction_hash: intent.transaction_hash.clone(),
+                    ambiguous: true,
+                    reason,
+                },
+            )
+            .await;
+            Ok(())
+        }
+        BroadcastReply::Rejected { reason } => {
+            forget_funding_broadcast(ctx, intent).await;
+            let known = match request(
+                ctx,
+                ExecutionOperation::ProbeTransactionKnown {
+                    transaction_hash: intent.transaction_hash.clone(),
+                },
+            )
+            .await
+            {
+                ExecutionOutcome::Known { known } => known,
+                _ => return Err("unexpected shell response".to_owned()),
+            };
+            if known {
+                let _ = request(
+                    ctx,
+                    ExecutionOperation::RememberBroadcast {
+                        transaction_hash: intent.transaction_hash.clone(),
+                    },
+                )
+                .await;
+            } else {
+                let _ = request(
+                    ctx,
+                    ExecutionOperation::RecordUnprovenFunding {
+                        transaction_hash: intent.transaction_hash.clone(),
+                        ambiguous: false,
+                        reason,
+                    },
+                )
+                .await;
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn forget_funding_broadcast(ctx: &Ctx, intent: &PreparedFundingIntent) {
+    let _ = request(
+        ctx,
+        ExecutionOperation::ForgetBroadcast {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await;
+}
+
+/// Rebroadcast a persisted funding transfer and, behind a receipt-probe
+/// claim, settle it: clear on inclusion, error on revert.
+async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(), String> {
+    broadcast_funding(ctx, intent).await?;
+    match request(
+        ctx,
+        ExecutionOperation::AcquireReceiptProbe {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::LeaseAcquired { acquired: true } => {}
+        ExecutionOutcome::LeaseAcquired { acquired: false } => return Ok(()),
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    let receipt = match request(
+        ctx,
+        ExecutionOperation::FetchTransactionReceipt {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Receipt { receipt } => receipt,
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let Some(receipt) = receipt else {
+        return Ok(());
+    };
+    let Some(success) = receipt_succeeded(&receipt) else {
+        return Err("funding transaction receipt has invalid status".to_owned());
+    };
+    if let ExecutionOutcome::Failed { message } = request(
+        ctx,
+        ExecutionOperation::ClearFundingIntent {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        return Err(message);
+    }
+    forget_funding_broadcast(ctx, intent).await;
+    let _ = request(
+        ctx,
+        ExecutionOperation::NoteFundingReceipt {
+            intent: intent.clone(),
+            success,
+        },
+    )
+    .await;
+    if !success {
+        return Err(format!(
+            "treasury relayer top-up transaction reverted: {}",
+            intent.transaction_hash
+        ));
+    }
+    Ok(())
 }
 
 /// The broadcast sequence for a freshly signed bundle intent: cache probe,
@@ -2055,6 +2663,11 @@ mod tests {
             top_up_max_wei: 1_000_000,
             is_tempo: false,
             treasury: TREASURY,
+            relayer: address!("9999999999999999999999999999999999999999"),
+            relayer_float_cost_multiplier: 5,
+            relayer_float_target_wei: 0,
+            relayer_float_min_wei: 0,
+            treasury_floor_wei: 0,
         }
     }
 
@@ -2813,6 +3426,166 @@ mod tests {
             ExecutionOutcome::Indexed { indexed: 1 },
         );
         driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn an_underfunded_relayer_walks_the_treasury_top_up_and_defers() {
+        // prefund = 100 gas x fee 2 = 200 > balance 100. Float plan: target
+        // 200 x 5 = 1000, desired 900, deficit 100; treasury 100_000 covers
+        // the full request after the 42_000 reserve.
+        let fixture = fixture(280);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata,
+            },
+            ExecutionOutcome::Context {
+                context: TransactionContext {
+                    relayer_balance: U256::from(100u64),
+                    ..context()
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireTreasuryLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedFunding,
+            ExecutionOutcome::FundingIntent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::FetchTreasuryContext,
+            ExecutionOutcome::TreasuryContext {
+                nonce: 3,
+                balance: U256::from(100_000u64),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureTreasuryLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let funding_raw = [0x02u8, 0x09, 0x09];
+        let funding_hash = alloy::primitives::keccak256(funding_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignTreasuryTransfer {
+                request: super::TreasurySignRequest {
+                    nonce: 3,
+                    amount: U256::from(900u64),
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 0,
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x020909".into(),
+                    transaction_hash: funding_hash.clone(),
+                    nonce: 3,
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureTreasuryLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let funding_intent = crate::task::PreparedFundingIntent {
+            chain_id: CHAIN_ID,
+            relayer: policy().relayer.to_string(),
+            amount_wei: 900,
+            raw_transaction: "0x020909".into(),
+            transaction_hash: funding_hash.clone(),
+            nonce: 3,
+        };
+        driver.step(
+            ExecutionOperation::SaveFundingIntent {
+                intent: funding_intent,
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: funding_raw.to_vec(),
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: funding_hash.clone(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: funding_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::RecordFundingSubmitted {
+                amount: U256::from(900u64),
+                transaction_hash: funding_hash,
+                tempo: false,
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ReleaseTreasuryLease,
+            ExecutionOutcome::Done,
+        );
+        // "funding" is an expected hand-off: diagnostic, no Telegram.
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "funding",
+                reason: "waiting for relayer funding transaction confirmation".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: "UserOperation execution was deferred".into(),
+        }]);
     }
 
     /// Walks triage + simulation for a single candidate and returns the

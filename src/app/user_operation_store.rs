@@ -353,18 +353,7 @@ pub use vela_relay_core::task::UserOperationEvent;
 
 pub use vela_relay_core::task::PreparedBundleIntent;
 
-/// A signed treasury transfer persisted before broadcast. Only one funding transaction may be
-/// outstanding per chain, which serializes the treasury nonce across all relayer lanes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreparedFundingIntent {
-    pub chain_id: u64,
-    pub relayer: String,
-    pub amount_wei: u128,
-    pub raw_transaction: String,
-    pub transaction_hash: String,
-    pub nonce: u64,
-}
+pub use vela_relay_core::task::PreparedFundingIntent;
 
 /// A signed canonical-CREATE2 deployment persisted before broadcast. One deployment intent is
 /// allowed per chain because it shares the treasury nonce with relayer top-ups.

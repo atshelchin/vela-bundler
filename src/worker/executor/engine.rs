@@ -1,7 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     fmt::{Display, Formatter},
-    future::Future,
     str::FromStr,
     sync::{
         Arc,
@@ -19,7 +18,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::{
         ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent,
-        PreparedFundingIntent, USER_OPERATION_QUEUE_RETENTION, UserOperationStatusStore,
+        USER_OPERATION_QUEUE_RETENTION, UserOperationStatusStore,
         rpc::types::UserOperationStatusKind,
     },
     utils::{
@@ -111,12 +110,6 @@ struct TempoTransactionContext {
     base_fee_atto: U256,
     nonce: u64,
     relayer_path_usd_balance: U256,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FundingReadiness {
-    Ready,
-    Pending,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,6 +364,11 @@ impl ExecutorEngine {
             top_up_max_wei: self.config.top_up_max_wei,
             is_tempo: tempo::is_tempo_chain(chain_id),
             treasury: self.treasury_address,
+            relayer: self.relayer_addresses[lane as usize],
+            relayer_float_cost_multiplier: self.config.relayer_float_cost_multiplier,
+            relayer_float_target_wei: self.config.relayer_float_target_wei,
+            relayer_float_min_wei: self.config.relayer_float_min_wei,
+            treasury_floor_wei: self.config.treasury_floor_wei,
         };
         let lease_token = unique_token("lane");
         let mut shell = BatchShell {
@@ -383,6 +381,10 @@ impl ExecutorEngine {
             assets: None,
             heartbeat: None,
             lease_acquired: false,
+            treasury_scope: format!("treasury:{chain_id}"),
+            treasury_token: unique_token("treasury"),
+            treasury_heartbeat: None,
+            treasury_lease_acquired: false,
         };
 
         let core: crux_core::Core<core_execution::ExecutionApp> = crux_core::Core::new();
@@ -632,32 +634,6 @@ impl ExecutorEngine {
             Ok(true) => Ok(()),
             Ok(false) => Err(ExecutorItemError("executor lease was lost".into())),
             Err(error) => Err(store_item_error(error)),
-        }
-    }
-
-    async fn run_with_lease_heartbeat<T, F>(
-        &self,
-        scope: &str,
-        token: &str,
-        future: F,
-    ) -> Result<T, ExecutorItemError>
-    where
-        F: Future<Output = Result<T, ExecutorItemError>>,
-    {
-        let period = (self.config.lease_ttl / 3).max(Duration::from_millis(1));
-        let start = tokio::time::Instant::now() + period;
-        let mut heartbeat = tokio::time::interval_at(start, period);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tokio::pin!(future);
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = heartbeat.tick() => {
-                    self.ensure_lease(scope, token).await?;
-                }
-                result = &mut future => return result,
-            }
         }
     }
 
@@ -1346,545 +1322,6 @@ impl ExecutorEngine {
         }
         Ok(())
     }
-
-    async fn ensure_tempo_relayer_funded(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        let minimum = required_prefund.max(U256::from(tempo::TEMPO_FLOAT_MIN));
-        if relayer_balance >= minimum {
-            return Ok(FundingReadiness::Ready);
-        }
-
-        let scope = format!("treasury:{chain_id}");
-        let token = unique_token("tempo-treasury");
-        if !self
-            .store
-            .acquire_lease(&scope, &token, self.config.lease_ttl)
-            .await
-            .map_err(store_item_error)?
-        {
-            return Ok(FundingReadiness::Pending);
-        }
-        let result = self
-            .run_with_lease_heartbeat(
-                &scope,
-                &token,
-                self.ensure_tempo_relayer_funded_locked(
-                    chain_id,
-                    relayer,
-                    relayer_balance,
-                    required_prefund,
-                    max_fee_per_gas,
-                    &scope,
-                    &token,
-                ),
-            )
-            .await;
-        if let Err(error) = self.store.release_lease(&scope, &token).await {
-            tracing::warn!(chain_id, %error, "could not release Tempo treasury nonce lease");
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_tempo_relayer_funded_locked(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        if let Some(intent) = self
-            .store
-            .get_prepared_funding_intent(chain_id)
-            .await
-            .map_err(store_item_error)?
-        {
-            self.resume_funding_intent(&intent).await?;
-            return Ok(FundingReadiness::Pending);
-        }
-
-        let Some(amount) =
-            vela_relay_core::funding::plan_tempo_top_up(relayer_balance, required_prefund)
-                .map_err(|_| ExecutorItemError("Tempo relayer funding amount underflow".into()))?
-        else {
-            return Ok(FundingReadiness::Ready);
-        };
-        let amount_u128 = u128::try_from(amount)
-            .map_err(|_| ExecutorItemError("Tempo relayer top-up exceeds uint128".into()))?;
-        let transfer_calldata = tempo::path_usd_transfer_calldata(relayer, amount);
-
-        let calls = [
-            RpcBatchCall {
-                method: "eth_getTransactionCount",
-                params: json!([self.treasury_address.to_string(), "pending"]),
-            },
-            RpcBatchCall {
-                method: "eth_call",
-                params: json!([{
-                    "to": tempo::PATH_USD.to_string(),
-                    "data": format!("0x{}", hex::encode(tempo::path_usd_balance_calldata(self.treasury_address))),
-                }, "latest"]),
-            },
-            RpcBatchCall {
-                method: "eth_estimateGas",
-                params: json!([{
-                    "from": self.treasury_address.to_string(),
-                    "to": tempo::PATH_USD.to_string(),
-                    "data": format!("0x{}", hex::encode(&transfer_calldata)),
-                    "feeToken": tempo::PATH_USD.to_string(),
-                }, "latest"]),
-            },
-        ];
-        let responses = self
-            .rpc
-            .batch(chain_id, &calls)
-            .await
-            .map_err(rpc_item_error)?;
-        let nonce = u64::try_from(response_quantity(&responses, 0, "Tempo treasury nonce")?)
-            .map_err(|_| ExecutorItemError("Tempo treasury nonce exceeds uint64".into()))?;
-        let treasury_balance = response_abi_u256(&responses, 1, "Tempo treasury pathUSD balance")?;
-        let estimated_gas = u64::try_from(response_quantity(
-            &responses,
-            2,
-            "Tempo pathUSD top-up eth_estimateGas",
-        )?)
-        .map_err(|_| {
-            ExecutorItemError("Tempo pathUSD top-up gas estimate exceeds uint64".into())
-        })?;
-        let top_up_gas_limit = tempo::buffered_top_up_gas_limit(estimated_gas)
-            .ok_or_else(|| ExecutorItemError("Tempo pathUSD top-up gas buffer overflow".into()))?;
-        let top_up_gas_cost =
-            tempo_cost_in_path_usd(U256::from(top_up_gas_limit), U256::from(max_fee_per_gas))?;
-        let required_treasury = amount
-            .checked_add(top_up_gas_cost)
-            .and_then(|value| value.checked_add(U256::from(tempo::TEMPO_TREASURY_FLOOR)))
-            .ok_or_else(|| {
-                ExecutorItemError("Tempo treasury balance requirement overflow".into())
-            })?;
-        if treasury_balance < required_treasury {
-            tracing::warn!(
-                chain_id,
-                treasury_path_usd_balance = %treasury_balance,
-                required_path_usd = %required_treasury,
-                top_up_path_usd = %amount,
-                top_up_gas_limit,
-                top_up_gas_path_usd = %top_up_gas_cost,
-                reserve_path_usd = tempo::TEMPO_TREASURY_FLOOR,
-                "Tempo treasury cannot fund the pending relayer top-up"
-            );
-            return Err(ExecutorItemError(
-                "Tempo treasury pathUSD is below top-up amount, gas, and reserve floor".into(),
-            ));
-        }
-
-        self.ensure_lease(lease_scope, lease_token).await?;
-        let signed = sign_tempo(
-            &self.treasury_key,
-            TempoTransactionPlan {
-                chain_id,
-                nonce,
-                gas_limit: top_up_gas_limit,
-                max_fee_per_gas,
-                max_priority_fee_per_gas: 0,
-                fee_token: tempo::PATH_USD,
-                to: tempo::PATH_USD,
-                input: transfer_calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedFundingIntent {
-            chain_id,
-            relayer: relayer.to_string(),
-            amount_wei: amount_u128,
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash,
-            nonce: signed.nonce,
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_funding_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            if let Some(existing) = self
-                .store
-                .get_prepared_funding_intent(chain_id)
-                .await
-                .map_err(store_item_error)?
-            {
-                self.resume_funding_intent(&existing).await?;
-                return Ok(FundingReadiness::Pending);
-            }
-            return Err(ExecutorItemError(
-                "another Tempo treasury relayer top-up is pending".into(),
-            ));
-        }
-        self.broadcast_funding_intent(&intent).await?;
-        tracing::info!(
-            chain_id,
-            relayer = %relayer,
-            amount_path_usd = amount_u128,
-            transaction_hash = %intent.transaction_hash,
-            "submitted Tempo treasury pathUSD relayer top-up"
-        );
-        Ok(FundingReadiness::Pending)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_relayer_funded(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-        top_up_max: U256,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        // The current bundle takes precedence over filling the relayer float. A relayer that can
-        // already cover this handleOps must never be held back merely because it has not reached
-        // the preferred float target yet.
-        if relayer_balance >= required_prefund {
-            return Ok(FundingReadiness::Ready);
-        }
-
-        let scope = format!("treasury:{chain_id}");
-        let token = unique_token("treasury");
-        if !self
-            .store
-            .acquire_lease(&scope, &token, self.config.lease_ttl)
-            .await
-            .map_err(store_item_error)?
-        {
-            return Ok(FundingReadiness::Pending);
-        }
-        let result = self
-            .run_with_lease_heartbeat(
-                &scope,
-                &token,
-                self.ensure_relayer_funded_locked(
-                    chain_id,
-                    relayer,
-                    relayer_balance,
-                    required_prefund,
-                    max_fee_per_gas,
-                    max_priority_fee_per_gas,
-                    top_up_max,
-                    &scope,
-                    &token,
-                ),
-            )
-            .await;
-        if let Err(error) = self.store.release_lease(&scope, &token).await {
-            tracing::warn!(chain_id, %error, "could not release treasury nonce lease");
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_relayer_funded_locked(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-        top_up_max: U256,
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        if let Some(intent) = self
-            .store
-            .get_prepared_funding_intent(chain_id)
-            .await
-            .map_err(store_item_error)?
-        {
-            self.resume_funding_intent(&intent).await?;
-            return Ok(FundingReadiness::Pending);
-        }
-
-        let plan = plan_native_top_up(
-            relayer_balance,
-            required_prefund,
-            self.config.relayer_float_cost_multiplier,
-            self.config.relayer_float_target_wei,
-            self.config.relayer_float_min_wei,
-            top_up_max,
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let (capped_amount, deficit) = (plan.amount_capped, plan.deficit);
-
-        let calls = [
-            RpcBatchCall {
-                method: "eth_getTransactionCount",
-                params: json!([self.treasury_address.to_string(), "pending"]),
-            },
-            RpcBatchCall {
-                method: "eth_getBalance",
-                params: json!([self.treasury_address.to_string(), "pending"]),
-            },
-        ];
-        let responses = self
-            .rpc
-            .batch(chain_id, &calls)
-            .await
-            .map_err(rpc_item_error)?;
-        let nonce = u64::try_from(response_quantity(
-            &responses,
-            0,
-            "treasury eth_getTransactionCount",
-        )?)
-        .map_err(|_| ExecutorItemError("treasury nonce exceeds uint64".into()))?;
-        let treasury_balance = response_quantity(&responses, 1, "treasury eth_getBalance")?;
-        let protected_treasury =
-            native_top_up_reserve(max_fee_per_gas, self.config.treasury_floor_wei)
-                .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let top_up_gas_cost = protected_treasury - U256::from(self.config.treasury_floor_wei);
-        // If the treasury can satisfy this bundle but not the preferred float, make a partial
-        // top-up. The next bundle will replenish the float when more treasury funds arrive.
-        let Some(amount) = treasury_affordable_top_up(
-            capped_amount,
-            deficit,
-            treasury_balance,
-            protected_treasury,
-        ) else {
-            let required_treasury = deficit
-                .checked_add(protected_treasury)
-                .ok_or_else(|| ExecutorItemError("treasury balance requirement overflow".into()))?;
-            tracing::warn!(
-                chain_id,
-                treasury_native_balance = %treasury_balance,
-                required_native_balance = %required_treasury,
-                requested_top_up_native_amount = %capped_amount,
-                minimum_top_up_native_amount = %deficit,
-                top_up_gas_cost = %top_up_gas_cost,
-                reserve_native_amount = self.config.treasury_floor_wei,
-                "treasury cannot fund the current UserOperation relayer prefund"
-            );
-            return Err(ExecutorItemError(
-                "treasury balance cannot cover the current UserOperation prefund, top-up gas, and reserve floor".into(),
-            ));
-        };
-        if amount < capped_amount {
-            tracing::info!(
-                chain_id,
-                requested_top_up_native_amount = %capped_amount,
-                submitted_top_up_native_amount = %amount,
-                minimum_top_up_native_amount = %deficit,
-                "treasury funding the current UserOperation with a partial relayer float top-up"
-            );
-        }
-        let amount_u128 = u128::try_from(amount)
-            .map_err(|_| ExecutorItemError("top-up amount exceeds uint128".into()))?;
-
-        self.ensure_lease(lease_scope, lease_token).await?;
-        let signed = sign_eip1559(
-            &self.treasury_key,
-            TransactionPlan {
-                chain_id,
-                nonce,
-                gas_limit: TOP_UP_GAS_LIMIT,
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-                to: relayer,
-                value: amount,
-                input: Bytes::new(),
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedFundingIntent {
-            chain_id,
-            relayer: relayer.to_string(),
-            amount_wei: amount_u128,
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash,
-            nonce: signed.nonce,
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_funding_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            if let Some(existing) = self
-                .store
-                .get_prepared_funding_intent(chain_id)
-                .await
-                .map_err(store_item_error)?
-            {
-                self.resume_funding_intent(&existing).await?;
-                return Ok(FundingReadiness::Pending);
-            }
-            return Err(ExecutorItemError(
-                "another treasury relayer top-up is pending".into(),
-            ));
-        }
-        self.broadcast_funding_intent(&intent).await?;
-        tracing::info!(
-            chain_id,
-            relayer = %relayer,
-            amount_wei = amount_u128,
-            transaction_hash = %intent.transaction_hash,
-            "submitted treasury relayer gas top-up"
-        );
-        Ok(FundingReadiness::Pending)
-    }
-
-    async fn resume_funding_intent(
-        &self,
-        intent: &PreparedFundingIntent,
-    ) -> Result<(), ExecutorItemError> {
-        self.broadcast_funding_intent(intent).await?;
-        let claimed = self
-            .store
-            .acquire_lease(
-                &format!("receipt:{}:{}", intent.chain_id, intent.transaction_hash),
-                &unique_token("funding-receipt"),
-                self.config.receipt_poll_interval,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if !claimed {
-            return Ok(());
-        }
-        let receipt = self
-            .rpc
-            .call(
-                intent.chain_id,
-                "eth_getTransactionReceipt",
-                json!([intent.transaction_hash]),
-            )
-            .await
-            .map_err(rpc_item_error)?;
-        if receipt.is_null() {
-            return Ok(());
-        }
-        let Some(success) = receipt_succeeded(&receipt) else {
-            return Err(ExecutorItemError(
-                "funding transaction receipt has invalid status".into(),
-            ));
-        };
-        self.store
-            .clear_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
-            .await
-            .map_err(store_item_error)?;
-        self.broadcast_seen
-            .lock()
-            .await
-            .remove(&intent.transaction_hash);
-        if !success {
-            tracing::error!(
-                chain_id = intent.chain_id,
-                relayer = %intent.relayer,
-                amount_wei = intent.amount_wei,
-                transaction_hash = %intent.transaction_hash,
-                "treasury relayer top-up transaction reverted"
-            );
-            return Err(ExecutorItemError(format!(
-                "treasury relayer top-up transaction reverted: {}",
-                intent.transaction_hash
-            )));
-        }
-        tracing::info!(
-            chain_id = intent.chain_id,
-            relayer = %intent.relayer,
-            amount_wei = intent.amount_wei,
-            transaction_hash = %intent.transaction_hash,
-            "treasury relayer gas top-up included"
-        );
-        Ok(())
-    }
-
-    async fn broadcast_funding_intent(
-        &self,
-        intent: &PreparedFundingIntent,
-    ) -> Result<(), ExecutorItemError> {
-        let raw = validate_raw_transaction(&intent.raw_transaction, &intent.transaction_hash)?;
-        if self
-            .recently_confirmed_broadcast(&intent.transaction_hash)
-            .await
-        {
-            return Ok(());
-        }
-        let outcome = match self
-            .rpc
-            .broadcast_raw_transaction(intent.chain_id, &raw)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                return Err(rpc_item_error(error));
-            }
-        };
-        match outcome {
-            BroadcastOutcome::Accepted(hash)
-                if hash.eq_ignore_ascii_case(&intent.transaction_hash) =>
-            {
-                self.remember_confirmed_broadcast(&intent.transaction_hash)
-                    .await;
-                Ok(())
-            }
-            BroadcastOutcome::Accepted(_) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                Err(ExecutorItemError(
-                    "RPC returned a different funding transaction hash".into(),
-                ))
-            }
-            BroadcastOutcome::Ambiguous(reason) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                tracing::debug!(
-                    chain_id = intent.chain_id,
-                    transaction_hash = %intent.transaction_hash,
-                    reason,
-                    "funding broadcast is ambiguous; retaining exact outbox"
-                );
-                Ok(())
-            }
-            BroadcastOutcome::Rejected(reason) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                if self
-                    .transaction_is_known(intent.chain_id, &intent.transaction_hash)
-                    .await
-                {
-                    self.remember_confirmed_broadcast(&intent.transaction_hash)
-                        .await;
-                } else {
-                    tracing::warn!(
-                        chain_id = intent.chain_id,
-                        transaction_hash = %intent.transaction_hash,
-                        reason,
-                        "rejected broadcast is unproven; retaining exact funding outbox"
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
 }
 
 impl UserOperationHandler for ExecutorEngine {
@@ -1927,6 +1364,10 @@ struct BatchShell<'a> {
     assets: Option<ResolvedChainAssets>,
     heartbeat: Option<tokio::task::JoinHandle<()>>,
     lease_acquired: bool,
+    treasury_scope: String,
+    treasury_token: String,
+    treasury_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    treasury_lease_acquired: bool,
 }
 
 impl BatchShell<'_> {
@@ -2439,33 +1880,6 @@ impl BatchShell<'_> {
                     },
                 }
             }
-            Op::EnsureRelayerFunded {
-                relayer_balance,
-                required_prefund,
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-                top_up_max,
-            } => {
-                match engine
-                    .ensure_relayer_funded(
-                        chain_id,
-                        engine.relayer_addresses[self.lane as usize],
-                        *relayer_balance,
-                        *required_prefund,
-                        *max_fee_per_gas,
-                        *max_priority_fee_per_gas,
-                        *top_up_max,
-                    )
-                    .await
-                {
-                    Ok(readiness) => Out::Funding {
-                        ready: readiness == FundingReadiness::Ready,
-                    },
-                    Err(error) => Out::Failed {
-                        message: error.to_string(),
-                    },
-                }
-            }
             Op::SignBundle { request } => {
                 match sign_eip1559(
                     &engine.relayer_keys[self.lane as usize],
@@ -2556,6 +1970,386 @@ impl BatchShell<'_> {
                         message: error.to_string(),
                     },
                 }
+            }
+            Op::AcquireTreasuryLease => {
+                let acquired = engine
+                    .store
+                    .acquire_lease(
+                        &self.treasury_scope,
+                        &self.treasury_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if acquired {
+                    self.treasury_lease_acquired = true;
+                    self.start_treasury_heartbeat();
+                }
+                Out::LeaseAcquired { acquired }
+            }
+            Op::EnsureTreasuryLease => {
+                match engine
+                    .store
+                    .renew_lease(
+                        &self.treasury_scope,
+                        &self.treasury_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                {
+                    Ok(held) => Out::LeaseHeld { held },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ReleaseTreasuryLease => {
+                self.release_treasury_lease().await;
+                Out::Done
+            }
+            Op::LoadPreparedFunding => {
+                match engine.store.get_prepared_funding_intent(chain_id).await {
+                    Ok(intent) => Out::FundingIntent { intent },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SaveFundingIntent { intent } => {
+                match engine.store.save_prepared_funding_intent(intent).await {
+                    Ok(saved) => Out::Saved { saved },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ClearFundingIntent { transaction_hash } => {
+                match engine
+                    .store
+                    .clear_prepared_funding_intent(chain_id, transaction_hash)
+                    .await
+                {
+                    Ok(_) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTreasuryContext => {
+                let calls = [
+                    RpcBatchCall {
+                        method: "eth_getTransactionCount",
+                        params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_getBalance",
+                        params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                ];
+                match engine.rpc.batch(chain_id, &calls).await {
+                    Ok(responses) => {
+                        let context =
+                            response_quantity(&responses, 0, "treasury eth_getTransactionCount")
+                                .and_then(|nonce| {
+                                    let nonce = u64::try_from(nonce).map_err(|_| {
+                                        ExecutorItemError("treasury nonce exceeds uint64".into())
+                                    })?;
+                                    let balance = response_quantity(
+                                        &responses,
+                                        1,
+                                        "treasury eth_getBalance",
+                                    )?;
+                                    Ok((nonce, balance))
+                                });
+                        match context {
+                            Ok((nonce, balance)) => Out::TreasuryContext { nonce, balance },
+                            Err(error) => Out::Failed {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTempoTreasuryContext { transfer_amount } => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
+                let transfer_calldata =
+                    tempo::path_usd_transfer_calldata(relayer, *transfer_amount);
+                let calls = [
+                    RpcBatchCall {
+                        method: "eth_getTransactionCount",
+                        params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_call",
+                        params: json!([{
+                            "to": tempo::PATH_USD.to_string(),
+                            "data": format!("0x{}", hex::encode(tempo::path_usd_balance_calldata(engine.treasury_address))),
+                        }, "latest"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_estimateGas",
+                        params: json!([{
+                            "from": engine.treasury_address.to_string(),
+                            "to": tempo::PATH_USD.to_string(),
+                            "data": format!("0x{}", hex::encode(&transfer_calldata)),
+                            "feeToken": tempo::PATH_USD.to_string(),
+                        }, "latest"]),
+                    },
+                ];
+                match engine.rpc.batch(chain_id, &calls).await {
+                    Ok(responses) => {
+                        let context = response_quantity(&responses, 0, "Tempo treasury nonce")
+                            .and_then(|nonce| {
+                                let nonce = u64::try_from(nonce).map_err(|_| {
+                                    ExecutorItemError("Tempo treasury nonce exceeds uint64".into())
+                                })?;
+                                let balance = response_abi_u256(
+                                    &responses,
+                                    1,
+                                    "Tempo treasury pathUSD balance",
+                                )?;
+                                let raw_gas_estimate = u64::try_from(response_quantity(
+                                    &responses,
+                                    2,
+                                    "Tempo pathUSD top-up eth_estimateGas",
+                                )?)
+                                .map_err(|_| {
+                                    ExecutorItemError(
+                                        "Tempo pathUSD top-up gas estimate exceeds uint64".into(),
+                                    )
+                                })?;
+                                Ok((nonce, balance, raw_gas_estimate))
+                            });
+                        match context {
+                            Ok((nonce, balance, raw_gas_estimate)) => Out::TempoTreasuryContext {
+                                nonce,
+                                balance,
+                                raw_gas_estimate,
+                            },
+                            Err(error) => Out::Failed {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTreasuryTransfer { request } => {
+                match sign_eip1559(
+                    &engine.treasury_key,
+                    TransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: TOP_UP_GAS_LIMIT,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+                        to: engine.relayer_addresses[self.lane as usize],
+                        value: request.amount,
+                        input: Bytes::new(),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTreasuryPathUsd { request } => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
+                match sign_tempo(
+                    &engine.treasury_key,
+                    TempoTransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: request.gas_limit,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: 0,
+                        fee_token: tempo::PATH_USD,
+                        to: tempo::PATH_USD,
+                        input: tempo::path_usd_transfer_calldata(relayer, request.amount),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::AcquireReceiptProbe { transaction_hash } => {
+                match engine
+                    .store
+                    .acquire_lease(
+                        &format!("receipt:{chain_id}:{transaction_hash}"),
+                        &unique_token("funding-receipt"),
+                        engine.config.receipt_poll_interval,
+                    )
+                    .await
+                {
+                    Ok(acquired) => Out::LeaseAcquired { acquired },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTransactionReceipt { transaction_hash } => {
+                match engine
+                    .rpc
+                    .call(
+                        chain_id,
+                        "eth_getTransactionReceipt",
+                        json!([transaction_hash]),
+                    )
+                    .await
+                {
+                    Ok(receipt) => Out::Receipt {
+                        receipt: (!receipt.is_null()).then_some(receipt),
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::RecordTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                requested,
+                minimum,
+                top_up_gas_cost,
+            } => {
+                tracing::warn!(
+                    chain_id,
+                    treasury_native_balance = %treasury_balance,
+                    required_native_balance = %required_treasury,
+                    requested_top_up_native_amount = %requested,
+                    minimum_top_up_native_amount = %minimum,
+                    top_up_gas_cost = %top_up_gas_cost,
+                    reserve_native_amount = engine.config.treasury_floor_wei,
+                    "treasury cannot fund the current UserOperation relayer prefund"
+                );
+                Out::Done
+            }
+            Op::RecordTempoTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                top_up,
+                top_up_gas_limit,
+                top_up_gas_cost,
+            } => {
+                tracing::warn!(
+                    chain_id,
+                    treasury_path_usd_balance = %treasury_balance,
+                    required_path_usd = %required_treasury,
+                    top_up_path_usd = %top_up,
+                    top_up_gas_limit,
+                    top_up_gas_path_usd = %top_up_gas_cost,
+                    reserve_path_usd = tempo::TEMPO_TREASURY_FLOOR,
+                    "Tempo treasury cannot fund the pending relayer top-up"
+                );
+                Out::Done
+            }
+            Op::RecordPartialTopUp {
+                requested,
+                submitted,
+                minimum,
+            } => {
+                tracing::info!(
+                    chain_id,
+                    requested_top_up_native_amount = %requested,
+                    submitted_top_up_native_amount = %submitted,
+                    minimum_top_up_native_amount = %minimum,
+                    "treasury funding the current UserOperation with a partial relayer float top-up"
+                );
+                Out::Done
+            }
+            Op::RecordFundingSubmitted {
+                amount,
+                transaction_hash,
+                tempo: is_tempo,
+            } => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
+                if *is_tempo {
+                    tracing::info!(
+                        chain_id,
+                        relayer = %relayer,
+                        amount_path_usd = %amount,
+                        transaction_hash = %transaction_hash,
+                        "submitted Tempo treasury pathUSD relayer top-up"
+                    );
+                } else {
+                    tracing::info!(
+                        chain_id,
+                        relayer = %relayer,
+                        amount_wei = %amount,
+                        transaction_hash = %transaction_hash,
+                        "submitted treasury relayer gas top-up"
+                    );
+                }
+                Out::Done
+            }
+            Op::RecordUnprovenFunding {
+                transaction_hash,
+                ambiguous,
+                reason,
+            } => {
+                if *ambiguous {
+                    tracing::debug!(
+                        chain_id,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "funding broadcast is ambiguous; retaining exact outbox"
+                    );
+                } else {
+                    tracing::warn!(
+                        chain_id,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "rejected broadcast is unproven; retaining exact funding outbox"
+                    );
+                }
+                Out::Done
+            }
+            Op::NoteFundingReceipt { intent, success } => {
+                if *success {
+                    tracing::info!(
+                        chain_id = intent.chain_id,
+                        relayer = %intent.relayer,
+                        amount_wei = intent.amount_wei,
+                        transaction_hash = %intent.transaction_hash,
+                        "treasury relayer gas top-up included"
+                    );
+                } else {
+                    tracing::error!(
+                        chain_id = intent.chain_id,
+                        relayer = %intent.relayer,
+                        amount_wei = intent.amount_wei,
+                        transaction_hash = %intent.transaction_hash,
+                        "treasury relayer top-up transaction reverted"
+                    );
+                }
+                Out::Done
             }
             Op::RecordUnprovenBroadcast {
                 transaction_hash,
@@ -2672,29 +2466,6 @@ impl BatchShell<'_> {
                     },
                 }
             }
-            Op::EnsureTempoRelayerFunded {
-                relayer_path_usd_balance,
-                required_prefund,
-                outer_max_fee,
-            } => {
-                match engine
-                    .ensure_tempo_relayer_funded(
-                        chain_id,
-                        engine.relayer_addresses[self.lane as usize],
-                        *relayer_path_usd_balance,
-                        *required_prefund,
-                        *outer_max_fee,
-                    )
-                    .await
-                {
-                    Ok(readiness) => Out::Funding {
-                        ready: readiness == FundingReadiness::Ready,
-                    },
-                    Err(error) => Out::Failed {
-                        message: error.to_string(),
-                    },
-                }
-            }
         }
     }
 
@@ -2718,7 +2489,51 @@ impl BatchShell<'_> {
         }));
     }
 
+    fn start_treasury_heartbeat(&mut self) {
+        let engine = self.engine.clone();
+        let scope = self.treasury_scope.clone();
+        let token = self.treasury_token.clone();
+        let ttl = engine.config.lease_ttl;
+        self.treasury_heartbeat = Some(tokio::spawn(async move {
+            let period = (ttl / 3).max(Duration::from_millis(1));
+            let start = tokio::time::Instant::now() + period;
+            let mut heartbeat = tokio::time::interval_at(start, period);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                heartbeat.tick().await;
+                if let Err(error) = engine.ensure_lease(&scope, &token).await {
+                    tracing::warn!(%error, "treasury lease heartbeat stopped");
+                    return;
+                }
+            }
+        }));
+    }
+
+    async fn release_treasury_lease(&mut self) {
+        if let Some(heartbeat) = self.treasury_heartbeat.take() {
+            heartbeat.abort();
+        }
+        if self.treasury_lease_acquired {
+            self.treasury_lease_acquired = false;
+            if let Err(error) = self
+                .engine
+                .store
+                .release_lease(&self.treasury_scope, &self.treasury_token)
+                .await
+            {
+                tracing::warn!(
+                    chain_id = self.chain_id,
+                    %error,
+                    "could not release treasury nonce lease"
+                );
+            }
+        }
+    }
+
     async fn finish(&mut self) {
+        // Backstop: a transiently erroring program must never leak the
+        // treasury lease past the batch.
+        self.release_treasury_lease().await;
         if let Some(heartbeat) = self.heartbeat.take() {
             heartbeat.abort();
         }
@@ -2737,13 +2552,6 @@ impl BatchShell<'_> {
             );
         }
     }
-}
-
-/// Converts Tempo's `attodollars/gas` price to micro-pathUSD, always rounding up so the relay
-/// never accepts an in-band reimbursement below the cost it is about to front.
-fn tempo_cost_in_path_usd(gas: U256, price_atto: U256) -> Result<U256, ExecutorItemError> {
-    tempo::tempo_cost_in_path_usd(gas, price_atto)
-        .ok_or_else(|| ExecutorItemError("Tempo pathUSD cost overflow".into()))
 }
 
 fn validate_raw_transaction(
@@ -2858,9 +2666,7 @@ fn parse_quantity(value: &str) -> Option<U256> {
 // funding policy in their core modules.
 use vela_relay_core::broadcast::{nonce_too_low, parse_hex_bytes};
 use vela_relay_core::execution as core_execution;
-use vela_relay_core::funding::{
-    TOP_UP_GAS_LIMIT, native_top_up_reserve, plan_native_top_up, treasury_affordable_top_up,
-};
+use vela_relay_core::funding::TOP_UP_GAS_LIMIT;
 use vela_relay_core::settlement::parse_market_usd_price;
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {

@@ -22,7 +22,7 @@ pub(crate) use queue::USER_OPERATION_QUEUE_RETENTION;
 pub use queue::UserOperationQueue;
 pub use state::{AppState, Readiness};
 pub use user_operation_store::{
-    ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent, PreparedFundingIntent,
+    ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent,
     PreparedSimulationDeploymentIntent, StoredUserOperation, UserOperationStatusStore,
 };
 
