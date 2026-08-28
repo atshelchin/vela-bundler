@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::{Display, Formatter},
     future::Future,
     str::FromStr,
@@ -36,16 +36,12 @@ use crate::{
 };
 
 use super::{
-    abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata},
+    abi::get_nonce_calldata,
     alert::TelegramAlertNotifier,
-    cost::allocate_bundle_gas,
     deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
-    settlement::{
-        ChainAssetConfig, SettlementLog, StablecoinConfig, parse_reimbursement,
-        verify_stable_transfer_logs,
-    },
+    settlement::{ChainAssetConfig, SettlementLog, StablecoinConfig},
     simulation::{SimulationVerdict, simulate_bundle, simulate_individually},
     transaction::{
         TempoTransactionPlan, TransactionPlan, sign_eip1559, sign_tempo, signer_address,
@@ -424,235 +420,6 @@ impl ExecutorEngine {
                 .collect(),
             None => failure_results(operations.len(), "lane batch never settled"),
         }
-    }
-
-    /// Composite executor for the Tempo `0x76` tail, unchanged in behavior;
-    /// per-item outcomes are returned instead of written into a results slice.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_tempo_bundle_composite(
-        &self,
-        chain_id: u64,
-        lane: u8,
-        entry_point: Address,
-        relayer: Address,
-        survivors: &[(usize, PackedOperation)],
-        hash_strings: &[String],
-        simulation: &core_execution::BundleSimulationData,
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<Vec<(usize, core_execution::ItemResolution)>, ExecutorItemError> {
-        let mut resolutions = Vec::new();
-        // A generic token here would make the treasury's pathUSD float unable
-        // to replenish the relayer. Accept the wallet extension only when it
-        // agrees with the protocol default; omitted `feeToken` canonically
-        // means pathUSD.
-        if let Some(((index, packed), hash_string)) =
-            survivors.iter().zip(hash_strings).find(|((_, packed), _)| {
-                packed
-                    .fee_token
-                    .is_some_and(|fee_token| fee_token != tempo::PATH_USD)
-            })
-        {
-            self.store
-                .mark_rejected(hash_string)
-                .await
-                .map_err(store_item_error)?;
-            resolutions.push((*index, core_execution::ItemResolution::Durable));
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %hash_string,
-                fee_token = ?packed.fee_token,
-                "Tempo UserOperation requested an unsupported fee token"
-            );
-            return Ok(resolutions);
-        }
-
-        let calldata = handle_ops_calldata(
-            &survivors
-                .iter()
-                .map(|(_, packed)| packed.packed.clone())
-                .collect::<Vec<_>>(),
-            self.treasury_address,
-        );
-        let context = self.tempo_transaction_context(chain_id, relayer).await?;
-        let allocations = allocate_bundle_gas(
-            simulation.gas_used,
-            simulation.gas_used,
-            &simulation.operation_gas_used,
-            0,
-            tempo::TEMPO_COST_BUFFER_GAS,
-        )
-        .ok_or_else(|| ExecutorItemError("Tempo bundle gas allocation overflow".into()))?;
-        let costs = allocations
-            .iter()
-            .map(|gas| tempo_cost_in_path_usd(*gas, context.base_fee_atto))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut rejected_any = false;
-        let allowlist = BTreeSet::from([tempo::PATH_USD]);
-        for (((index, packed), hash_string), cost) in survivors.iter().zip(hash_strings).zip(&costs)
-        {
-            let reimbursement =
-                parse_reimbursement(packed.call_data.as_ref(), self.treasury_address, &allowlist);
-            let (paid, stable_logs_valid) = match reimbursement {
-                Ok(reimbursement) => (
-                    reimbursement
-                        .stablecoins
-                        .get(&tempo::PATH_USD)
-                        .copied()
-                        .unwrap_or_default(),
-                    verify_stable_transfer_logs(
-                        &reimbursement,
-                        packed.sender,
-                        self.treasury_address,
-                        &simulation.logs,
-                    ),
-                ),
-                Err(_) => (U256::ZERO, false),
-            };
-            let required = marked_tempo_cost(*cost, self.config.settlement_markup_bps)?;
-            if paid < required || !stable_logs_valid {
-                let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
-                self.store
-                    .mark_rejected_with_executor_reason(hash_string, "in_band_settlement", &reason)
-                    .await
-                    .map_err(store_item_error)?;
-                resolutions.push((*index, core_execution::ItemResolution::Durable));
-                rejected_any = true;
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %hash_string,
-                    paid = %paid,
-                    required = %required,
-                    stable_logs_valid,
-                    "Tempo pathUSD in-band settlement rejected UserOperation"
-                );
-                self.notify_executor_issue(chain_id, "in_band_settlement", hash_string, &reason);
-            }
-        }
-        if rejected_any {
-            return Ok(resolutions);
-        }
-
-        let gas_limit = tempo_handle_ops_gas_limit_packed(
-            &survivors
-                .iter()
-                .map(|(_, packed)| packed)
-                .collect::<Vec<_>>(),
-        )?;
-        let outer_max_fee = context
-            .base_fee_atto
-            .checked_add(context.base_fee_atto / U256::from(2u8))
-            .ok_or_else(|| ExecutorItemError("Tempo outer fee overflow".into()))?;
-        let outer_max_fee = u128::try_from(outer_max_fee)
-            .map_err(|_| ExecutorItemError("Tempo outer fee exceeds uint128".into()))?;
-        let required_prefund =
-            tempo_cost_in_path_usd(U256::from(gas_limit), U256::from(outer_max_fee))?;
-        if self
-            .ensure_tempo_relayer_funded(
-                chain_id,
-                relayer,
-                context.relayer_path_usd_balance,
-                required_prefund,
-                outer_max_fee,
-            )
-            .await?
-            == FundingReadiness::Pending
-        {
-            for hash_string in hash_strings {
-                self.record_deferred_diagnostic(
-                    chain_id,
-                    hash_string,
-                    "funding",
-                    "waiting for relayer pathUSD funding transaction confirmation",
-                )
-                .await;
-            }
-            return Ok(resolutions);
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        let signed = sign_tempo(
-            &self.relayer_keys[lane as usize],
-            TempoTransactionPlan {
-                chain_id,
-                nonce: context.nonce,
-                gas_limit,
-                max_fee_per_gas: outer_max_fee,
-                max_priority_fee_per_gas: 0,
-                fee_token: tempo::PATH_USD,
-                to: entry_point,
-                input: calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedBundleIntent {
-            chain_id,
-            lane,
-            entry_point: entry_point.to_string(),
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash.clone(),
-            nonce: signed.nonce,
-            user_operation_hashes: hash_strings.to_vec(),
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_bundle_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            let existing = self
-                .store
-                .get_prepared_bundle_intent(chain_id, lane)
-                .await
-                .map_err(store_item_error)?
-                .ok_or_else(|| {
-                    ExecutorItemError("prepared Tempo bundle raced and disappeared".into())
-                })?;
-            self.resume_bundle_intent(&existing).await?;
-            return Ok(resolutions);
-        }
-        if self.broadcast_bundle_intent(&intent).await? == BundleBroadcastDisposition::Unknown {
-            for hash_string in hash_strings {
-                self.record_deferred_diagnostic(
-                    chain_id,
-                    hash_string,
-                    "broadcast",
-                    "signed Tempo handleOps transaction awaits broadcast confirmation",
-                )
-                .await;
-            }
-            return Ok(resolutions);
-        }
-        let indexed = self
-            .store
-            .mark_bundle_submitted(
-                chain_id,
-                &intent.transaction_hash,
-                &intent.user_operation_hashes,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if indexed != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "not every signed Tempo UserOperation entered submitted state".into(),
-            ));
-        }
-        for (index, _) in survivors {
-            resolutions.push((*index, core_execution::ItemResolution::Durable));
-        }
-        tracing::info!(
-            chain_id,
-            lane,
-            relayer = %relayer,
-            transaction_hash = %intent.transaction_hash,
-            nonce = intent.nonce,
-            operations = intent.user_operation_hashes.len(),
-            gas_limit,
-            fee_token = %tempo::PATH_USD,
-            "submitted Tempo 0x76 handleOps transaction"
-        );
-        Ok(resolutions)
     }
 
     /// Best-effort retry diagnostic (store write only; the Telegram decision
@@ -2147,34 +1914,6 @@ impl UserOperationHandler for ExecutorEngine {
     }
 }
 
-/// Tempo's outer `0x76` gas limit deliberately comes from the UserOperations' declared limits,
-/// rather than `eth_estimateGas`: EntryPoint catches an inner OOG and an estimate can therefore
-/// succeed while a user's actual execution runs out of gas.
-fn tempo_handle_ops_gas_limit_packed(
-    operations: &[&PackedOperation],
-) -> Result<u64, ExecutorItemError> {
-    let declared = operations.iter().try_fold(U256::ZERO, |total, packed| {
-        let limits = packed.packed.accountGasLimits.as_slice();
-        let verification = U256::from_be_slice(&limits[..16]);
-        let call = U256::from_be_slice(&limits[16..]);
-        total
-            .checked_add(verification)?
-            .checked_add(call)?
-            .checked_add(packed.packed.preVerificationGas)
-    });
-    let declared =
-        declared.ok_or_else(|| ExecutorItemError("Tempo declared gas overflow".into()))?;
-    let gas = declared
-        .checked_mul(U256::from(64u8))
-        .map(|value| value / U256::from(63u8))
-        .and_then(|value| {
-            value.checked_add(U256::from(operations.len()).checked_mul(U256::from(50_000u64))?)
-        })
-        .and_then(|value| value.checked_add(U256::from(60_000u64)))
-        .ok_or_else(|| ExecutorItemError("Tempo outer gas limit overflow".into()))?;
-    u64::try_from(gas).map_err(|_| ExecutorItemError("Tempo outer gas limit exceeds uint64".into()))
-}
-
 /// The shell side of one lane-batch program: executes the core's requested
 /// operations against real infrastructure. Failures fold into result data —
 /// the core decides what they mean.
@@ -2316,6 +2055,14 @@ impl BatchShell<'_> {
                                 user_nonce = %user_nonce,
                                 onchain_nonce = %onchain_nonce,
                                 "stale account nonce rejected UserOperation"
+                            );
+                        }
+                        core_execution::RejectionCause::UnsupportedTempoFeeToken { fee_token } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                fee_token = ?fee_token,
+                                "Tempo UserOperation requested an unsupported fee token"
                             );
                         }
                     }
@@ -2846,16 +2593,30 @@ impl BatchShell<'_> {
                 {
                     Ok(indexed) => {
                         if indexed == intent.user_operation_hashes.len() {
-                            tracing::info!(
-                                chain_id,
-                                lane = self.lane,
-                                relayer = %engine.relayer_addresses[self.lane as usize],
-                                transaction_hash = %intent.transaction_hash,
-                                nonce = intent.nonce,
-                                operations = intent.user_operation_hashes.len(),
-                                gas_limit,
-                                "submitted handleOps transaction"
-                            );
+                            if intent.raw_transaction.starts_with("0x76") {
+                                tracing::info!(
+                                    chain_id,
+                                    lane = self.lane,
+                                    relayer = %engine.relayer_addresses[self.lane as usize],
+                                    transaction_hash = %intent.transaction_hash,
+                                    nonce = intent.nonce,
+                                    operations = intent.user_operation_hashes.len(),
+                                    gas_limit,
+                                    fee_token = %tempo::PATH_USD,
+                                    "submitted Tempo 0x76 handleOps transaction"
+                                );
+                            } else {
+                                tracing::info!(
+                                    chain_id,
+                                    lane = self.lane,
+                                    relayer = %engine.relayer_addresses[self.lane as usize],
+                                    transaction_hash = %intent.transaction_hash,
+                                    nonce = intent.nonce,
+                                    operations = intent.user_operation_hashes.len(),
+                                    gas_limit,
+                                    "submitted handleOps transaction"
+                                );
+                            }
                         }
                         Out::Indexed { indexed }
                     }
@@ -2864,34 +2625,71 @@ impl BatchShell<'_> {
                     },
                 }
             }
-            Op::ExecuteTempoBundle {
-                entry_point,
-                survivors,
-                simulation,
-            } => {
-                let hash_strings = survivors
-                    .iter()
-                    .map(|(index, _)| {
-                        self.operations[*index]
-                            .user_operation_hash
-                            .to_ascii_lowercase()
-                    })
-                    .collect::<Vec<_>>();
+            Op::FetchTempoContext => {
                 match engine
-                    .execute_tempo_bundle_composite(
+                    .tempo_transaction_context(
                         chain_id,
-                        self.lane,
-                        *entry_point,
                         engine.relayer_addresses[self.lane as usize],
-                        survivors,
-                        &hash_strings,
-                        simulation,
-                        &self.lease_scope,
-                        &self.lease_token,
                     )
                     .await
                 {
-                    Ok(resolutions) => Out::TempoOutcome { resolutions },
+                    Ok(context) => Out::TempoContext {
+                        base_fee_atto: context.base_fee_atto,
+                        nonce: context.nonce,
+                        relayer_path_usd_balance: context.relayer_path_usd_balance,
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTempoBundle { request } => {
+                match sign_tempo(
+                    &engine.relayer_keys[self.lane as usize],
+                    TempoTransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: request.gas_limit,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: 0,
+                        fee_token: tempo::PATH_USD,
+                        to: request.entry_point,
+                        input: request.calldata.clone().into(),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::EnsureTempoRelayerFunded {
+                relayer_path_usd_balance,
+                required_prefund,
+                outer_max_fee,
+            } => {
+                match engine
+                    .ensure_tempo_relayer_funded(
+                        chain_id,
+                        engine.relayer_addresses[self.lane as usize],
+                        *relayer_path_usd_balance,
+                        *required_prefund,
+                        *outer_max_fee,
+                    )
+                    .await
+                {
+                    Ok(readiness) => Out::Funding {
+                        ready: readiness == FundingReadiness::Ready,
+                    },
                     Err(error) => Out::Failed {
                         message: error.to_string(),
                     },
@@ -2946,11 +2744,6 @@ impl BatchShell<'_> {
 fn tempo_cost_in_path_usd(gas: U256, price_atto: U256) -> Result<U256, ExecutorItemError> {
     tempo::tempo_cost_in_path_usd(gas, price_atto)
         .ok_or_else(|| ExecutorItemError("Tempo pathUSD cost overflow".into()))
-}
-
-fn marked_tempo_cost(cost: U256, markup_bps: u64) -> Result<U256, ExecutorItemError> {
-    vela_relay_core::settlement::marked_tempo_cost(cost, markup_bps)
-        .ok_or_else(|| ExecutorItemError("Tempo settlement markup overflow".into()))
 }
 
 fn validate_raw_transaction(
@@ -3068,7 +2861,7 @@ use vela_relay_core::execution as core_execution;
 use vela_relay_core::funding::{
     TOP_UP_GAS_LIMIT, native_top_up_reserve, plan_native_top_up, treasury_affordable_top_up,
 };
-use vela_relay_core::settlement::{parse_market_usd_price, settlement_rejection_reason};
+use vela_relay_core::settlement::parse_market_usd_price;
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {
     (0..count).map(|_| item_error(message)).collect()

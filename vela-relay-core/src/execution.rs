@@ -132,6 +132,16 @@ pub struct SignedBundle {
     pub nonce: u64,
 }
 
+/// The Tempo `0x76` plan the shell signs (fee token is always pathUSD, tip 0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TempoSignRequest {
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub max_fee_per_gas: u128,
+    pub entry_point: Address,
+    pub calldata: Vec<u8>,
+}
+
 /// The plan the shell signs; keys never cross into the core.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BundleSignRequest {
@@ -271,12 +281,17 @@ pub enum ExecutionOperation {
         intent: PreparedBundleIntent,
         gas_limit: u64,
     },
-    /// Composite: the whole Tempo `0x76` tail (context, settlement gate,
-    /// funding, sign, broadcast) exactly as today.
-    ExecuteTempoBundle {
-        entry_point: Address,
-        survivors: Vec<(usize, PackedOperation)>,
-        simulation: BundleSimulationData,
+    /// Tempo fee/nonce/pathUSD-balance context for the outer `0x76`.
+    FetchTempoContext,
+    SignTempoBundle {
+        request: TempoSignRequest,
+    },
+    /// Composite: treasury lease + probe + sign + broadcast of a pathUSD
+    /// top-up (decomposes with the funding batch).
+    EnsureTempoRelayerFunded {
+        relayer_path_usd_balance: U256,
+        required_prefund: U256,
+        outer_max_fee: u128,
     },
 }
 
@@ -294,6 +309,10 @@ pub enum RejectionCause {
     StaleNonce {
         user_nonce: U256,
         onchain_nonce: U256,
+    },
+    /// A Tempo wallet extension requested a fee token other than pathUSD.
+    UnsupportedTempoFeeToken {
+        fee_token: Option<Address>,
     },
 }
 
@@ -399,8 +418,10 @@ pub enum ExecutionOutcome {
     Indexed {
         indexed: usize,
     },
-    TempoOutcome {
-        resolutions: Vec<(usize, ItemResolution)>,
+    TempoContext {
+        base_fee_atto: U256,
+        nonce: u64,
+        relayer_path_usd_balance: U256,
     },
     /// Any infrastructure failure, folded to its display text; the program
     /// decides what it means at each step.
@@ -1086,30 +1107,16 @@ async fn execute_with_lane_lease(
     ensure_lane_lease(ctx).await?;
 
     if policy.is_tempo {
-        let resolutions = match request(
+        return execute_tempo_bundle(
             ctx,
-            ExecutionOperation::ExecuteTempoBundle {
-                entry_point,
-                survivors: survivors
-                    .iter()
-                    .map(|candidate| (candidate.result_index, candidate.packed.clone()))
-                    .collect(),
-                simulation: bundle_simulation,
-            },
+            start,
+            &chain_assets,
+            entry_point,
+            survivors,
+            bundle_simulation,
+            results,
         )
-        .await
-        {
-            ExecutionOutcome::TempoOutcome { resolutions } => resolutions,
-            ExecutionOutcome::Failed { message } => return Err(message),
-            _ => return Err("unexpected shell response".to_owned()),
-        };
-        for (index, resolution) in resolutions {
-            match resolution {
-                ItemResolution::Durable => results.durable(index),
-                ItemResolution::Failed { reason } => results.failed(index, reason),
-            }
-        }
-        return Ok(());
+        .await;
     }
 
     let calldata = handle_ops_calldata(
@@ -1421,6 +1428,276 @@ async fn execute_with_lane_lease(
     };
     if indexed != intent.user_operation_hashes.len() {
         return Err("not every signed UserOperation entered submitted state".to_owned());
+    }
+    for candidate in survivors {
+        results.durable(candidate.result_index);
+    }
+    Ok(())
+}
+
+/// The Tempo `0x76` tail: fee-token gate, pathUSD settlement gate, funding,
+/// sign, persist, broadcast, mark — the pathUSD twin of the EIP-1559 tail.
+async fn execute_tempo_bundle(
+    ctx: &Ctx,
+    start: &StartBatch,
+    chain_assets: &ResolvedChainAssets,
+    entry_point: Address,
+    survivors: Vec<Candidate>,
+    simulation: BundleSimulationData,
+    results: &mut Results,
+) -> Result<(), String> {
+    let treasury = start_treasury(start);
+    let chain_id = start.operations[0].chain_id;
+    let lane = start.operations[0].lane;
+
+    // A generic token here would make the treasury's pathUSD float unable to
+    // replenish the relayer. Accept the wallet extension only when it agrees
+    // with the protocol default; omitted `feeToken` canonically means pathUSD.
+    if let Some(candidate) = survivors.iter().find(|candidate| {
+        candidate
+            .packed
+            .fee_token
+            .is_some_and(|fee_token| fee_token != crate::tempo::PATH_USD)
+    }) {
+        match request(
+            ctx,
+            ExecutionOperation::MarkRejected {
+                hash: candidate.hash_string.clone(),
+                cause: RejectionCause::UnsupportedTempoFeeToken {
+                    fee_token: candidate.packed.fee_token,
+                },
+            },
+        )
+        .await
+        {
+            ExecutionOutcome::Failed { message } => return Err(message),
+            _ => results.durable(candidate.result_index),
+        }
+        return Ok(());
+    }
+
+    let calldata = handle_ops_calldata(
+        &survivors
+            .iter()
+            .map(|candidate| candidate.packed.packed.clone())
+            .collect::<Vec<_>>(),
+        treasury,
+    );
+    let context = match request(ctx, ExecutionOperation::FetchTempoContext).await {
+        ExecutionOutcome::TempoContext {
+            base_fee_atto,
+            nonce,
+            relayer_path_usd_balance,
+        } => (base_fee_atto, nonce, relayer_path_usd_balance),
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let (base_fee_atto, nonce, relayer_path_usd_balance) = context;
+    let allocations = allocate_bundle_gas(
+        simulation.gas_used,
+        simulation.gas_used,
+        &simulation.operation_gas_used,
+        0,
+        crate::tempo::TEMPO_COST_BUFFER_GAS,
+    )
+    .ok_or_else(|| "Tempo bundle gas allocation overflow".to_owned())?;
+    let costs = allocations
+        .iter()
+        .map(|gas| {
+            crate::tempo::tempo_cost_in_path_usd(*gas, base_fee_atto)
+                .ok_or_else(|| "Tempo pathUSD cost overflow".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let allowlist = std::collections::BTreeSet::from([crate::tempo::PATH_USD]);
+    let mut rejected_any = false;
+    for (candidate, cost) in survivors.iter().zip(&costs) {
+        let reimbursement = crate::settlement::parse_reimbursement(
+            candidate.packed.call_data.as_ref(),
+            treasury,
+            &allowlist,
+        );
+        let (paid, stable_logs_valid) = match reimbursement {
+            Ok(reimbursement) => (
+                reimbursement
+                    .stablecoins
+                    .get(&crate::tempo::PATH_USD)
+                    .copied()
+                    .unwrap_or_default(),
+                verify_stable_transfer_logs(
+                    &reimbursement,
+                    candidate.packed.sender,
+                    treasury,
+                    &simulation.logs,
+                ),
+            ),
+            Err(_) => (U256::ZERO, false),
+        };
+        let required =
+            crate::settlement::marked_tempo_cost(*cost, chain_assets.assets.settlement_markup_bps)
+                .ok_or_else(|| "Tempo settlement markup overflow".to_owned())?;
+        if paid < required || !stable_logs_valid {
+            let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
+            if let ExecutionOutcome::Failed { message } = request(
+                ctx,
+                ExecutionOperation::MarkRejectedWithReason {
+                    hash: candidate.hash_string.clone(),
+                    stage: "in_band_settlement",
+                    reason: reason.clone(),
+                },
+            )
+            .await
+            {
+                return Err(message);
+            }
+            results.durable(candidate.result_index);
+            rejected_any = true;
+            let _ = request(
+                ctx,
+                ExecutionOperation::NotifyIssue {
+                    hash: candidate.hash_string.clone(),
+                    stage: "in_band_settlement",
+                    reason,
+                },
+            )
+            .await;
+        }
+    }
+    if rejected_any {
+        return Ok(());
+    }
+
+    let gas_limit = crate::tempo::tempo_handle_ops_gas_limit(
+        &survivors
+            .iter()
+            .map(|candidate| &candidate.packed)
+            .collect::<Vec<_>>(),
+    )
+    .map_err(str::to_owned)?;
+    let outer_max_fee = crate::tempo::tempo_outer_max_fee(base_fee_atto).map_err(str::to_owned)?;
+    let required_prefund =
+        crate::tempo::tempo_cost_in_path_usd(U256::from(gas_limit), U256::from(outer_max_fee))
+            .ok_or_else(|| "Tempo pathUSD cost overflow".to_owned())?;
+    // The current bundle takes precedence over filling the pathUSD float.
+    if relayer_path_usd_balance < required_prefund.max(U256::from(crate::tempo::TEMPO_FLOAT_MIN)) {
+        match request(
+            ctx,
+            ExecutionOperation::EnsureTempoRelayerFunded {
+                relayer_path_usd_balance,
+                required_prefund,
+                outer_max_fee,
+            },
+        )
+        .await
+        {
+            ExecutionOutcome::Funding { ready: true } => {}
+            ExecutionOutcome::Funding { ready: false } => {
+                record_candidates_deferred(
+                    ctx,
+                    &survivors,
+                    "funding",
+                    "waiting for relayer pathUSD funding transaction confirmation",
+                )
+                .await;
+                return Ok(());
+            }
+            ExecutionOutcome::Failed { message } => return Err(message),
+            _ => return Err("unexpected shell response".to_owned()),
+        }
+    }
+    ensure_lane_lease(ctx).await?;
+
+    let signed = match request(
+        ctx,
+        ExecutionOperation::SignTempoBundle {
+            request: TempoSignRequest {
+                nonce,
+                gas_limit,
+                max_fee_per_gas: outer_max_fee,
+                entry_point,
+                calldata: calldata.to_vec(),
+            },
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Signed { signed } => signed,
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let intent = PreparedBundleIntent {
+        chain_id,
+        lane,
+        entry_point: entry_point.to_string(),
+        raw_transaction: signed.raw_transaction_hex.clone(),
+        transaction_hash: signed.transaction_hash.clone(),
+        nonce: signed.nonce,
+        user_operation_hashes: survivors
+            .iter()
+            .map(|candidate| candidate.hash_string.clone())
+            .collect(),
+    };
+    ensure_lane_lease(ctx).await?;
+    match request(
+        ctx,
+        ExecutionOperation::SavePreparedBundle {
+            intent: intent.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Saved { saved: true } => {}
+        ExecutionOutcome::Saved { saved: false } => {
+            let existing = match request(ctx, ExecutionOperation::LoadPreparedBundle).await {
+                ExecutionOutcome::Intent {
+                    intent: Some(existing),
+                } => existing,
+                ExecutionOutcome::Intent { intent: None } => {
+                    return Err("prepared Tempo bundle raced and disappeared".to_owned());
+                }
+                ExecutionOutcome::Failed { message } => return Err(message),
+                _ => return Err("unexpected shell response".to_owned()),
+            };
+            match request(
+                ctx,
+                ExecutionOperation::ResumeBundleIntent { intent: existing },
+            )
+            .await
+            {
+                ExecutionOutcome::Resumed { .. } => {}
+                ExecutionOutcome::Failed { message } => return Err(message),
+                _ => return Err("unexpected shell response".to_owned()),
+            }
+            return Ok(());
+        }
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    if !broadcast_bundle(ctx, &intent).await? {
+        record_candidates_deferred(
+            ctx,
+            &survivors,
+            "broadcast",
+            "signed Tempo handleOps transaction awaits broadcast confirmation",
+        )
+        .await;
+        return Ok(());
+    }
+    let indexed = match request(
+        ctx,
+        ExecutionOperation::MarkBundleSubmitted {
+            intent: intent.clone(),
+            gas_limit,
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Indexed { indexed } => indexed,
+        ExecutionOutcome::Failed { message } => return Err(message),
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    if indexed != intent.user_operation_hashes.len() {
+        return Err("not every signed Tempo UserOperation entered submitted state".to_owned());
     }
     for candidate in survivors {
         results.durable(candidate.result_index);
@@ -2266,6 +2543,274 @@ mod tests {
                     .into(),
             },
             ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    fn path_usd_payment_call_data(amount: u128) -> String {
+        fn word_u128(value: u128) -> Vec<u8> {
+            let mut word = vec![0; 16];
+            word.extend(value.to_be_bytes());
+            word
+        }
+        let path_usd = crate::tempo::PATH_USD;
+        let mut transfer = vec![0xa9, 0x05, 0x9c, 0xbb];
+        let mut to_word = vec![0u8; 12];
+        to_word.extend(TREASURY.as_slice());
+        transfer.extend(to_word);
+        transfer.extend(word_u128(amount));
+
+        let mut packed = Vec::new();
+        packed.push(0);
+        packed.extend(path_usd.as_slice());
+        packed.extend(word_u128(0));
+        packed.extend(word_u128(transfer.len() as u128));
+        packed.extend(&transfer);
+
+        let mut multisend = vec![0x8d, 0x80, 0xff, 0x0a];
+        multisend.extend(word_u128(32));
+        multisend.extend(word_u128(packed.len() as u128));
+        multisend.extend(packed);
+        let padding = (32 - multisend.len() % 32) % 32;
+        multisend.resize(multisend.len() + padding, 0);
+
+        let mut call_data = vec![0x7b, 0xb3, 0x74, 0x28];
+        let mut trusted = vec![0u8; 12];
+        trusted.extend(address!("38869bf66a61cf6bdb996a6ae40d5853fd43b526").as_slice());
+        call_data.extend(trusted);
+        call_data.extend(word_u128(0));
+        call_data.extend(word_u128(128));
+        call_data.extend(word_u128(1));
+        call_data.extend(word_u128(multisend.len() as u128));
+        call_data.extend(multisend);
+        format!("0x{}", hex::encode(call_data))
+    }
+
+    fn path_usd_transfer_log(amount: u128) -> crate::settlement::SettlementLog {
+        fn address_topic(address: Address) -> alloy::primitives::B256 {
+            let mut word = [0u8; 32];
+            word[12..].copy_from_slice(address.as_slice());
+            alloy::primitives::B256::from(word)
+        }
+        let sender: Address = SENDER.parse().unwrap();
+        crate::settlement::SettlementLog {
+            address: crate::tempo::PATH_USD,
+            topics: vec![
+                alloy::primitives::keccak256(b"Transfer(address,address,uint256)"),
+                address_topic(sender),
+                address_topic(TREASURY),
+            ],
+            data: U256::from(amount).to_be_bytes::<32>().to_vec().into(),
+        }
+    }
+
+    #[test]
+    fn a_tempo_bundle_walks_the_path_usd_tail_to_submission() {
+        // pathUSD payment 10_000 covers required = max(ceil(1.4 × 3600), 0.01
+        // pathUSD) = 10_000; the relayer float (200k) already exceeds
+        // max(prefund 3_307, TEMPO_FLOAT_MIN 100k), so no funding operation.
+        let operation = {
+            let mut op = user_op(280);
+            op.call_data = path_usd_payment_call_data(10_000);
+            UserOperation::V0_7(Box::new(op))
+        };
+        let packed = PackedOperation::try_from(&operation).expect("fixture packs");
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let tempo_chain = 4_217u64;
+        let hash = user_operation_hash(&packed, entry_point, tempo_chain);
+        let hash_string = hash.to_string().to_ascii_lowercase();
+        let lane = relayer_index_for_sender(SENDER, 10) as u8;
+        let routed = RoutedUserOperation {
+            schema_version: 1,
+            user_operation_hash: hash_string.clone(),
+            chain_id: tempo_chain,
+            entry_point: ENTRY_POINT.into(),
+            user_operation: serde_json::to_value(&operation).unwrap(),
+            sender: SENDER.into(),
+            lane,
+            stream: "chain-4217".into(),
+            partition_id: 1,
+            offset: 7,
+        };
+        let record = StoredUserOperation {
+            status: UserOperationStatus::Queued,
+            transaction_hash: None,
+            chain_id: tempo_chain,
+            chain_id_text: tempo_chain.to_string(),
+            entry_point: ENTRY_POINT.into(),
+            user_operation: operation,
+            admitted: true,
+            next_receipt_check_at_ms: 0,
+            block_hash: None,
+            block_number: None,
+            receipt: None,
+            event: None,
+            last_executor_stage: None,
+            last_executor_error: None,
+            last_executor_attempt_at_ms: None,
+        };
+        let mut policy = policy();
+        policy.is_tempo = true;
+        let mut driver = Driver::start(StartBatch {
+            operations: vec![routed],
+            policy,
+            lease_token: "lane-token-1".into(),
+        });
+
+        let tempo_assets = ResolvedChainAssets {
+            assets: ChainAssetConfig {
+                native_decimals: crate::tempo::PATH_USD_DECIMALS,
+                settlement_markup_bps: 14_000,
+                stablecoins: BTreeMap::from([(
+                    crate::tempo::PATH_USD,
+                    crate::settlement::StablecoinConfig {
+                        symbol: crate::tempo::PATH_USD_SYMBOL.into(),
+                        decimals: crate::tempo::PATH_USD_DECIMALS,
+                    },
+                )]),
+            },
+            native_symbol: crate::tempo::PATH_USD_SYMBOL.into(),
+        };
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets {
+                resolved: tempo_assets,
+            },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(record)],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(hash, packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(hash, packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(BundleSimulationData {
+                    gas_used: U256::from(100_000u64),
+                    operation_gas_used: vec![U256::from(100_000u64)],
+                    logs: vec![path_usd_transfer_log(10_000)],
+                }),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::FetchTempoContext,
+            ExecutionOutcome::TempoContext {
+                base_fee_atto: U256::from(crate::tempo::TEMPO_BASE_FEE_ATTO),
+                nonce: 7,
+                relayer_path_usd_balance: U256::from(200_000u64),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let signed_raw = [0x76u8, 0x01, 0x02, 0x03];
+        let signed_hash = alloy::primitives::keccak256(signed_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignTempoBundle {
+                request: super::TempoSignRequest {
+                    nonce: 7,
+                    gas_limit: 110_203,
+                    max_fee_per_gas: 30_000_000_000,
+                    entry_point,
+                    calldata: crate::abi::handle_ops_calldata(
+                        std::slice::from_ref(&packed.packed),
+                        TREASURY,
+                    )
+                    .to_vec(),
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x76010203".into(),
+                    transaction_hash: signed_hash.clone(),
+                    nonce: 7,
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: tempo_chain,
+            lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: "0x76010203".into(),
+            transaction_hash: signed_hash.clone(),
+            nonce: 7,
+            user_operation_hashes: vec![hash_string.clone()],
+        };
+        driver.step(
+            ExecutionOperation::SavePreparedBundle {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: signed_raw.to_vec(),
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: signed_hash.clone(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: signed_hash,
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::MarkBundleSubmitted {
+                intent,
+                gas_limit: 110_203,
+            },
+            ExecutionOutcome::Indexed { indexed: 1 },
         );
         driver.assert_settled(&[ItemResolution::Durable]);
     }

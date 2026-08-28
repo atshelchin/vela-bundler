@@ -45,6 +45,42 @@ pub fn buffered_top_up_gas_limit(estimated_gas: u64) -> Option<u64> {
         .map(|value| value / 10_000)
 }
 
+/// Tempo's outer `0x76` gas limit deliberately comes from the UserOperations'
+/// declared limits, rather than `eth_estimateGas`: EntryPoint catches an
+/// inner OOG and an estimate can therefore succeed while a user's actual
+/// execution runs out of gas.
+pub fn tempo_handle_ops_gas_limit(
+    operations: &[&crate::abi::PackedOperation],
+) -> Result<u64, &'static str> {
+    let declared = operations.iter().try_fold(U256::ZERO, |total, packed| {
+        let limits = packed.packed.accountGasLimits.as_slice();
+        let verification = U256::from_be_slice(&limits[..16]);
+        let call = U256::from_be_slice(&limits[16..]);
+        total
+            .checked_add(verification)?
+            .checked_add(call)?
+            .checked_add(packed.packed.preVerificationGas)
+    });
+    let declared = declared.ok_or("Tempo declared gas overflow")?;
+    let gas = declared
+        .checked_mul(U256::from(64u8))
+        .map(|value| value / U256::from(63u8))
+        .and_then(|value| {
+            value.checked_add(U256::from(operations.len()).checked_mul(U256::from(50_000u64))?)
+        })
+        .and_then(|value| value.checked_add(U256::from(60_000u64)))
+        .ok_or("Tempo outer gas limit overflow")?;
+    u64::try_from(gas).map_err(|_| "Tempo outer gas limit exceeds uint64")
+}
+
+/// The outer `0x76` fee cap: 1.5× the current attodollar base fee.
+pub fn tempo_outer_max_fee(base_fee_atto: U256) -> Result<u128, &'static str> {
+    let fee = base_fee_atto
+        .checked_add(base_fee_atto / U256::from(2u8))
+        .ok_or("Tempo outer fee overflow")?;
+    u128::try_from(fee).map_err(|_| "Tempo outer fee exceeds uint128")
+}
+
 /// Converts a gas cost quoted in attodollars per gas into micro-pathUSD,
 /// rounding up. `None` on overflow.
 pub fn tempo_cost_in_path_usd(gas: U256, price_atto: U256) -> Option<U256> {
