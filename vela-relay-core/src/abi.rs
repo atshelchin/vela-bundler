@@ -9,7 +9,7 @@ use alloy::{
 use crate::task::{UserOperation, UserOperationV0_7};
 
 sol! {
-    #[derive(Debug)]
+    #[derive(Debug, PartialEq)]
     struct PackedUserOperation {
         address sender;
         uint256 nonce;
@@ -61,7 +61,7 @@ sol! {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PackedOperation {
     pub packed: PackedUserOperation,
     pub sender: Address,

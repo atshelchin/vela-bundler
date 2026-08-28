@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    app::rpc::types::{
-        TransactionHash, UserOperation, UserOperationStatus, UserOperationStatusKind,
-    },
+    app::rpc::types::{UserOperationStatus, UserOperationStatusKind},
     utils::config::RedisConfig,
 };
 
@@ -297,69 +295,34 @@ redis.call('DEL', KEYS[3])
 return attempts
 "#;
 
-/// Redis-backed lifecycle state for an accepted UserOperation.
-///
-/// `admitted` is an internal two-phase marker: a `queued` record is created before the Iggy
-/// append, then marked admitted only after Iggy acknowledges it. It is never exposed via RPC.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredUserOperation {
-    pub status: UserOperationStatusKind,
-    pub transaction_hash: Option<TransactionHash>,
-    pub chain_id: u64,
-    /// Decimal text used by Redis Lua because cjson numbers cannot represent every u64 exactly.
-    #[serde(default)]
-    pub chain_id_text: String,
-    pub entry_point: String,
-    pub user_operation: UserOperation,
-    pub admitted: bool,
-    #[serde(default)]
-    pub next_receipt_check_at_ms: u64,
-    pub block_hash: Option<String>,
-    pub block_number: Option<String>,
-    pub receipt: Option<Value>,
-    pub event: Option<UserOperationEvent>,
-    /// The last executor diagnostic. It explains either a pending retry or a terminal local
-    /// rejection (for example an insufficient in-band reimbursement).
-    #[serde(default)]
-    pub last_executor_stage: Option<String>,
-    #[serde(default)]
-    pub last_executor_error: Option<String>,
-    #[serde(default)]
-    pub last_executor_attempt_at_ms: Option<u64>,
-}
+pub use vela_relay_core::task::StoredUserOperation;
 
-impl StoredUserOperation {
-    pub fn rpc_status(&self) -> UserOperationStatus {
-        let exposes_executor_diagnostic = matches!(
-            self.status,
-            UserOperationStatusKind::Queued
-                | UserOperationStatusKind::NotSubmitted
-                | UserOperationStatusKind::Rejected
-        );
-        UserOperationStatus {
-            status: self.status,
-            transaction_hash: self.transaction_hash.clone(),
-            last_executor_stage: exposes_executor_diagnostic
-                .then(|| self.last_executor_stage.clone())
-                .flatten(),
-            last_executor_error: exposes_executor_diagnostic
-                .then(|| self.last_executor_error.clone())
-                .flatten(),
-            last_executor_attempt_at_ms: exposes_executor_diagnostic
-                .then_some(self.last_executor_attempt_at_ms)
-                .flatten(),
-        }
+/// The RPC-facing status view of a stored record. (Formerly
+/// `StoredUserOperation::rpc_status`; the record type now lives in the core
+/// and the response shape is transport vocabulary that stays here.)
+pub fn rpc_status(record: &StoredUserOperation) -> UserOperationStatus {
+    let exposes_executor_diagnostic = matches!(
+        record.status,
+        UserOperationStatusKind::Queued
+            | UserOperationStatusKind::NotSubmitted
+            | UserOperationStatusKind::Rejected
+    );
+    UserOperationStatus {
+        status: record.status,
+        transaction_hash: record.transaction_hash.clone(),
+        last_executor_stage: exposes_executor_diagnostic
+            .then(|| record.last_executor_stage.clone())
+            .flatten(),
+        last_executor_error: exposes_executor_diagnostic
+            .then(|| record.last_executor_error.clone())
+            .flatten(),
+        last_executor_attempt_at_ms: exposes_executor_diagnostic
+            .then_some(record.last_executor_attempt_at_ms)
+            .flatten(),
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct QueuedUserOperation {
-    pub user_operation_hash: String,
-    pub chain_id: u64,
-    pub entry_point: String,
-    pub user_operation: UserOperation,
-}
+pub use vela_relay_core::task::QueuedUserOperation;
 
 /// Lossless immutable copy of a routed Iggy message that was deferred for a future account nonce.
 ///
@@ -388,22 +351,7 @@ pub struct ClaimedDelayedUserOperation {
 
 pub use vela_relay_core::task::UserOperationEvent;
 
-/// A fully signed outer transaction persisted before its first broadcast.
-///
-/// One intent may exist for a `(chain_id, lane)` pair. If a worker dies after broadcasting but
-/// before updating UserOperation status, its successor loads and rebroadcasts this exact byte
-/// sequence instead of allocating another nonce.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreparedBundleIntent {
-    pub chain_id: u64,
-    pub lane: u8,
-    pub entry_point: String,
-    pub raw_transaction: String,
-    pub transaction_hash: String,
-    pub nonce: u64,
-    pub user_operation_hashes: Vec<String>,
-}
+pub use vela_relay_core::task::PreparedBundleIntent;
 
 /// A signed treasury transfer persisted before broadcast. Only one funding transaction may be
 /// outstanding per chain, which serializes the treasury nonce across all relayer lanes.

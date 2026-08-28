@@ -66,20 +66,7 @@ pub trait UserOperationHandler: Send + Sync + 'static {
     ) -> MalformedUserOperationHandlerFuture<'_>;
 }
 
-/// The validated queue envelope plus its deterministic relayer lane and Iggy position.
-#[derive(Clone, Debug)]
-pub struct RoutedUserOperation {
-    pub schema_version: u32,
-    pub user_operation_hash: String,
-    pub chain_id: u64,
-    pub entry_point: String,
-    pub user_operation: Value,
-    pub sender: String,
-    pub lane: u8,
-    pub stream: String,
-    pub partition_id: u32,
-    pub offset: u64,
-}
+pub use vela_relay_core::task::RoutedUserOperation;
 
 /// A queue message that cannot be safely routed to an EOA lane.
 ///
