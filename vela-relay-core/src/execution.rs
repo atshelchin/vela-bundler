@@ -232,6 +232,12 @@ pub enum ExecutionOperation {
         stage: &'static str,
         reason: String,
     },
+    /// An operator-facing log line whose data exists only inside a core
+    /// decision; the shell renders it with the historical tracing level,
+    /// message, and field names.
+    EmitDiagnostic {
+        diagnostic: ExecutionDiagnostic,
+    },
     // --- leases ---
     AcquireLaneLease,
     EnsureLaneLease,
@@ -405,6 +411,65 @@ pub enum DeferCause {
     },
 }
 
+/// The historical operator log lines of the old engine whose data lives only
+/// in core decisions. One variant per line; the shell's `EmitDiagnostic` arm
+/// carries the byte-identical message and field names.
+#[derive(Debug, PartialEq)]
+pub enum ExecutionDiagnostic {
+    /// info: "single-operation simulation is waiting for automatic contract deployment"
+    SimulationDeploymentWait { hash: String, reason: String },
+    /// warn: "single-operation simulation unavailable"
+    SimulationUnavailable { hash: String, reason: String },
+    /// warn: "final handleOps simulation rejected bundle"
+    BundleSimulationRejected { reason: String },
+    /// warn: "final handleOps simulation reported an account nonce mismatch"
+    BundleSimulationNonceMismatch,
+    /// info: "final handleOps simulation is waiting for automatic contract deployment"
+    BundleSimulationDeploymentWait { reason: String },
+    /// info: "in-band reimbursement cannot fund an includable outer fee"
+    FloorUnfundable {
+        quoted_fee: u128,
+        affordable: u128,
+        floor: u128,
+        base_fee: u128,
+    },
+    /// info: "repriced the outer transaction to the signed in-band budget"
+    Repriced {
+        quoted_fee: u128,
+        repriced_fee: u128,
+        base_fee: u128,
+        tip: u128,
+    },
+    /// warn: "in-band reimbursement stayed unaffordable for the whole hold budget"
+    HoldBudgetExhausted {
+        hash: String,
+        attempt: u32,
+        paid: U256,
+        required: U256,
+    },
+    /// warn: "in-band settlement rejected UserOperation"
+    SettlementRejected {
+        hash: String,
+        payment_asset: Option<Address>,
+        paid: U256,
+        required: U256,
+        stable_logs_valid: bool,
+    },
+    /// warn: "Tempo pathUSD in-band settlement rejected UserOperation"
+    TempoSettlementRejected {
+        hash: String,
+        paid: U256,
+        required: U256,
+        stable_logs_valid: bool,
+    },
+    /// debug: "using USD-denominated relayer top-up cap"
+    TopUpCapUsd { native_units: U256 },
+    /// warn: "could not convert USD relayer top-up cap to native units; using static cap"
+    TopUpCapUnconvertible,
+    /// warn: "UserOperation lane execution deferred"
+    ExecutionDeferred { reason: String },
+}
+
 /// Mirror of the node's raw-broadcast reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BroadcastReply {
@@ -517,6 +582,13 @@ pub enum ExecutionOutcome {
     Failed {
         message: String,
     },
+    /// The shell's lease heartbeat failed while this operation was pending:
+    /// the operation was NOT executed. Mirrors the old engine's mid-await
+    /// pipeline abort — [`request`] converts it into the batch-fatal `Err`
+    /// channel so the program unwinds without taking further effects.
+    Interrupted {
+        reason: String,
+    },
 }
 
 impl crux_core::capability::Operation for ExecutionOperation {
@@ -578,15 +650,41 @@ impl App for ExecutionApp {
 
 type Ctx = crux_core::command::CommandContext<ExecutionEffect, ExecutionEvent>;
 
-async fn request(ctx: &Ctx, operation: ExecutionOperation) -> ExecutionOutcome {
+/// A leased-pipeline operation. `Err` is a lease-heartbeat interrupt: the
+/// operation did not run, and the whole batch unwinds through the transient
+/// `Err(reason)` channel — the same disposition the old engine reached by
+/// dropping the pipeline future mid-await. Infrastructure failures are NOT
+/// errors here: they arrive as `Ok(Failed { .. })` result data and each step
+/// keeps deciding their meaning.
+async fn request(ctx: &Ctx, operation: ExecutionOperation) -> Result<ExecutionOutcome, String> {
+    match ctx.request_from_shell(operation).await {
+        ExecutionOutcome::Interrupted { reason } => Err(reason),
+        outcome => Ok(outcome),
+    }
+}
+
+/// A triage or bookkeeping operation the shell answers even while a lease
+/// interrupt is pending: everything before the lane lease exists (no
+/// heartbeat yet), plus deferral diagnostics, Telegram, and log emission —
+/// which the old engine likewise performed after aborting the pipeline.
+async fn request_unfenced(ctx: &Ctx, operation: ExecutionOperation) -> ExecutionOutcome {
     ctx.request_from_shell(operation).await
 }
 
+async fn emit_diagnostic(ctx: &Ctx, diagnostic: ExecutionDiagnostic) {
+    let _ = request_unfenced(ctx, ExecutionOperation::EmitDiagnostic { diagnostic }).await;
+}
+
 /// Whether an executor deferral is operator-actionable. A lease held by
-/// another worker and a freshly submitted funding/deployment transaction are
-/// expected hand-offs; Telegram is reserved for work that is actually blocked.
+/// another worker, a freshly submitted funding/deployment transaction, and an
+/// in-budget market hold are expected hand-offs; Telegram is reserved for
+/// work that is actually blocked. The allowlist (not a denylist) is the
+/// contract: a newly introduced stage stays silent until deliberately added.
 pub fn should_notify_executor_deferred(stage: &str) -> bool {
-    !matches!(stage, "lease" | "funding" | "simulation_deployment")
+    matches!(
+        stage,
+        "rpc" | "assets" | "simulation" | "bundle_simulation" | "broadcast" | "execution"
+    )
 }
 
 /// Validation of one routed envelope for durable-payload restoration.
@@ -758,7 +856,7 @@ impl Results {
 /// Best-effort deferral diagnostic plus the Telegram policy. Mirrors the
 /// shell's old `record_executor_deferred`.
 async fn record_deferred(ctx: &Ctx, hash: &str, stage: &'static str, reason: &str) {
-    let _ = request(
+    let _ = request_unfenced(
         ctx,
         ExecutionOperation::RecordDeferred {
             hash: hash.to_owned(),
@@ -768,7 +866,7 @@ async fn record_deferred(ctx: &Ctx, hash: &str, stage: &'static str, reason: &st
     )
     .await;
     if should_notify_executor_deferred(stage) {
-        let _ = request(
+        let _ = request_unfenced(
             ctx,
             ExecutionOperation::NotifyIssue {
                 hash: hash.to_owned(),
@@ -832,7 +930,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         );
     }
 
-    match request(ctx, ExecutionOperation::CheckChainSupported).await {
+    match request_unfenced(ctx, ExecutionOperation::CheckChainSupported).await {
         ExecutionOutcome::Supported { supported: true } => {}
         _ => {
             let reason = "chain has no trusted executor RPC";
@@ -840,7 +938,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
             return Results::all_failed(operations.len(), reason);
         }
     }
-    let chain_assets = match request(ctx, ExecutionOperation::LoadChainAssets).await {
+    let chain_assets = match request_unfenced(ctx, ExecutionOperation::LoadChainAssets).await {
         ExecutionOutcome::Assets { resolved } => resolved,
         ExecutionOutcome::AssetsUnavailable { reason }
         | ExecutionOutcome::Failed { message: reason } => {
@@ -854,7 +952,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         .iter()
         .map(|operation| operation.user_operation_hash.clone())
         .collect::<Vec<_>>();
-    let records = match request(ctx, ExecutionOperation::LoadRecords { hashes }).await {
+    let records = match request_unfenced(ctx, ExecutionOperation::LoadRecords { hashes }).await {
         ExecutionOutcome::Records { records } => records,
         ExecutionOutcome::Failed { message } => {
             return Results::all_failed(operations.len(), &message);
@@ -871,7 +969,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
                 let queued = match queued_operation_from_routed(routed, policy.pool_width) {
                     Ok(queued) => queued,
                     Err(reason) => {
-                        match request(
+                        match request_unfenced(
                             ctx,
                             ExecutionOperation::DeadLetterRouted {
                                 index,
@@ -890,7 +988,9 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
                         continue;
                     }
                 };
-                match request(ctx, ExecutionOperation::RestoreQueued { index, queued }).await {
+                match request_unfenced(ctx, ExecutionOperation::RestoreQueued { index, queued })
+                    .await
+                {
                     ExecutionOutcome::Done => {}
                     ExecutionOutcome::Failed { message } => {
                         results.failed(index, &message);
@@ -901,7 +1001,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
                         continue;
                     }
                 }
-                match request(
+                match request_unfenced(
                     ctx,
                     ExecutionOperation::ReloadRecord {
                         hash: routed.user_operation_hash.clone(),
@@ -936,7 +1036,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         }
         match admission_action(record.admitted, queue_record_matches(routed, &record)) {
             AdmissionAction::DeadLetter => {
-                match request(
+                match request_unfenced(
                     ctx,
                     ExecutionOperation::DeadLetterRouted {
                         index,
@@ -951,7 +1051,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
                 continue;
             }
             AdmissionAction::Recover => {
-                match request(
+                match request_unfenced(
                     ctx,
                     ExecutionOperation::MarkAdmitted {
                         hash: routed.user_operation_hash.clone(),
@@ -979,7 +1079,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         match candidate_from_record(index, routed, &record, policy.pool_width) {
             Ok(candidate) => candidates.push(candidate),
             Err(reason) => {
-                match request(
+                match request_unfenced(
                     ctx,
                     ExecutionOperation::MarkRejected {
                         hash: routed.user_operation_hash.clone(),
@@ -1007,7 +1107,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
     });
     candidates.truncate(policy.max_bundle_operations);
 
-    match request(ctx, ExecutionOperation::AcquireLaneLease).await {
+    match request_unfenced(ctx, ExecutionOperation::AcquireLaneLease).await {
         ExecutionOutcome::LeaseAcquired { acquired: true } => {}
         _ => {
             record_routed_deferred(
@@ -1027,6 +1127,7 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         Err(reason) => {
             record_routed_deferred(ctx, &start.operations, Some(&results), "execution", &reason)
                 .await;
+            emit_diagnostic(ctx, ExecutionDiagnostic::ExecutionDeferred { reason }).await;
             results.finish(DEFERRED_FINISH)
         }
     }
@@ -1043,7 +1144,7 @@ async fn execute_with_lane_lease(
 ) -> Result<(), String> {
     let policy = &start.policy;
 
-    match request(ctx, ExecutionOperation::LoadPreparedBundle).await {
+    match request(ctx, ExecutionOperation::LoadPreparedBundle).await? {
         ExecutionOutcome::Intent { intent: None } => {}
         ExecutionOutcome::Intent {
             intent: Some(intent),
@@ -1054,7 +1155,7 @@ async fn execute_with_lane_lease(
                     intent: intent.clone(),
                 },
             )
-            .await
+            .await?
             {
                 ExecutionOutcome::Resumed { known_outcome } => known_outcome,
                 ExecutionOutcome::Failed { message } => return Err(message),
@@ -1095,7 +1196,7 @@ async fn execute_with_lane_lease(
                 .collect(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::OperationVerdicts { verdicts } => verdicts,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -1112,6 +1213,8 @@ async fn execute_with_lane_lease(
             OperationSimVerdict::Success => survivors.push(candidate),
             OperationSimVerdict::NonceMismatch => nonce_mismatches.push(candidate),
             OperationSimVerdict::Rejected { reason } => {
+                // A store failure here defers the whole lane batch: nothing
+                // may broadcast while a rejection is only half-recorded.
                 if let ExecutionOutcome::Failed { message } = request(
                     ctx,
                     ExecutionOperation::MarkRejected {
@@ -1121,12 +1224,11 @@ async fn execute_with_lane_lease(
                         },
                     },
                 )
-                .await
+                .await?
                 {
-                    results.failed(candidate.result_index, &message);
-                    continue;
+                    return Err(message);
                 }
-                let _ = request(
+                let _ = request_unfenced(
                     ctx,
                     ExecutionOperation::NotifyIssue {
                         hash: candidate.hash_string.clone(),
@@ -1145,14 +1247,30 @@ async fn execute_with_lane_lease(
                     &reason,
                 )
                 .await;
+                emit_diagnostic(
+                    ctx,
+                    ExecutionDiagnostic::SimulationDeploymentWait {
+                        hash: candidate.hash_string.clone(),
+                        reason,
+                    },
+                )
+                .await;
             }
             OperationSimVerdict::Transient { reason } => {
                 record_deferred(ctx, &candidate.hash_string, "simulation", &reason).await;
+                emit_diagnostic(
+                    ctx,
+                    ExecutionDiagnostic::SimulationUnavailable {
+                        hash: candidate.hash_string.clone(),
+                        reason,
+                    },
+                )
+                .await;
             }
         }
     }
     if !nonce_mismatches.is_empty() {
-        resolve_nonce_mismatches(ctx, entry_point, &nonce_mismatches, results).await;
+        resolve_nonce_mismatches(ctx, entry_point, &nonce_mismatches, results).await?;
     }
     if survivors.is_empty() {
         return Ok(());
@@ -1175,6 +1293,11 @@ async fn execute_with_lane_lease(
         BundleSimVerdict::Success(simulation) => simulation,
         BundleSimVerdict::Rejected { reason } => {
             record_candidates_deferred(ctx, &survivors, "bundle_simulation", &reason).await;
+            emit_diagnostic(
+                ctx,
+                ExecutionDiagnostic::BundleSimulationRejected { reason },
+            )
+            .await;
             return Ok(());
         }
         BundleSimVerdict::NonceMismatch => {
@@ -1185,10 +1308,16 @@ async fn execute_with_lane_lease(
                 "final handleOps simulation reported an account nonce mismatch",
             )
             .await;
+            emit_diagnostic(ctx, ExecutionDiagnostic::BundleSimulationNonceMismatch).await;
             return Ok(());
         }
         BundleSimVerdict::Pending { reason } => {
             record_candidates_deferred(ctx, &survivors, "simulation_deployment", &reason).await;
+            emit_diagnostic(
+                ctx,
+                ExecutionDiagnostic::BundleSimulationDeploymentWait { reason },
+            )
+            .await;
             return Ok(());
         }
         BundleSimVerdict::Transient { reason } => return Err(reason),
@@ -1222,7 +1351,7 @@ async fn execute_with_lane_lease(
             calldata: calldata.to_vec(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Context { context } => context,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -1248,7 +1377,7 @@ async fn execute_with_lane_lease(
         // xDAI is USD-pegged: Gnosis settlement never consults the market.
         match crate::settlement::pegged_native_usd_price(chain_id) {
             Some(price) => Some(price),
-            None => match request(ctx, ExecutionOperation::FetchMarketPrice).await {
+            None => match request(ctx, ExecutionOperation::FetchMarketPrice).await? {
                 ExecutionOutcome::Price { price } => Some(price),
                 ExecutionOutcome::Failed { message } => return Err(message),
                 _ => return Err("unexpected shell response".to_owned()),
@@ -1274,11 +1403,37 @@ async fn execute_with_lane_lease(
     .map_err(|error| error.to_string())?
     {
         SettlementDecision::KeepQuote { evaluation } => evaluation,
-        SettlementDecision::FloorUnfundable { evaluation, .. } => evaluation,
+        SettlementDecision::FloorUnfundable {
+            evaluation,
+            affordable,
+            floor,
+        } => {
+            emit_diagnostic(
+                ctx,
+                ExecutionDiagnostic::FloorUnfundable {
+                    quoted_fee: fees.quoted_fee_per_gas,
+                    affordable,
+                    floor,
+                    base_fee: fees.base_fee_per_gas,
+                },
+            )
+            .await;
+            evaluation
+        }
         SettlementDecision::Reprice {
             fee_per_gas,
             evaluation,
         } => {
+            emit_diagnostic(
+                ctx,
+                ExecutionDiagnostic::Repriced {
+                    quoted_fee: fees.quoted_fee_per_gas,
+                    repriced_fee: fee_per_gas,
+                    base_fee: fees.base_fee_per_gas,
+                    tip: fees.max_priority_fee_per_gas,
+                },
+            )
+            .await;
             context.max_fee_per_gas = fee_per_gas;
             evaluation
         }
@@ -1305,7 +1460,7 @@ async fn execute_with_lane_lease(
                     cause: DeferCause::AffordableMarketHold,
                 },
             )
-            .await
+            .await?
             {
                 match decide_hold(
                     attempt,
@@ -1325,7 +1480,18 @@ async fn execute_with_lane_lease(
                         rejected_any = true;
                         continue;
                     }
-                    HoldDecision::RejectBudgetExhausted => {}
+                    HoldDecision::RejectBudgetExhausted => {
+                        emit_diagnostic(
+                            ctx,
+                            ExecutionDiagnostic::HoldBudgetExhausted {
+                                hash: candidate.hash_string.clone(),
+                                attempt,
+                                paid: evaluation.paid_amount,
+                                required: evaluation.required_amount,
+                            },
+                        )
+                        .await;
+                    }
                 }
             }
         }
@@ -1342,13 +1508,24 @@ async fn execute_with_lane_lease(
                 reason: reason.clone(),
             },
         )
-        .await
+        .await?
         {
             return Err(message);
         }
         results.durable(candidate.result_index);
         rejected_any = true;
-        let _ = request(
+        emit_diagnostic(
+            ctx,
+            ExecutionDiagnostic::SettlementRejected {
+                hash: candidate.hash_string.clone(),
+                payment_asset: evaluation.payment_asset,
+                paid: evaluation.paid_amount,
+                required: evaluation.required_amount,
+                stable_logs_valid,
+            },
+        )
+        .await;
+        let _ = request_unfenced(
             ctx,
             ExecutionOperation::NotifyIssue {
                 hash: candidate.hash_string.clone(),
@@ -1378,20 +1555,29 @@ async fn execute_with_lane_lease(
     // Gnosis, otherwise from the market), failing open to the static wei cap.
     let top_up_price = match crate::settlement::pegged_native_usd_price(chain_id) {
         Some(price) => Some(price),
-        None => match request(ctx, ExecutionOperation::FetchMarketPrice).await {
+        None => match request(ctx, ExecutionOperation::FetchMarketPrice).await? {
             ExecutionOutcome::Price { price } => Some(price),
             _ => None,
         },
     };
-    let top_up_max = top_up_price
-        .and_then(|price| {
-            native_amount_for_usd_cap(
-                chain_assets.assets.native_decimals,
-                price,
-                NATIVE_TOP_UP_USD_CAP,
-            )
-        })
-        .unwrap_or(U256::from(policy.top_up_max_wei));
+    let top_up_max = match top_up_price {
+        // No usable market price: silently keep the operator's static cap.
+        None => U256::from(policy.top_up_max_wei),
+        Some(price) => match native_amount_for_usd_cap(
+            chain_assets.assets.native_decimals,
+            price,
+            NATIVE_TOP_UP_USD_CAP,
+        ) {
+            Some(cap) => {
+                emit_diagnostic(ctx, ExecutionDiagnostic::TopUpCapUsd { native_units: cap }).await;
+                cap
+            }
+            None => {
+                emit_diagnostic(ctx, ExecutionDiagnostic::TopUpCapUnconvertible).await;
+                U256::from(policy.top_up_max_wei)
+            }
+        },
+    };
 
     // The current bundle takes precedence over filling the relayer float.
     if context.relayer_balance < prefund
@@ -1431,7 +1617,7 @@ async fn execute_with_lane_lease(
             },
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Signed { signed } => signed,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -1456,12 +1642,12 @@ async fn execute_with_lane_lease(
             intent: intent.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Saved { saved: true } => {}
         ExecutionOutcome::Saved { saved: false } => {
             // Raced: another writer holds an intent; resume that one instead.
-            let existing = match request(ctx, ExecutionOperation::LoadPreparedBundle).await {
+            let existing = match request(ctx, ExecutionOperation::LoadPreparedBundle).await? {
                 ExecutionOutcome::Intent {
                     intent: Some(existing),
                 } => existing,
@@ -1475,7 +1661,7 @@ async fn execute_with_lane_lease(
                 ctx,
                 ExecutionOperation::ResumeBundleIntent { intent: existing },
             )
-            .await
+            .await?
             {
                 ExecutionOutcome::Resumed { .. } => {}
                 ExecutionOutcome::Failed { message } => return Err(message),
@@ -1503,7 +1689,7 @@ async fn execute_with_lane_lease(
             gas_limit,
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Indexed { indexed } => indexed,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -1551,7 +1737,7 @@ async fn execute_tempo_bundle(
                 },
             },
         )
-        .await
+        .await?
         {
             ExecutionOutcome::Failed { message } => return Err(message),
             _ => results.durable(candidate.result_index),
@@ -1566,7 +1752,7 @@ async fn execute_tempo_bundle(
             .collect::<Vec<_>>(),
         treasury,
     );
-    let context = match request(ctx, ExecutionOperation::FetchTempoContext).await {
+    let context = match request(ctx, ExecutionOperation::FetchTempoContext).await? {
         ExecutionOutcome::TempoContext {
             base_fee_atto,
             nonce,
@@ -1629,13 +1815,23 @@ async fn execute_tempo_bundle(
                     reason: reason.clone(),
                 },
             )
-            .await
+            .await?
             {
                 return Err(message);
             }
             results.durable(candidate.result_index);
             rejected_any = true;
-            let _ = request(
+            emit_diagnostic(
+                ctx,
+                ExecutionDiagnostic::TempoSettlementRejected {
+                    hash: candidate.hash_string.clone(),
+                    paid,
+                    required,
+                    stable_logs_valid,
+                },
+            )
+            .await;
+            let _ = request_unfenced(
                 ctx,
                 ExecutionOperation::NotifyIssue {
                     hash: candidate.hash_string.clone(),
@@ -1696,7 +1892,7 @@ async fn execute_tempo_bundle(
             },
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Signed { signed } => signed,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -1721,11 +1917,11 @@ async fn execute_tempo_bundle(
             intent: intent.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Saved { saved: true } => {}
         ExecutionOutcome::Saved { saved: false } => {
-            let existing = match request(ctx, ExecutionOperation::LoadPreparedBundle).await {
+            let existing = match request(ctx, ExecutionOperation::LoadPreparedBundle).await? {
                 ExecutionOutcome::Intent {
                     intent: Some(existing),
                 } => existing,
@@ -1739,7 +1935,7 @@ async fn execute_tempo_bundle(
                 ctx,
                 ExecutionOperation::ResumeBundleIntent { intent: existing },
             )
-            .await
+            .await?
             {
                 ExecutionOutcome::Resumed { .. } => {}
                 ExecutionOutcome::Failed { message } => return Err(message),
@@ -1767,7 +1963,7 @@ async fn execute_tempo_bundle(
             gas_limit,
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Indexed { indexed } => indexed,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -1859,7 +2055,7 @@ async fn resolve_nonce_mismatches(
     entry_point: Address,
     mismatches: &[Candidate],
     results: &mut Results,
-) {
+) -> Result<(), String> {
     const LOOKUP_UNAVAILABLE: &str = "account nonce lookup is temporarily unavailable";
     let nonces = match request(
         ctx,
@@ -1871,14 +2067,14 @@ async fn resolve_nonce_mismatches(
                 .collect(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::AccountNonces { nonces } if nonces.len() == mismatches.len() => nonces,
         _ => {
             for candidate in mismatches {
                 results.failed(candidate.result_index, LOOKUP_UNAVAILABLE);
             }
-            return;
+            return Ok(());
         }
     };
     for (candidate, onchain_nonce) in mismatches.iter().zip(nonces) {
@@ -1901,7 +2097,7 @@ async fn resolve_nonce_mismatches(
                     },
                 },
             )
-            .await
+            .await?
             {
                 ExecutionOutcome::Deferred { .. } => results.durable(candidate.result_index),
                 _ => results.failed(
@@ -1921,7 +2117,7 @@ async fn resolve_nonce_mismatches(
                 },
             },
         )
-        .await
+        .await?
         {
             ExecutionOutcome::Failed { .. } => results.failed(
                 candidate.result_index,
@@ -1930,6 +2126,7 @@ async fn resolve_nonce_mismatches(
             _ => results.durable(candidate.result_index),
         }
     }
+    Ok(())
 }
 
 /// Native relayer funding under the treasury lease: prepared-intent resume,
@@ -1946,8 +2143,12 @@ async fn ensure_native_funding(
     max_priority_fee_per_gas: u128,
     top_up_max: U256,
 ) -> Result<bool, String> {
-    match request(ctx, ExecutionOperation::AcquireTreasuryLease).await {
+    match request(ctx, ExecutionOperation::AcquireTreasuryLease).await? {
         ExecutionOutcome::LeaseAcquired { acquired: true } => {}
+        // A store failure is not "another funder owns the lease": it defers
+        // the whole batch through the transient channel, as the old engine's
+        // acquire error did.
+        ExecutionOutcome::Failed { message } => return Err(message),
         _ => return Ok(false),
     }
     let result = native_funding_locked(
@@ -1961,7 +2162,7 @@ async fn ensure_native_funding(
         top_up_max,
     )
     .await;
-    let _ = request(ctx, ExecutionOperation::ReleaseTreasuryLease).await;
+    let _ = request_unfenced(ctx, ExecutionOperation::ReleaseTreasuryLease).await;
     result
 }
 
@@ -1976,7 +2177,7 @@ async fn native_funding_locked(
     max_priority_fee_per_gas: u128,
     top_up_max: U256,
 ) -> Result<bool, String> {
-    match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+    match request(ctx, ExecutionOperation::LoadPreparedFunding).await? {
         ExecutionOutcome::FundingIntent { intent: None } => {}
         ExecutionOutcome::FundingIntent {
             intent: Some(intent),
@@ -1997,7 +2198,7 @@ async fn native_funding_locked(
     )
     .map_err(|error| error.to_string())?;
     let (nonce, treasury_balance) =
-        match request(ctx, ExecutionOperation::FetchTreasuryContext).await {
+        match request(ctx, ExecutionOperation::FetchTreasuryContext).await? {
             ExecutionOutcome::TreasuryContext { nonce, balance } => (nonce, balance),
             ExecutionOutcome::Failed { message } => return Err(message),
             _ => return Err("unexpected shell response".to_owned()),
@@ -2028,7 +2229,7 @@ async fn native_funding_locked(
                 top_up_gas_cost,
             },
         )
-        .await;
+        .await?;
         return Err(
             "treasury balance cannot cover the current UserOperation prefund, top-up gas, and reserve floor"
                 .to_owned(),
@@ -2043,7 +2244,7 @@ async fn native_funding_locked(
                 minimum: plan.deficit,
             },
         )
-        .await;
+        .await?;
     }
     let amount_u128 =
         u128::try_from(amount).map_err(|_| "top-up amount exceeds uint128".to_owned())?;
@@ -2060,7 +2261,7 @@ async fn native_funding_locked(
             },
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Signed { signed } => signed,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -2081,11 +2282,11 @@ async fn native_funding_locked(
             intent: intent.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Saved { saved: true } => {}
         ExecutionOutcome::Saved { saved: false } => {
-            match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+            match request(ctx, ExecutionOperation::LoadPreparedFunding).await? {
                 ExecutionOutcome::FundingIntent {
                     intent: Some(existing),
                 } => {
@@ -2111,7 +2312,7 @@ async fn native_funding_locked(
             tempo: false,
         },
     )
-    .await;
+    .await?;
     Ok(false)
 }
 
@@ -2124,8 +2325,12 @@ async fn ensure_tempo_funding(
     required_prefund: U256,
     outer_max_fee: u128,
 ) -> Result<bool, String> {
-    match request(ctx, ExecutionOperation::AcquireTreasuryLease).await {
+    match request(ctx, ExecutionOperation::AcquireTreasuryLease).await? {
         ExecutionOutcome::LeaseAcquired { acquired: true } => {}
+        // A store failure is not "another funder owns the lease": it defers
+        // the whole batch through the transient channel, as the old engine's
+        // acquire error did.
+        ExecutionOutcome::Failed { message } => return Err(message),
         _ => return Ok(false),
     }
     let result = tempo_funding_locked(
@@ -2137,7 +2342,7 @@ async fn ensure_tempo_funding(
         outer_max_fee,
     )
     .await;
-    let _ = request(ctx, ExecutionOperation::ReleaseTreasuryLease).await;
+    let _ = request_unfenced(ctx, ExecutionOperation::ReleaseTreasuryLease).await;
     result
 }
 
@@ -2149,7 +2354,7 @@ async fn tempo_funding_locked(
     required_prefund: U256,
     outer_max_fee: u128,
 ) -> Result<bool, String> {
-    match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+    match request(ctx, ExecutionOperation::LoadPreparedFunding).await? {
         ExecutionOutcome::FundingIntent { intent: None } => {}
         ExecutionOutcome::FundingIntent {
             intent: Some(intent),
@@ -2173,7 +2378,7 @@ async fn tempo_funding_locked(
             transfer_amount: amount,
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::TempoTreasuryContext {
             nonce,
@@ -2205,7 +2410,7 @@ async fn tempo_funding_locked(
                 top_up_gas_cost,
             },
         )
-        .await;
+        .await?;
         return Err(
             "Tempo treasury pathUSD is below top-up amount, gas, and reserve floor".to_owned(),
         );
@@ -2223,7 +2428,7 @@ async fn tempo_funding_locked(
             },
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Signed { signed } => signed,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -2244,11 +2449,11 @@ async fn tempo_funding_locked(
             intent: intent.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Saved { saved: true } => {}
         ExecutionOutcome::Saved { saved: false } => {
-            match request(ctx, ExecutionOperation::LoadPreparedFunding).await {
+            match request(ctx, ExecutionOperation::LoadPreparedFunding).await? {
                 ExecutionOutcome::FundingIntent {
                     intent: Some(existing),
                 } => {
@@ -2274,12 +2479,12 @@ async fn tempo_funding_locked(
             tempo: true,
         },
     )
-    .await;
+    .await?;
     Ok(false)
 }
 
 async fn ensure_treasury_lease(ctx: &Ctx) -> Result<(), String> {
-    match request(ctx, ExecutionOperation::EnsureTreasuryLease).await {
+    match request(ctx, ExecutionOperation::EnsureTreasuryLease).await? {
         ExecutionOutcome::LeaseHeld { held: true } => Ok(()),
         ExecutionOutcome::LeaseHeld { held: false } => Err("executor lease was lost".to_owned()),
         ExecutionOutcome::Failed { message } => Err(message),
@@ -2298,7 +2503,7 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Seen { seen: true } => return Ok(()),
         ExecutionOutcome::Seen { seen: false } => {}
@@ -2314,7 +2519,7 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Sent { reply } => reply,
         ExecutionOutcome::Failed { message } => {
@@ -2327,7 +2532,7 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
         BroadcastReply::Accepted { transaction_hash }
             if transaction_hash.eq_ignore_ascii_case(&intent.transaction_hash) =>
         {
-            let _ = request(
+            let _ = request_unfenced(
                 ctx,
                 ExecutionOperation::RememberBroadcast {
                     transaction_hash: intent.transaction_hash.clone(),
@@ -2350,7 +2555,7 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
                     reason,
                 },
             )
-            .await;
+            .await?;
             Ok(())
         }
         BroadcastReply::Rejected { reason } => {
@@ -2361,13 +2566,13 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
                     transaction_hash: intent.transaction_hash.clone(),
                 },
             )
-            .await
+            .await?
             {
                 ExecutionOutcome::Known { known } => known,
                 _ => return Err("unexpected shell response".to_owned()),
             };
             if known {
-                let _ = request(
+                let _ = request_unfenced(
                     ctx,
                     ExecutionOperation::RememberBroadcast {
                         transaction_hash: intent.transaction_hash.clone(),
@@ -2383,7 +2588,7 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
                         reason,
                     },
                 )
-                .await;
+                .await?;
             }
             Ok(())
         }
@@ -2391,7 +2596,7 @@ async fn broadcast_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<
 }
 
 async fn forget_funding_broadcast(ctx: &Ctx, intent: &PreparedFundingIntent) {
-    let _ = request(
+    let _ = request_unfenced(
         ctx,
         ExecutionOperation::ForgetBroadcast {
             transaction_hash: intent.transaction_hash.clone(),
@@ -2410,7 +2615,7 @@ async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(),
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::LeaseAcquired { acquired: true } => {}
         ExecutionOutcome::LeaseAcquired { acquired: false } => return Ok(()),
@@ -2423,7 +2628,7 @@ async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(),
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Receipt { receipt } => receipt,
         ExecutionOutcome::Failed { message } => return Err(message),
@@ -2441,7 +2646,7 @@ async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(),
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         return Err(message);
     }
@@ -2453,7 +2658,7 @@ async fn resume_funding(ctx: &Ctx, intent: &PreparedFundingIntent) -> Result<(),
             success,
         },
     )
-    .await;
+    .await?;
     if !success {
         return Err(format!(
             "treasury relayer top-up transaction reverted: {}",
@@ -2477,7 +2682,7 @@ async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bo
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Seen { seen: true } => return Ok(true),
         ExecutionOutcome::Seen { seen: false } => {}
@@ -2493,7 +2698,7 @@ async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bo
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Sent { reply } => reply,
         ExecutionOutcome::Failed { message } => {
@@ -2523,7 +2728,7 @@ async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bo
             transaction_hash: intent.transaction_hash.clone(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::Known { known } => known,
         _ => return Err("unexpected shell response".to_owned()),
@@ -2540,7 +2745,7 @@ async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bo
                     intent: intent.clone(),
                 },
             )
-            .await
+            .await?
             {
                 ExecutionOutcome::Stale { stale } => stale,
                 _ => return Err("unexpected shell response".to_owned()),
@@ -2553,7 +2758,7 @@ async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bo
                         reason: reason.clone(),
                     },
                 )
-                .await
+                .await?
                 {
                     return Err(message);
                 }
@@ -2570,7 +2775,7 @@ async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bo
 }
 
 async fn remember_broadcast(ctx: &Ctx, intent: &PreparedBundleIntent) {
-    let _ = request(
+    let _ = request_unfenced(
         ctx,
         ExecutionOperation::RememberBroadcast {
             transaction_hash: intent.transaction_hash.clone(),
@@ -2580,7 +2785,7 @@ async fn remember_broadcast(ctx: &Ctx, intent: &PreparedBundleIntent) {
 }
 
 async fn forget_broadcast(ctx: &Ctx, intent: &PreparedBundleIntent) {
-    let _ = request(
+    let _ = request_unfenced(
         ctx,
         ExecutionOperation::ForgetBroadcast {
             transaction_hash: intent.transaction_hash.clone(),
@@ -2590,7 +2795,7 @@ async fn forget_broadcast(ctx: &Ctx, intent: &PreparedBundleIntent) {
 }
 
 async fn note_unproven(ctx: &Ctx, intent: &PreparedBundleIntent, ambiguous: bool, reason: &str) {
-    let _ = request(
+    let _ = request_unfenced(
         ctx,
         ExecutionOperation::RecordUnprovenBroadcast {
             transaction_hash: intent.transaction_hash.clone(),
@@ -2602,7 +2807,7 @@ async fn note_unproven(ctx: &Ctx, intent: &PreparedBundleIntent, ambiguous: bool
 }
 
 async fn ensure_lane_lease(ctx: &Ctx) -> Result<(), String> {
-    match request(ctx, ExecutionOperation::EnsureLaneLease).await {
+    match request(ctx, ExecutionOperation::EnsureLaneLease).await? {
         ExecutionOutcome::LeaseHeld { held: true } => Ok(()),
         ExecutionOutcome::LeaseHeld { held: false } => Err("executor lease was lost".to_owned()),
         ExecutionOutcome::Failed { message } => Err(message),
@@ -2625,7 +2830,7 @@ async fn simulate_bundle(
                 .collect(),
         },
     )
-    .await
+    .await?
     {
         ExecutionOutcome::BundleVerdict { verdict } => Ok(verdict),
         ExecutionOutcome::Failed { message } => Err(message),
@@ -2647,8 +2852,9 @@ mod tests {
 
     use super::{
         BroadcastReply, BundleSimVerdict, BundleSimulationData, DeferCause, ExecutionApp,
-        ExecutionEvent, ExecutionOperation, ExecutionOutcome, ExecutionPolicy, ItemResolution,
-        OperationSimVerdict, ResolvedChainAssets, SignedBundle, StartBatch, TransactionContext,
+        ExecutionDiagnostic, ExecutionEvent, ExecutionOperation, ExecutionOutcome, ExecutionPolicy,
+        ItemResolution, OperationSimVerdict, ResolvedChainAssets, SignedBundle, StartBatch,
+        TransactionContext,
     };
     use crate::{
         abi::{PackedOperation, user_operation_hash},
@@ -3134,9 +3340,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unaffordable_market_holds_the_operation_and_notifies() {
+    fn an_unaffordable_market_holds_the_operation_without_paging() {
         // Paying 1 against a requirement of 280 is a shortfall: parked in the
-        // delayed inbox, attempt 3 of 12 stays within budget.
+        // delayed inbox, attempt 3 of 12 stays within budget. The hold is an
+        // expected hand-off — the diagnostic is recorded but Telegram stays
+        // quiet, exactly as the old engine's notify allowlist decided.
         let fixture = fixture(1);
         let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
         driver.step(
@@ -3217,13 +3425,162 @@ mod tests {
             },
             ExecutionOutcome::Done,
         );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_heartbeat_interrupt_defers_the_batch_like_a_dropped_pipeline() {
+        // A failed lease renewal answers the pending operation with
+        // `Interrupted`: the operation must not run, and the batch settles
+        // through the same "execution" deferral (diagnostic, Telegram, warn)
+        // the old engine reached by dropping the pipeline future mid-await.
+        let fixture = fixture(280);
+        let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Interrupted {
+                reason: "executor lease was lost".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "execution",
+                reason: "executor lease was lost".into(),
+            },
+            ExecutionOutcome::Done,
+        );
         driver.step(
             ExecutionOperation::NotifyIssue {
                 hash: fixture.hash_string.clone(),
-                stage: "in_band_settlement_hold",
-                reason: "waiting for network fees to fit the signed in-band reimbursement: \
-                         paid=1, required=280, shortfall=279, attempt=3/12"
-                    .into(),
+                stage: "execution",
+                reason: "executor lease was lost".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::ExecutionDeferred {
+                    reason: "executor lease was lost".into(),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: "UserOperation execution was deferred".into(),
+        }]);
+    }
+
+    #[test]
+    fn an_exhausted_hold_budget_rejects_with_the_historical_warns() {
+        // Attempt 13 of 12 exhausts the budget: the operation is rejected
+        // with the frozen reason, and the shell is asked to emit the two
+        // historical warns (budget exhausted + field-rich rejection) before
+        // the Telegram notification.
+        let fixture = fixture(1);
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata,
+            },
+            ExecutionOutcome::Context { context: context() },
+        );
+        driver.step(
+            ExecutionOperation::DeferOperation {
+                index: 0,
+                cause: DeferCause::AffordableMarketHold,
+            },
+            ExecutionOutcome::Deferred { attempt: 13 },
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::HoldBudgetExhausted {
+                    hash: fixture.hash_string.clone(),
+                    attempt: 13,
+                    paid: U256::from(1u64),
+                    required: U256::from(280u64),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        let reason = "in-band reimbursement is below the required amount: \
+                      paid=1, required=280, shortfall=279";
+        driver.step(
+            ExecutionOperation::MarkRejectedWithReason {
+                hash: fixture.hash_string.clone(),
+                stage: "in_band_settlement",
+                reason: reason.into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::EmitDiagnostic {
+                diagnostic: ExecutionDiagnostic::SettlementRejected {
+                    hash: fixture.hash_string.clone(),
+                    payment_asset: None,
+                    paid: U256::from(1u64),
+                    required: U256::from(280u64),
+                    stable_logs_valid: true,
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "in_band_settlement",
+                reason: reason.into(),
             },
             ExecutionOutcome::Done,
         );
@@ -3988,10 +4345,18 @@ mod policy_tests {
 
     #[test]
     fn alerts_only_for_executor_failures_not_expected_handoffs() {
+        assert!(should_notify_executor_deferred("rpc"));
+        assert!(should_notify_executor_deferred("assets"));
         assert!(should_notify_executor_deferred("execution"));
         assert!(should_notify_executor_deferred("simulation"));
+        assert!(should_notify_executor_deferred("bundle_simulation"));
+        assert!(should_notify_executor_deferred("broadcast"));
         assert!(!should_notify_executor_deferred("lease"));
         assert!(!should_notify_executor_deferred("funding"));
         assert!(!should_notify_executor_deferred("simulation_deployment"));
+        // An in-budget market hold is an expected hand-off, not a page.
+        assert!(!should_notify_executor_deferred("in_band_settlement_hold"));
+        // Allowlist semantics: an unknown stage stays silent by default.
+        assert!(!should_notify_executor_deferred("some_future_stage"));
     }
 }

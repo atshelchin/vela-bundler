@@ -17,22 +17,41 @@ For the PR description (spec FR-011).
 The spec's acceptance ("identical outcome to either pre-refactor parser") is
 satisfiable only where the two old parsers agreed — which is every well-formed
 input. Where they disagreed, unification resolves toward the executor's
-evaluation (the authoritative money path), changing only the RPC validation's
-answer on two pathological inputs:
+evaluation (the authoritative money path). *This section was corrected by the
+2026-08-28 audit: the first draft named the wrong input classes.* The RPC
+validation's answer changes on exactly two pathological classes:
 
-1. **Amount words above `u128::MAX`**: the old HTTP parser saturated per leg
-   and could report `u128::MAX` "paid" (validation would accept); the executor
-   parsed exactly and rejected on overflow. Now both reject (adapter reads the
-   core's overflow as "nothing paid"), so an operation that would previously
-   pass RPC validation only to be rejected by the executor is refused up front.
+1. **Reimbursement legs whose exact sum overflows `U256`** (e.g. two native
+   value words of `2^255` to the recipient): the core's `checked_add` reports
+   `ArithmeticOverflow`, which the string adapter reads as "nothing paid", so
+   the RPC now refuses with the minimum-reimbursement rejection. The old HTTP
+   parser saturated each leg to `u128::MAX` and accepted; the old executor
+   later stored an arithmetic-overflow rejection — an accept-then-reject the
+   unified parser refuses up front. (A *single* word above `u128::MAX` never
+   disagreed and still validates: the adapter saturates the exact `U256` back
+   to `u128::MAX`, and one 32-byte word cannot overflow `U256` in the
+   executor.)
 2. **Zero-amount stablecoin legs**: the old HTTP parser created a `{token: 0}`
-   entry (which could trip mixed-asset/minimum checks); the executor ignored
-   zero-amount legs. Now both ignore them.
+   entry; the executor ignored zero legs (and main's RPC validation had no
+   mixed-asset check for it to trip). The observable class: a zero-amount leg
+   of allowlisted token B alongside sufficient payment in token A, where B's
+   `decimals()` lookup fails or returns < 2 and B sorts before A — the old
+   validation refused with `estimation_unavailable`; the unified path never
+   surfaces the zero leg and accepts. With healthy lookups the only change is
+   one fewer `erc20_decimals` eth_call.
 
-Both inputs are economically meaningless (no real reimbursement can exceed
-`u128` wei; a zero transfer pays nothing); in the old system they produced an
+Both classes are economically meaningless (no real reimbursement sums past
+`U256`; a zero transfer pays nothing); in the old system they produced an
 RPC-vs-executor disagreement, which is precisely the defect FR-009 exists to
 eliminate.
+
+## Post-US5 state
+
+US5's admission program absorbed the string-facing adapter: it now lives as
+`vela_relay_core::admission::string_reimbursement` (with the two former HTTP
+parser tests exercising it there), and the quoting path's
+`in_band_settlement.rs` module keeps only transport-side helpers over the same
+single core parser.
 
 ## Test accounting
 

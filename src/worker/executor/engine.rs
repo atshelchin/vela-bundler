@@ -376,6 +376,7 @@ impl ExecutorEngine {
             treasury_token: unique_token("treasury"),
             treasury_heartbeat: None,
             treasury_lease_acquired: false,
+            interrupt: LeaseInterrupt::new(),
         };
 
         let core: crux_core::Core<core_execution::ExecutionApp> = crux_core::Core::new();
@@ -390,7 +391,7 @@ impl ExecutorEngine {
             .into_iter()
             .collect();
         while let Some(core_execution::ExecutionEffect::Work(mut request)) = effects.pop_front() {
-            let outcome = shell.execute(&request.operation).await;
+            let outcome = shell.execute_fenced(&request.operation).await;
             match core.resolve(&mut request, outcome) {
                 Ok(next) => effects.extend(next),
                 Err(_) => {
@@ -1291,6 +1292,38 @@ impl UserOperationHandler for ExecutorEngine {
 /// The shell side of one lane-batch program: executes the core's requested
 /// operations against real infrastructure. Failures fold into result data —
 /// the core decides what they mean.
+/// First-failure latch shared with the lease heartbeat tasks. A failed
+/// renewal (lease gone or store error) trips it once; the driver then answers
+/// every pending non-bookkeeping operation with `Interrupted`, abandoning the
+/// in-flight one at the same moment the old engine's biased `select!` dropped
+/// the pipeline future mid-await.
+struct LeaseInterrupt {
+    reason: std::sync::Mutex<Option<String>>,
+    notify: tokio::sync::Notify,
+}
+
+impl LeaseInterrupt {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reason: std::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn trip(&self, reason: String) {
+        let mut slot = self.reason.lock().expect("lease interrupt mutex");
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+        drop(slot);
+        self.notify.notify_one();
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.lock().expect("lease interrupt mutex").clone()
+    }
+}
+
 struct BatchShell<'a> {
     engine: &'a ExecutorEngine,
     operations: &'a [RoutedUserOperation],
@@ -1305,9 +1338,48 @@ struct BatchShell<'a> {
     treasury_token: String,
     treasury_heartbeat: Option<tokio::task::JoinHandle<()>>,
     treasury_lease_acquired: bool,
+    interrupt: Arc<LeaseInterrupt>,
 }
 
 impl BatchShell<'_> {
+    /// Executes one requested operation behind the lease-interrupt fence.
+    /// Bookkeeping (deferral diagnostics, Telegram, log emission, cache
+    /// forget/remember, treasury release) still runs after an interrupt —
+    /// the old engine likewise performed that work after aborting the
+    /// pipeline. Every other operation is answered `Interrupted` without
+    /// executing, and an in-flight one is abandoned mid-await.
+    async fn execute_fenced(
+        &mut self,
+        operation: &core_execution::ExecutionOperation,
+    ) -> core_execution::ExecutionOutcome {
+        use core_execution::{ExecutionOperation as Op, ExecutionOutcome as Out};
+        if matches!(
+            operation,
+            Op::RecordDeferred { .. }
+                | Op::NotifyIssue { .. }
+                | Op::EmitDiagnostic { .. }
+                | Op::ReleaseTreasuryLease
+                | Op::RememberBroadcast { .. }
+                | Op::ForgetBroadcast { .. }
+                | Op::RecordUnprovenBroadcast { .. }
+        ) {
+            return self.execute(operation).await;
+        }
+        if let Some(reason) = self.interrupt.reason() {
+            return Out::Interrupted { reason };
+        }
+        let interrupt = self.interrupt.clone();
+        tokio::select! {
+            biased;
+            _ = interrupt.notify.notified() => Out::Interrupted {
+                reason: interrupt
+                    .reason()
+                    .unwrap_or_else(|| "executor lease was lost".to_owned()),
+            },
+            outcome = self.execute(operation) => outcome,
+        }
+    }
+
     async fn execute(
         &mut self,
         operation: &core_execution::ExecutionOperation,
@@ -1470,16 +1542,9 @@ impl BatchShell<'_> {
                     .mark_rejected_with_executor_reason(hash, stage, reason)
                     .await
                 {
-                    Ok(_) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %hash,
-                            stage,
-                            reason,
-                            "in-band settlement rejected UserOperation"
-                        );
-                        Out::Done
-                    }
+                    // The field-rich rejection warns are core-driven
+                    // `EmitDiagnostic` lines, matching the old engine's.
+                    Ok(_) => Out::Done,
                     Err(error) => Out::Failed {
                         message: error.to_string(),
                     },
@@ -1559,6 +1624,169 @@ impl BatchShell<'_> {
                 reason,
             } => {
                 engine.notify_executor_issue(chain_id, stage, hash, reason);
+                Out::Done
+            }
+            // Renders the historical operator log lines whose data lives in
+            // core decisions; message texts, levels, and field names are the
+            // old engine's, byte for byte.
+            Op::EmitDiagnostic { diagnostic } => {
+                use core_execution::ExecutionDiagnostic as Diagnostic;
+                let lane = self.lane;
+                match diagnostic {
+                    Diagnostic::SimulationDeploymentWait { hash, reason } => {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            reason,
+                            "single-operation simulation is waiting for automatic contract deployment"
+                        );
+                    }
+                    Diagnostic::SimulationUnavailable { hash, reason } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            reason,
+                            "single-operation simulation unavailable"
+                        );
+                    }
+                    Diagnostic::BundleSimulationRejected { reason } => {
+                        tracing::warn!(
+                            chain_id,
+                            lane,
+                            reason,
+                            "final handleOps simulation rejected bundle"
+                        );
+                    }
+                    Diagnostic::BundleSimulationNonceMismatch => {
+                        tracing::warn!(
+                            chain_id,
+                            lane,
+                            "final handleOps simulation reported an account nonce mismatch"
+                        );
+                    }
+                    Diagnostic::BundleSimulationDeploymentWait { reason } => {
+                        tracing::info!(
+                            chain_id,
+                            lane,
+                            reason,
+                            "final handleOps simulation is waiting for automatic contract deployment"
+                        );
+                    }
+                    Diagnostic::FloorUnfundable {
+                        quoted_fee,
+                        affordable,
+                        floor,
+                        base_fee,
+                    } => {
+                        tracing::info!(
+                            chain_id,
+                            quoted_fee,
+                            affordable,
+                            floor,
+                            base_fee,
+                            "in-band reimbursement cannot fund an includable outer fee"
+                        );
+                    }
+                    Diagnostic::Repriced {
+                        quoted_fee,
+                        repriced_fee,
+                        base_fee,
+                        tip,
+                    } => {
+                        tracing::info!(
+                            chain_id,
+                            quoted_fee,
+                            repriced_fee,
+                            base_fee,
+                            tip,
+                            "repriced the outer transaction to the signed in-band budget"
+                        );
+                    }
+                    Diagnostic::HoldBudgetExhausted {
+                        hash,
+                        attempt,
+                        paid,
+                        required,
+                    } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            attempt,
+                            paid = %paid,
+                            required = %required,
+                            "in-band reimbursement stayed unaffordable for the whole hold budget"
+                        );
+                    }
+                    Diagnostic::SettlementRejected {
+                        hash,
+                        payment_asset,
+                        paid,
+                        required,
+                        stable_logs_valid,
+                    } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            payment_asset = ?payment_asset,
+                            paid = %paid,
+                            required = %required,
+                            stable_logs_valid,
+                            "in-band settlement rejected UserOperation"
+                        );
+                    }
+                    Diagnostic::TempoSettlementRejected {
+                        hash,
+                        paid,
+                        required,
+                        stable_logs_valid,
+                    } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            paid = %paid,
+                            required = %required,
+                            stable_logs_valid,
+                            "Tempo pathUSD in-band settlement rejected UserOperation"
+                        );
+                    }
+                    Diagnostic::TopUpCapUsd { native_units } => {
+                        let (native_symbol, native_decimals) = self
+                            .assets
+                            .as_ref()
+                            .map(|assets| {
+                                (assets.native_symbol.as_str(), assets.assets.native_decimals)
+                            })
+                            .unwrap_or(("", 0));
+                        tracing::debug!(
+                            native_symbol,
+                            native_decimals,
+                            native_units = %native_units,
+                            "using USD-denominated relayer top-up cap"
+                        );
+                    }
+                    Diagnostic::TopUpCapUnconvertible => {
+                        let (native_symbol, native_decimals) = self
+                            .assets
+                            .as_ref()
+                            .map(|assets| {
+                                (assets.native_symbol.as_str(), assets.assets.native_decimals)
+                            })
+                            .unwrap_or(("", 0));
+                        tracing::warn!(
+                            native_symbol,
+                            native_decimals,
+                            "could not convert USD relayer top-up cap to native units; using static cap"
+                        );
+                    }
+                    Diagnostic::ExecutionDeferred { reason } => {
+                        tracing::warn!(
+                            chain_id,
+                            lane,
+                            error = %reason,
+                            "UserOperation lane execution deferred"
+                        );
+                    }
+                }
                 Out::Done
             }
             Op::AcquireLaneLease => {
@@ -1909,7 +2137,7 @@ impl BatchShell<'_> {
                 }
             }
             Op::AcquireTreasuryLease => {
-                let acquired = engine
+                match engine
                     .store
                     .acquire_lease(
                         &self.treasury_scope,
@@ -1917,12 +2145,18 @@ impl BatchShell<'_> {
                         engine.config.lease_ttl,
                     )
                     .await
-                    .unwrap_or(false);
-                if acquired {
-                    self.treasury_lease_acquired = true;
-                    self.start_treasury_heartbeat();
+                {
+                    Ok(acquired) => {
+                        if acquired {
+                            self.treasury_lease_acquired = true;
+                            self.start_treasury_heartbeat();
+                        }
+                        Out::LeaseAcquired { acquired }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
                 }
-                Out::LeaseAcquired { acquired }
             }
             Op::EnsureTreasuryLease => {
                 match engine
@@ -2411,6 +2645,7 @@ impl BatchShell<'_> {
         let scope = self.lease_scope.clone();
         let token = self.lease_token.clone();
         let ttl = engine.config.lease_ttl;
+        let interrupt = self.interrupt.clone();
         self.heartbeat = Some(tokio::spawn(async move {
             let period = (ttl / 3).max(Duration::from_millis(1));
             let start = tokio::time::Instant::now() + period;
@@ -2420,6 +2655,7 @@ impl BatchShell<'_> {
                 heartbeat.tick().await;
                 if let Err(error) = engine.ensure_lease(&scope, &token).await {
                     tracing::warn!(%error, "lane lease heartbeat stopped");
+                    interrupt.trip(error.to_string());
                     return;
                 }
             }
@@ -2431,6 +2667,7 @@ impl BatchShell<'_> {
         let scope = self.treasury_scope.clone();
         let token = self.treasury_token.clone();
         let ttl = engine.config.lease_ttl;
+        let interrupt = self.interrupt.clone();
         self.treasury_heartbeat = Some(tokio::spawn(async move {
             let period = (ttl / 3).max(Duration::from_millis(1));
             let start = tokio::time::Instant::now() + period;
@@ -2440,6 +2677,7 @@ impl BatchShell<'_> {
                 heartbeat.tick().await;
                 if let Err(error) = engine.ensure_lease(&scope, &token).await {
                     tracing::warn!(%error, "treasury lease heartbeat stopped");
+                    interrupt.trip(error.to_string());
                     return;
                 }
             }
@@ -2458,11 +2696,19 @@ impl BatchShell<'_> {
                 .release_lease(&self.treasury_scope, &self.treasury_token)
                 .await
             {
-                tracing::warn!(
-                    chain_id = self.chain_id,
-                    %error,
-                    "could not release treasury nonce lease"
-                );
+                if tempo::is_tempo_chain(self.chain_id) {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        %error,
+                        "could not release Tempo treasury nonce lease"
+                    );
+                } else {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        %error,
+                        "could not release treasury nonce lease"
+                    );
+                }
             }
         }
     }

@@ -176,6 +176,20 @@ own PR.
 
 ---
 
+## Phase 10: Audit remediation (2026-08-28 independent old-vs-new audit)
+
+**Purpose**: restore the FR-003 divergences a four-track adversarial audit
+(test inventory, note verification, string/Lua byte-compare, execution-path
+comparison) found after Phase 9, and re-true the equivalence notes at HEAD.
+
+- [x] T048 Restore the Telegram gating ALLOWLIST (`should_notify_executor_deferred` had flipped to a denylist, silently paging on every in-budget `in_band_settlement_hold` — main deliberately never notified holds); unit test extended to pin the hold silence and the unknown-stage default; the hold Driver walk renamed `an_unaffordable_market_holds_the_operation_without_paging` and its `NotifyIssue` step removed
+- [x] T049 Restore prompt heartbeat aborts: shared `LeaseInterrupt` (lane + treasury) trips on any failed renewal; the driver's biased `select!` abandons the in-flight operation mid-await and answers non-bookkeeping operations with the new `ExecutionOutcome::Interrupted`, which `request()` folds into the transient `Err` channel — the batch settles through the same "execution" deferral as main's future-drop (new Driver test `a_heartbeat_interrupt_defers_the_batch_like_a_dropped_pipeline`); triage/diagnostic operations use `request_unfenced`
+- [x] T050 Restore the dropped operator logs byte-for-byte via a typed `EmitDiagnostic` operation: simulation deployment-wait/unavailable, bundle-simulation rejected/nonce-mismatch/deployment-wait, floor-unfundable + reprice (the two the us3 note had falsely claimed preserved), hold-budget-exhausted, field-rich settlement + Tempo rejections (`payment_asset`/`paid`/`required`/`stable_logs_valid`), USD top-up cap debug/warn, "UserOperation lane execution deferred", the Tempo-vs-native treasury release warn split, and the admission accepted log's `entry_point` field (new Driver test `an_exhausted_hold_budget_rejects_with_the_historical_warns`)
+- [x] T051 Restore two store-failure dispositions to main's: a failed simulation-rejection persist defers the whole batch (was: item-only); a store error during treasury-lease acquire is batch-fatal through the transient channel (was: silent "funding" defer)
+- [x] T052 Re-true the equivalence notes at HEAD: us3 (log history), us4 (allowlist + interrupt + the two store-failure restorations), us5 (entry_point restored; assertion-drop compensation documented), us6 (corrected divergence input classes — multi-leg U256-sum overflow and the zero-leg decimals-failure class; post-US5 adapter location), t034 ("strictly safer" claim precised to parity; Tempo warn revert; shared treasury token). Gates re-run: fmt OK, clippy = baseline (core 0), core 99 + shell 101 tests green, core suite 0.07 s
+
+---
+
 ## Dependencies
 
 ```

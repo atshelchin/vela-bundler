@@ -28,7 +28,7 @@ An 18-step Driver walk pins the tail (gas 110_203 / fee 30e9 / threshold
 
 | Old | New |
 |---|---|
-| `ensure_relayer_funded(+locked)` under `run_with_lease_heartbeat` | `ensure_native_funding` / `native_funding_locked` in the core; treasury lease as `Acquire`/`Ensure`/`Release` ops with a shell heartbeat task and a **batch-end backstop release** (a transiently erroring program can no longer leak the treasury lease — strictly safer than before) |
+| `ensure_relayer_funded(+locked)` under `run_with_lease_heartbeat` | `ensure_native_funding` / `native_funding_locked` in the core; treasury lease as `Acquire`/`Ensure`/`Release` ops with a shell heartbeat task and a batch-end backstop release. (Precision from the audit: main also never leaked the lease — it released unconditionally after the wrapped future — so the backstop restores parity for the op-based release rather than improving on main. A failed treasury heartbeat now trips the same `LeaseInterrupt` as the lane heartbeat, aborting the batch like main's future-drop; an acquire-time store error is batch-fatal, not a silent funding defer) |
 | shortfall/partial/submitted warn+info logs with amounts | `RecordTreasuryShortfall`/`RecordPartialTopUp`/`RecordFundingSubmitted` ops logged verbatim by the shell |
 | `resume_funding_intent` (rebroadcast + receipt-probe claim + clear/revert) | `resume_funding` in the core over `AcquireReceiptProbe`/`FetchTransactionReceipt`/`ClearFundingIntent`/`NoteFundingReceipt`; `receipt_succeeded` was already a core rule |
 | `broadcast_funding_intent` | `broadcast_funding` in the core — same shape as the bundle broadcast minus the stale-nonce path (the treasury nonce is serialized by its lease); ambiguous → debug + retain, rejected → known-probe else warn, identical texts |
@@ -50,13 +50,24 @@ stays a shell timer loop: every rule they apply (audit classification, receipt
 success, broadcast judgement, `mark_bundle_submitted` lifecycle policy) already
 lives in the core; what remains is IO orchestration.
 
-## Declared divergences
+## Declared divergences (post-audit revision, 2026-08-28)
 
-1. Treasury-lease heartbeat: task-based like the lane lease (batch 1 note);
-   plus the new backstop release at batch end (safety improvement).
-2. Tempo settlement rejection warn now uses the generic
-   "in-band settlement rejected UserOperation" text (previously
-   "Tempo pathUSD in-band settlement rejected UserOperation") — the stored
-   reason string and response are unchanged.
+1. Treasury-lease heartbeat: task-based like the lane lease, wired to the
+   shared `LeaseInterrupt` (failure aborts the batch as main's future-drop
+   did); the batch-end backstop release restores main's unconditional-release
+   parity for the op-based flow.
+2. ~~Tempo settlement rejection warn now uses the generic text~~ — reverted
+   by the audit: the Tempo-specific
+   "Tempo pathUSD in-band settlement rejected UserOperation" warn (fields
+   `paid`, `required`, `stable_logs_valid`) and the non-Tempo field-rich
+   "in-band settlement rejected UserOperation" warn (adding `payment_asset`)
+   are both emitted via `EmitDiagnostic` with main's exact shapes; the
+   Tempo-vs-native release-failure warn texts are likewise distinguished
+   again ("could not release (Tempo) treasury nonce lease").
 3. Funding/receipt log placement moved to operation arms; messages and fields
    preserved.
+4. Treasury lease token: one per-batch `unique_token("treasury")` serves both
+   the native and Tempo paths (main minted "treasury"/"tempo-treasury" tokens
+   per call). The token is an opaque equality-compared value under the same
+   `treasury:{chain_id}` scope; within a strictly sequential batch the reuse
+   cannot overlap, so the fencing semantics are unchanged.

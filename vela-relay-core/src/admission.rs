@@ -103,6 +103,8 @@ pub enum AdmissionOutcome {
     Accepted {
         user_operation_hash: String,
         sender_hex: String,
+        /// Echoed for the shell's accepted log line, verbatim from the request.
+        entry_point: String,
     },
     /// Idempotent duplicate: the record already reached the durable queue.
     AlreadyQueued {
@@ -299,6 +301,7 @@ async fn drive_admission(ctx: &Ctx, submit: SubmitRequest) -> Flow<AdmissionOutc
         AdmissionResult::Marked { marked: true } => Ok(AdmissionOutcome::Accepted {
             user_operation_hash,
             sender_hex: prepared.sender_hex(),
+            entry_point,
         }),
         _ => Err(AdmissionOutcome::StoreUnavailable),
     }
@@ -1118,6 +1121,7 @@ mod tests {
         driver.assert_settled(AdmissionOutcome::Accepted {
             user_operation_hash: hash,
             sender_hex: "0x1111111111111111111111111111111111111111".into(),
+            entry_point: ENTRY_POINT.into(),
         });
     }
 

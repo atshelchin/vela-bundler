@@ -173,9 +173,11 @@ fn render(id: Value, chain_id: u64, outcome: AdmissionOutcome) -> RpcResponse<Va
         AdmissionOutcome::Accepted {
             user_operation_hash,
             sender_hex,
+            entry_point,
         } => {
             tracing::info!(
                 chain_id,
+                entry_point = %entry_point,
                 sender = %sender_hex,
                 user_operation_hash = %user_operation_hash,
                 settlement = "in_band",
