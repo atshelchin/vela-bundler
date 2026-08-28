@@ -1,7 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt::{Display, Formatter},
-    future::Future,
     str::FromStr,
     sync::{
         Arc,
@@ -10,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, task::JoinSet};
@@ -19,17 +18,13 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::{
         ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent,
-        PreparedFundingIntent, QueuedUserOperation, StoredUserOperation,
         USER_OPERATION_QUEUE_RETENTION, UserOperationStatusStore,
-        rpc::types::{UserOperation, UserOperationStatusKind},
     },
     utils::{
         config::ExecutorConfig,
-        market::{binance_usdt_price, is_gnosis_chain},
+        market::binance_usdt_price,
         rpc as chain_directory, tempo,
-        vault::{
-            derive_pool_relayer_secret_key, derive_treasury_secret_key, relayer_index_for_sender,
-        },
+        vault::{derive_pool_relayer_secret_key, derive_treasury_secret_key},
     },
     worker::consumer::{
         MalformedUserOperation, MalformedUserOperationHandlerFuture, RoutedUserOperation,
@@ -39,32 +34,23 @@ use crate::{
 };
 
 use super::{
-    abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata, user_operation_hash},
+    abi::get_nonce_calldata,
     alert::TelegramAlertNotifier,
-    cost::{allocate_bundle_gas, native_cost},
     deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
-    settlement::{
-        ChainAssetConfig, SettlementEvaluation, SettlementInput, SettlementLog, StablecoinConfig,
-        USD_PRICE_DECIMALS, affordable_fee_per_gas, evaluate_batch, inclusion_floor_fee_per_gas,
-        parse_reimbursement, verify_stable_transfer_logs,
-    },
-    simulation::{SimulationResult, SimulationVerdict, simulate_bundle, simulate_individually},
+    settlement::{ChainAssetConfig, SettlementLog, StablecoinConfig},
+    simulation::{SimulationVerdict, simulate_bundle, simulate_individually},
     transaction::{
         TempoTransactionPlan, TransactionPlan, sign_eip1559, sign_tempo, signer_address,
     },
 };
 
 const BROADCAST_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-const TOP_UP_GAS_LIMIT: u64 = 21_000;
 const RECEIPT_RECONCILE_FAILURE_DELAY: Duration = Duration::from_secs(1);
 const DELAYED_CLAIM_BATCH_SIZE: usize = 100;
 const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
-const USD_PRICE_SCALE: u64 = 100_000_000;
-const NATIVE_TOP_UP_USD_CAP: u64 = 20;
-const TEMPO_TOP_UP_GAS_BUFFER_BPS: u64 = 12_000;
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -98,24 +84,6 @@ struct CachedMarketPrice {
     price: U256,
 }
 
-#[derive(Debug)]
-struct Candidate {
-    result_index: usize,
-    hash: B256,
-    hash_string: String,
-    entry_point: Address,
-    packed: PackedOperation,
-    delayed_operation: DelayedUserOperation,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct BundleReplayAudit {
-    active: usize,
-    awaiting_submission: usize,
-    terminal: usize,
-    expired: usize,
-}
-
 #[derive(Clone, Debug)]
 struct TransactionContext {
     estimated_gas: U256,
@@ -136,12 +104,6 @@ struct TempoTransactionContext {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum FundingReadiness {
-    Ready,
-    Pending,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BundleBroadcastDisposition {
     Confirmed,
     Unknown,
@@ -152,13 +114,6 @@ enum BundleResumeDisposition {
     Confirmed,
     Unknown,
     Cleared,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdmissionAction {
-    Execute,
-    Recover,
-    DeadLetter,
 }
 
 #[derive(Debug)]
@@ -377,269 +332,100 @@ impl ExecutorEngine {
         }
     }
 
+    /// Executes one consumed lane batch by driving the core's
+    /// `ExecutionApp` program: `Core::new()` per batch, one operation in
+    /// flight at a time, per-item resolutions mapped back onto the
+    /// `UserOperationHandler` results contract.
     async fn handle_lane_batch(
         &self,
         operations: Vec<RoutedUserOperation>,
     ) -> UserOperationBatchResults {
-        let mut results = std::iter::repeat_with(|| None)
-            .take(operations.len())
-            .collect::<Vec<Option<Result<(), UserOperationHandlerError>>>>();
         if operations.is_empty() {
             return Vec::new();
         }
         let chain_id = operations[0].chain_id;
         let lane = operations[0].lane;
-        if operations
-            .iter()
-            .any(|operation| operation.chain_id != chain_id || operation.lane != lane)
-        {
-            return failure_results(
-                operations.len(),
-                "consumer returned a mixed chain/lane batch",
-            );
-        }
-        if !self.rpc.supports_chain(chain_id).await {
-            tracing::warn!(
-                chain_id,
-                "Iggy stream discovered without a trusted executor RPC"
-            );
-            let reason = "chain has no trusted executor RPC";
-            self.record_routed_deferred(&operations, None, "rpc", reason)
-                .await;
-            return failure_results(operations.len(), reason);
-        }
-        let chain_assets = match if tempo::is_tempo_chain(chain_id) {
-            Ok(self.tempo_chain_assets())
-        } else {
-            self.chain_assets_for(chain_id).await
-        } {
-            Ok(chain_assets) => chain_assets,
-            Err(error) => {
-                tracing::warn!(chain_id, %error, "Iggy stream has no usable executor asset policy");
-                let reason = error.to_string();
-                self.record_routed_deferred(&operations, None, "assets", &reason)
-                    .await;
-                return failure_results(operations.len(), &reason);
-            }
+        let policy = core_execution::ExecutionPolicy {
+            pool_width: self.config.pool_width,
+            max_bundle_operations: self.config.max_bundle_operations,
+            gas_buffer_bps: self.config.gas_buffer_bps,
+            fixed_gas_buffer: self.config.fixed_gas_buffer,
+            settlement_inclusion_floor_bps: self.config.settlement_inclusion_floor_bps,
+            settlement_hold_max_attempts: self.config.settlement_hold_max_attempts,
+            top_up_max_wei: self.config.top_up_max_wei,
+            is_tempo: tempo::is_tempo_chain(chain_id),
+            treasury: self.treasury_address,
+            relayer: self.relayer_addresses[lane as usize],
+            relayer_float_cost_multiplier: self.config.relayer_float_cost_multiplier,
+            relayer_float_target_wei: self.config.relayer_float_target_wei,
+            relayer_float_min_wei: self.config.relayer_float_min_wei,
+            treasury_floor_wei: self.config.treasury_floor_wei,
         };
-
-        let hashes = operations
-            .iter()
-            .map(|operation| operation.user_operation_hash.clone())
-            .collect::<Vec<_>>();
-        let records = match self.store.get_many(&hashes).await {
-            Ok(records) => records,
-            Err(error) => return failure_results(operations.len(), &error.to_string()),
-        };
-
-        let mut candidates = Vec::new();
-        for (index, (routed, record)) in operations.iter().zip(records).enumerate() {
-            let mut record = match record {
-                Some(record) => record,
-                None => {
-                    let queued = match queued_operation_from_routed(routed, self.config.pool_width)
-                    {
-                        Ok(queued) => queued,
-                        Err(reason) => {
-                            if self.dead_letter_routed(routed, reason).await.is_ok() {
-                                results[index] = Some(Ok(()));
-                            } else {
-                                results[index] =
-                                    Some(item_error("could not persist invalid queue message"));
-                            }
-                            continue;
-                        }
-                    };
-                    if let Err(error) = self.store.restore_queued_from_durable_payload(queued).await
-                    {
-                        results[index] = Some(item_error(&error.to_string()));
-                        continue;
-                    }
-                    match self.store.get(&routed.user_operation_hash).await {
-                        Ok(Some(record)) => {
-                            tracing::info!(
-                                chain_id,
-                                user_operation_hash = %routed.user_operation_hash,
-                                "rebuilt expired UserOperation status from durable queue payload"
-                            );
-                            record
-                        }
-                        Ok(None) => {
-                            results[index] = Some(item_error(
-                                "rebuilt UserOperation status disappeared before execution",
-                            ));
-                            continue;
-                        }
-                        Err(error) => {
-                            results[index] = Some(item_error(&error.to_string()));
-                            continue;
-                        }
-                    }
-                }
-            };
-            if is_durable_status(record.status) {
-                results[index] = Some(Ok(()));
-                continue;
-            }
-            match admission_action(record.admitted, queue_record_matches(routed, &record)) {
-                AdmissionAction::DeadLetter => {
-                    if self
-                        .dead_letter_routed(routed, "Iggy envelope does not match Redis admission")
-                        .await
-                        .is_ok()
-                    {
-                        results[index] = Some(Ok(()));
-                    } else {
-                        results[index] =
-                            Some(item_error("could not persist mismatched queue message"));
-                    }
-                    continue;
-                }
-                AdmissionAction::Recover => {
-                    match self.store.mark_admitted(&routed.user_operation_hash).await {
-                        Ok(true) => {
-                            record.admitted = true;
-                            tracing::warn!(
-                                chain_id,
-                                user_operation_hash = %routed.user_operation_hash,
-                                "recovered Redis admission after Iggy producer crash window"
-                            );
-                        }
-                        Ok(false) => {
-                            results[index] = Some(item_error(
-                                "could not recover expired UserOperation admission",
-                            ));
-                            continue;
-                        }
-                        Err(error) => {
-                            results[index] = Some(item_error(&error.to_string()));
-                            continue;
-                        }
-                    }
-                }
-                AdmissionAction::Execute => {}
-            }
-            match candidate_from_record(index, routed, record, self.config.pool_width) {
-                Ok(candidate) => candidates.push(candidate),
-                Err(reason) => match self.store.mark_rejected(&routed.user_operation_hash).await {
-                    Ok(_) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %routed.user_operation_hash,
-                            reason,
-                            "rejected invalid queued UserOperation"
-                        );
-                        results[index] = Some(Ok(()));
-                    }
-                    Err(error) => results[index] = Some(item_error(&error.to_string())),
-                },
-            }
-        }
-        if candidates.is_empty() {
-            return finish_results(results, "no durable executor outcome");
-        }
-
-        // Never put two nonces from the same sender into one outer transaction. The later item
-        // stays queued and will be retried after the first transaction is reconciled.
-        let mut unique_hashes = HashSet::new();
-        candidates.retain(|candidate| unique_hashes.insert(candidate.hash));
-        let mut senders = HashSet::new();
-        candidates.retain(|candidate| {
-            senders.insert(candidate.packed.sender) && candidate.result_index < operations.len()
-        });
-        candidates.truncate(self.config.max_bundle_operations);
-
-        let lease_scope = format!("executor:{chain_id}:{lane}");
         let lease_token = unique_token("lane");
-        let acquired = self
-            .store
-            .acquire_lease(&lease_scope, &lease_token, self.config.lease_ttl)
-            .await
-            .unwrap_or(false);
-        if !acquired {
-            self.record_routed_deferred(
-                &operations,
-                Some(&results),
-                "lease",
-                "relayer lane is currently owned by another worker",
-            )
-            .await;
-            return finish_results(results, "relayer lane is owned by another worker");
-        }
+        let mut shell = BatchShell {
+            engine: self,
+            operations: &operations,
+            chain_id,
+            lane,
+            lease_scope: format!("executor:{chain_id}:{lane}"),
+            lease_token: lease_token.clone(),
+            assets: None,
+            heartbeat: None,
+            lease_acquired: false,
+            treasury_scope: format!("treasury:{chain_id}"),
+            treasury_token: unique_token("treasury"),
+            treasury_heartbeat: None,
+            treasury_lease_acquired: false,
+            interrupt: LeaseInterrupt::new(),
+        };
 
-        let outcome = self
-            .run_with_lease_heartbeat(
-                &lease_scope,
-                &lease_token,
-                self.execute_with_lane_lease(
-                    chain_id,
-                    lane,
-                    &chain_assets.assets,
-                    &chain_assets.native_symbol,
-                    candidates,
-                    &mut results,
-                    &lease_scope,
-                    &lease_token,
-                ),
-            )
-            .await;
-        if let Err(error) = self.store.release_lease(&lease_scope, &lease_token).await {
-            tracing::warn!(chain_id, lane, %error, "could not release relayer lane lease");
-        }
-        if let Err(error) = outcome {
-            let reason = error.to_string();
-            self.record_routed_deferred(&operations, Some(&results), "execution", &reason)
-                .await;
-            tracing::warn!(chain_id, lane, %error, "UserOperation lane execution deferred");
-        }
-
-        finish_results(results, "UserOperation execution was deferred")
-    }
-
-    /// Persists the concrete retry reason next to the UserOperation. Iggy deliberately retains
-    /// the message until this work reaches a durable outcome; without this record, callers can
-    /// only see a permanent-looking `queued` state while an executor retry is failing.
-    async fn record_routed_deferred(
-        &self,
-        operations: &[RoutedUserOperation],
-        results: Option<&[Option<Result<(), UserOperationHandlerError>>]>,
-        stage: &str,
-        reason: &str,
-    ) {
-        for (index, operation) in operations.iter().enumerate() {
-            if results.is_some_and(|results| results[index].is_some()) {
-                continue;
+        let core: crux_core::Core<core_execution::ExecutionApp> = crux_core::Core::new();
+        let mut effects: VecDeque<core_execution::ExecutionEffect> = core
+            .process_event(core_execution::ExecutionEvent::Start(Box::new(
+                core_execution::StartBatch {
+                    operations: operations.clone(),
+                    policy,
+                    lease_token,
+                },
+            )))
+            .into_iter()
+            .collect();
+        while let Some(core_execution::ExecutionEffect::Work(mut request)) = effects.pop_front() {
+            let outcome = shell.execute_fenced(&request.operation).await;
+            match core.resolve(&mut request, outcome) {
+                Ok(next) => effects.extend(next),
+                Err(_) => {
+                    shell.finish().await;
+                    return failure_results(operations.len(), "could not resolve execution effect");
+                }
             }
-            self.record_executor_deferred(
-                operation.chain_id,
-                &operation.user_operation_hash,
-                stage,
-                reason,
-            )
-            .await;
+        }
+        shell.finish().await;
+
+        match core.view().outcome {
+            Some(resolutions) => resolutions
+                .into_iter()
+                .map(|resolution| match resolution {
+                    core_execution::ItemResolution::Durable => Ok(()),
+                    core_execution::ItemResolution::Failed { reason } => {
+                        Err(Box::new(ExecutorItemError(reason)) as UserOperationHandlerError)
+                    }
+                })
+                .collect(),
+            None => failure_results(operations.len(), "lane batch never settled"),
         }
     }
 
-    async fn record_candidates_deferred(
-        &self,
-        chain_id: u64,
-        candidates: &[Candidate],
-        stage: &str,
-        reason: &str,
-    ) {
-        for candidate in candidates {
-            self.record_executor_deferred(chain_id, &candidate.hash_string, stage, reason)
-                .await;
-        }
-    }
-
-    async fn record_executor_deferred(
+    /// Best-effort retry diagnostic (store write only; the Telegram decision
+    /// lives in the core's program).
+    async fn record_deferred_diagnostic(
         &self,
         chain_id: u64,
         user_operation_hash: &str,
         stage: &str,
         reason: &str,
     ) {
+        let _ = chain_id;
         if let Err(error) = self
             .store
             .record_executor_deferred(user_operation_hash, stage, reason)
@@ -651,12 +437,6 @@ impl ExecutorEngine {
                 %error,
                 "could not persist executor retry diagnostic"
             );
-        }
-        // A lease held by another worker and a freshly submitted funding/deployment transaction
-        // are expected hand-offs, not operator-actionable failures. Their durable diagnostics are
-        // still recorded, but Telegram is reserved for work that is actually blocked.
-        if should_notify_executor_deferred(stage) {
-            self.notify_executor_issue(chain_id, stage, user_operation_hash, reason);
         }
     }
 
@@ -786,708 +566,6 @@ impl ExecutorEngine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_with_lane_lease(
-        &self,
-        chain_id: u64,
-        lane: u8,
-        chain_assets: &ChainAssetConfig,
-        native_symbol: &str,
-        mut candidates: Vec<Candidate>,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<(), ExecutorItemError> {
-        if let Some(intent) = self
-            .store
-            .get_prepared_bundle_intent(chain_id, lane)
-            .await
-            .map_err(store_item_error)?
-        {
-            let disposition = self.resume_bundle_intent(&intent).await?;
-            if disposition != BundleResumeDisposition::Unknown {
-                for candidate in candidates {
-                    if intent
-                        .user_operation_hashes
-                        .iter()
-                        .any(|hash| hash.eq_ignore_ascii_case(&candidate.hash_string))
-                    {
-                        results[candidate.result_index] = Some(Ok(()));
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        let entry_point = candidates[0].entry_point;
-        if candidates
-            .iter()
-            .any(|candidate| candidate.entry_point != entry_point)
-        {
-            return Err(ExecutorItemError(
-                "one lane batch contains multiple EntryPoints".into(),
-            ));
-        }
-        let relayer = self.relayer_addresses[lane as usize];
-        let hashes = candidates
-            .iter()
-            .map(|candidate| candidate.hash)
-            .collect::<Vec<_>>();
-        let verdicts = simulate_individually(
-            &self.rpc,
-            chain_id,
-            entry_point,
-            relayer,
-            self.treasury_address,
-            &self.simulation_deployer,
-            &candidates
-                .iter()
-                .map(|candidate| &candidate.packed)
-                .cloned()
-                .collect::<Vec<_>>(),
-            &hashes,
-        )
-        .await;
-
-        let mut survivors = Vec::new();
-        let mut nonce_mismatches = Vec::new();
-        for (candidate, verdict) in candidates.drain(..).zip(verdicts) {
-            match verdict {
-                SimulationVerdict::Success(_) => survivors.push(candidate),
-                SimulationVerdict::NonceMismatch => nonce_mismatches.push(candidate),
-                SimulationVerdict::Rejected(reason) => {
-                    self.store
-                        .mark_rejected(&candidate.hash_string)
-                        .await
-                        .map_err(store_item_error)?;
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        reason,
-                        "single-operation simulation rejected UserOperation"
-                    );
-                    self.notify_executor_issue(
-                        chain_id,
-                        "simulation",
-                        &candidate.hash_string,
-                        reason,
-                    );
-                    results[candidate.result_index] = Some(Ok(()));
-                }
-                SimulationVerdict::Pending(reason) => {
-                    self.record_executor_deferred(
-                        chain_id,
-                        &candidate.hash_string,
-                        "simulation_deployment",
-                        reason,
-                    )
-                    .await;
-                    tracing::info!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        reason,
-                        "single-operation simulation is waiting for automatic contract deployment"
-                    );
-                }
-                SimulationVerdict::Transient(reason) => {
-                    self.record_executor_deferred(
-                        chain_id,
-                        &candidate.hash_string,
-                        "simulation",
-                        reason,
-                    )
-                    .await;
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        reason,
-                        "single-operation simulation unavailable"
-                    );
-                }
-            }
-        }
-        self.resolve_nonce_mismatches(chain_id, entry_point, nonce_mismatches, results)
-            .await;
-        if survivors.is_empty() {
-            return Ok(());
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        // If a multi-op bundle has a state interaction that does not exist in isolated
-        // simulation, fall back to the first op. Later ops stay queued instead of poisoning the
-        // whole handleOps transaction.
-        let mut bundle_simulation = simulate_bundle(
-            &self.rpc,
-            chain_id,
-            entry_point,
-            relayer,
-            self.treasury_address,
-            &self.simulation_deployer,
-            &survivors
-                .iter()
-                .map(|candidate| &candidate.packed)
-                .cloned()
-                .collect::<Vec<_>>(),
-            &survivors
-                .iter()
-                .map(|candidate| candidate.hash)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-        if matches!(
-            bundle_simulation,
-            SimulationVerdict::Rejected(_) | SimulationVerdict::NonceMismatch
-        ) && survivors.len() > 1
-        {
-            survivors.truncate(1);
-            bundle_simulation = simulate_bundle(
-                &self.rpc,
-                chain_id,
-                entry_point,
-                relayer,
-                self.treasury_address,
-                &self.simulation_deployer,
-                &[survivors[0].packed.clone()],
-                &[survivors[0].hash],
-            )
-            .await;
-        }
-        let bundle_simulation = match bundle_simulation {
-            SimulationVerdict::Success(simulation) => simulation,
-            SimulationVerdict::Rejected(reason) => {
-                self.record_candidates_deferred(chain_id, &survivors, "bundle_simulation", reason)
-                    .await;
-                tracing::warn!(
-                    chain_id,
-                    lane,
-                    reason,
-                    "final handleOps simulation rejected bundle"
-                );
-                return Ok(());
-            }
-            SimulationVerdict::NonceMismatch => {
-                self.record_candidates_deferred(
-                    chain_id,
-                    &survivors,
-                    "bundle_simulation",
-                    "final handleOps simulation reported an account nonce mismatch",
-                )
-                .await;
-                tracing::warn!(
-                    chain_id,
-                    lane,
-                    "final handleOps simulation reported an account nonce mismatch"
-                );
-                return Ok(());
-            }
-            SimulationVerdict::Pending(reason) => {
-                self.record_candidates_deferred(
-                    chain_id,
-                    &survivors,
-                    "simulation_deployment",
-                    reason,
-                )
-                .await;
-                tracing::info!(
-                    chain_id,
-                    lane,
-                    reason,
-                    "final handleOps simulation is waiting for automatic contract deployment"
-                );
-                return Ok(());
-            }
-            SimulationVerdict::Transient(reason) => {
-                return Err(ExecutorItemError(reason.into()));
-            }
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        if tempo::is_tempo_chain(chain_id) {
-            return self
-                .execute_tempo_bundle(
-                    chain_id,
-                    lane,
-                    entry_point,
-                    relayer,
-                    survivors,
-                    bundle_simulation,
-                    results,
-                    lease_scope,
-                    lease_token,
-                )
-                .await;
-        }
-
-        let calldata = handle_ops_calldata(
-            &survivors
-                .iter()
-                .map(|candidate| candidate.packed.packed.clone())
-                .collect::<Vec<_>>(),
-            self.treasury_address,
-        );
-        let mut context = self
-            .transaction_context(chain_id, relayer, entry_point, &calldata)
-            .await?;
-        let allocations = allocate_bundle_gas(
-            bundle_simulation.gas_used,
-            context.estimated_gas,
-            &bundle_simulation
-                .events
-                .iter()
-                .map(|event| event.actual_gas_used)
-                .collect::<Vec<_>>(),
-            self.config.gas_buffer_bps,
-            self.config.fixed_gas_buffer,
-        )
-        .ok_or_else(|| ExecutorItemError("bundle gas allocation overflow".into()))?;
-        let settlement = self
-            .settle_at_affordable_fee(
-                chain_id,
-                chain_assets,
-                native_symbol,
-                &survivors,
-                &allocations,
-                &mut context,
-            )
-            .await?;
-        // Settlement evidence must come from the exact final handleOps simulation. Individual
-        // simulations run against a different pre-state; a prior operation in this bundle can
-        // change balances or allowances and make a later transfer disappear. Token address plus
-        // indexed sender/treasury topics attributes each ERC-20 payment to its own UserOperation.
-        let bundle_logs = bundle_simulation
-            .logs
-            .iter()
-            .map(|log| SettlementLog {
-                address: log.address,
-                topics: log.topics.clone(),
-                data: log.data.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut rejected_any = false;
-        for (candidate, evaluation) in survivors.iter().zip(&settlement.operations) {
-            let stable_logs_valid = verify_stable_transfer_logs(
-                &evaluation.reimbursement,
-                candidate.packed.sender,
-                self.treasury_address,
-                &bundle_logs,
-            );
-            if evaluation.accepted() && stable_logs_valid {
-                continue;
-            }
-            // A shortfall that survived repricing means the market is momentarily above what this
-            // payer signed for. Gas prices come back down; a signature the user already gave
-            // should wait for that rather than be thrown away. Holding moves the operation to the
-            // durable delayed inbox, which retries with backoff and — unlike leaving it on the
-            // Iggy offset — does not stall every other payer queued behind it.
-            if evaluation.is_shortfall()
-                && stable_logs_valid
-                && self
-                    .hold_for_affordable_market(chain_id, candidate, evaluation, results)
-                    .await?
-            {
-                rejected_any = true;
-                continue;
-            }
-            let reason = settlement_rejection_reason(
-                evaluation.paid_amount,
-                evaluation.required_amount,
-                stable_logs_valid,
-            );
-            self.store
-                .mark_rejected_with_executor_reason(
-                    &candidate.hash_string,
-                    "in_band_settlement",
-                    &reason,
-                )
-                .await
-                .map_err(store_item_error)?;
-            results[candidate.result_index] = Some(Ok(()));
-            rejected_any = true;
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %candidate.hash_string,
-                payment_asset = ?evaluation.payment_asset,
-                paid = %evaluation.paid_amount,
-                required = %evaluation.required_amount,
-                stable_logs_valid,
-                "in-band settlement rejected UserOperation"
-            );
-            self.notify_executor_issue(
-                chain_id,
-                "in_band_settlement",
-                &candidate.hash_string,
-                &reason,
-            );
-        }
-        if rejected_any {
-            // Reassemble on the next queue delivery so the cost allocation and aggregate estimate
-            // never include a rejected payer.
-            return Ok(());
-        }
-
-        let gas_limit = allocations
-            .iter()
-            .try_fold(U256::ZERO, |sum, gas| sum.checked_add(*gas))
-            .ok_or_else(|| ExecutorItemError("bundle gas limit overflow".into()))?;
-        let gas_limit = u64::try_from(gas_limit)
-            .map_err(|_| ExecutorItemError("bundle gas limit exceeds uint64".into()))?;
-        let prefund = U256::from(gas_limit)
-            .checked_mul(U256::from(context.max_fee_per_gas))
-            .ok_or_else(|| ExecutorItemError("bundle prefund overflow".into()))?;
-        let top_up_max = self
-            .native_top_up_cap(chain_id, native_symbol, chain_assets.native_decimals)
-            .await;
-        if self
-            .ensure_relayer_funded(
-                chain_id,
-                relayer,
-                context.relayer_balance,
-                prefund,
-                context.max_fee_per_gas,
-                context.max_priority_fee_per_gas,
-                top_up_max,
-            )
-            .await?
-            == FundingReadiness::Pending
-        {
-            self.record_candidates_deferred(
-                chain_id,
-                &survivors,
-                "funding",
-                "waiting for relayer funding transaction confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        let signed = sign_eip1559(
-            &self.relayer_keys[lane as usize],
-            TransactionPlan {
-                chain_id,
-                nonce: context.nonce,
-                gas_limit,
-                max_fee_per_gas: context.max_fee_per_gas,
-                max_priority_fee_per_gas: context.max_priority_fee_per_gas,
-                to: entry_point,
-                value: U256::ZERO,
-                input: calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedBundleIntent {
-            chain_id,
-            lane,
-            entry_point: entry_point.to_string(),
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash.clone(),
-            nonce: signed.nonce,
-            user_operation_hashes: survivors
-                .iter()
-                .map(|candidate| candidate.hash_string.clone())
-                .collect(),
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_bundle_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            let existing = self
-                .store
-                .get_prepared_bundle_intent(chain_id, lane)
-                .await
-                .map_err(store_item_error)?
-                .ok_or_else(|| ExecutorItemError("prepared bundle raced and disappeared".into()))?;
-            self.resume_bundle_intent(&existing).await?;
-            return Ok(());
-        }
-        match self.broadcast_bundle_intent(&intent).await? {
-            BundleBroadcastDisposition::Unknown => {
-                self.record_candidates_deferred(
-                    chain_id,
-                    &survivors,
-                    "broadcast",
-                    "signed handleOps transaction awaits broadcast confirmation",
-                )
-                .await;
-                return Ok(());
-            }
-            BundleBroadcastDisposition::Confirmed => {}
-        }
-        let indexed = self
-            .store
-            .mark_bundle_submitted(
-                chain_id,
-                &intent.transaction_hash,
-                &intent.user_operation_hashes,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if indexed != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "not every signed UserOperation entered submitted state".into(),
-            ));
-        }
-        for candidate in survivors {
-            results[candidate.result_index] = Some(Ok(()));
-        }
-        tracing::info!(
-            chain_id,
-            lane,
-            relayer = %relayer,
-            transaction_hash = %intent.transaction_hash,
-            nonce = intent.nonce,
-            operations = intent.user_operation_hashes.len(),
-            gas_limit,
-            "submitted handleOps transaction"
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_tempo_bundle(
-        &self,
-        chain_id: u64,
-        lane: u8,
-        entry_point: Address,
-        relayer: Address,
-        survivors: Vec<Candidate>,
-        bundle_simulation: SimulationResult,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<(), ExecutorItemError> {
-        // A generic token here would make the treasury's pathUSD float unable to replenish the
-        // relayer. Accept the wallet extension only when it agrees with the protocol default;
-        // omitted `feeToken` canonically means pathUSD.
-        if let Some(candidate) = survivors.iter().find(|candidate| {
-            candidate
-                .packed
-                .fee_token
-                .is_some_and(|fee_token| fee_token != tempo::PATH_USD)
-        }) {
-            self.store
-                .mark_rejected(&candidate.hash_string)
-                .await
-                .map_err(store_item_error)?;
-            results[candidate.result_index] = Some(Ok(()));
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %candidate.hash_string,
-                fee_token = ?candidate.packed.fee_token,
-                "Tempo UserOperation requested an unsupported fee token"
-            );
-            return Ok(());
-        }
-
-        let calldata = handle_ops_calldata(
-            &survivors
-                .iter()
-                .map(|candidate| candidate.packed.packed.clone())
-                .collect::<Vec<_>>(),
-            self.treasury_address,
-        );
-        let context = self.tempo_transaction_context(chain_id, relayer).await?;
-        let allocations = allocate_bundle_gas(
-            bundle_simulation.gas_used,
-            bundle_simulation.gas_used,
-            &bundle_simulation
-                .events
-                .iter()
-                .map(|event| event.actual_gas_used)
-                .collect::<Vec<_>>(),
-            0,
-            tempo::TEMPO_COST_BUFFER_GAS,
-        )
-        .ok_or_else(|| ExecutorItemError("Tempo bundle gas allocation overflow".into()))?;
-        let costs = allocations
-            .iter()
-            .map(|gas| tempo_cost_in_path_usd(*gas, context.base_fee_atto))
-            .collect::<Result<Vec<_>, _>>()?;
-        let bundle_logs = bundle_simulation
-            .logs
-            .iter()
-            .map(|log| SettlementLog {
-                address: log.address,
-                topics: log.topics.clone(),
-                data: log.data.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut rejected_any = false;
-        let allowlist = BTreeSet::from([tempo::PATH_USD]);
-        for (candidate, cost) in survivors.iter().zip(&costs) {
-            let reimbursement = parse_reimbursement(
-                candidate.packed.call_data.as_ref(),
-                self.treasury_address,
-                &allowlist,
-            );
-            let (paid, stable_logs_valid) = match reimbursement {
-                Ok(reimbursement) => (
-                    reimbursement
-                        .stablecoins
-                        .get(&tempo::PATH_USD)
-                        .copied()
-                        .unwrap_or_default(),
-                    verify_stable_transfer_logs(
-                        &reimbursement,
-                        candidate.packed.sender,
-                        self.treasury_address,
-                        &bundle_logs,
-                    ),
-                ),
-                Err(_) => (U256::ZERO, false),
-            };
-            let required = marked_tempo_cost(*cost, self.config.settlement_markup_bps)?;
-            if paid < required || !stable_logs_valid {
-                let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
-                self.store
-                    .mark_rejected_with_executor_reason(
-                        &candidate.hash_string,
-                        "in_band_settlement",
-                        &reason,
-                    )
-                    .await
-                    .map_err(store_item_error)?;
-                results[candidate.result_index] = Some(Ok(()));
-                rejected_any = true;
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    paid = %paid,
-                    required = %required,
-                    stable_logs_valid,
-                    "Tempo pathUSD in-band settlement rejected UserOperation"
-                );
-                self.notify_executor_issue(
-                    chain_id,
-                    "in_band_settlement",
-                    &candidate.hash_string,
-                    &reason,
-                );
-            }
-        }
-        if rejected_any {
-            return Ok(());
-        }
-
-        let gas_limit = tempo_handle_ops_gas_limit(&survivors)?;
-        let outer_max_fee = context
-            .base_fee_atto
-            .checked_add(context.base_fee_atto / U256::from(2u8))
-            .ok_or_else(|| ExecutorItemError("Tempo outer fee overflow".into()))?;
-        let outer_max_fee = u128::try_from(outer_max_fee)
-            .map_err(|_| ExecutorItemError("Tempo outer fee exceeds uint128".into()))?;
-        let required_prefund =
-            tempo_cost_in_path_usd(U256::from(gas_limit), U256::from(outer_max_fee))?;
-        if self
-            .ensure_tempo_relayer_funded(
-                chain_id,
-                relayer,
-                context.relayer_path_usd_balance,
-                required_prefund,
-                outer_max_fee,
-            )
-            .await?
-            == FundingReadiness::Pending
-        {
-            self.record_candidates_deferred(
-                chain_id,
-                &survivors,
-                "funding",
-                "waiting for relayer pathUSD funding transaction confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        let signed = sign_tempo(
-            &self.relayer_keys[lane as usize],
-            TempoTransactionPlan {
-                chain_id,
-                nonce: context.nonce,
-                gas_limit,
-                max_fee_per_gas: outer_max_fee,
-                max_priority_fee_per_gas: 0,
-                fee_token: tempo::PATH_USD,
-                to: entry_point,
-                input: calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedBundleIntent {
-            chain_id,
-            lane,
-            entry_point: entry_point.to_string(),
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash.clone(),
-            nonce: signed.nonce,
-            user_operation_hashes: survivors
-                .iter()
-                .map(|candidate| candidate.hash_string.clone())
-                .collect(),
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_bundle_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            let existing = self
-                .store
-                .get_prepared_bundle_intent(chain_id, lane)
-                .await
-                .map_err(store_item_error)?
-                .ok_or_else(|| {
-                    ExecutorItemError("prepared Tempo bundle raced and disappeared".into())
-                })?;
-            self.resume_bundle_intent(&existing).await?;
-            return Ok(());
-        }
-        if self.broadcast_bundle_intent(&intent).await? == BundleBroadcastDisposition::Unknown {
-            self.record_candidates_deferred(
-                chain_id,
-                &survivors,
-                "broadcast",
-                "signed Tempo handleOps transaction awaits broadcast confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        let indexed = self
-            .store
-            .mark_bundle_submitted(
-                chain_id,
-                &intent.transaction_hash,
-                &intent.user_operation_hashes,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if indexed != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "not every signed Tempo UserOperation entered submitted state".into(),
-            ));
-        }
-        for candidate in survivors {
-            results[candidate.result_index] = Some(Ok(()));
-        }
-        tracing::info!(
-            chain_id,
-            lane,
-            relayer = %relayer,
-            transaction_hash = %intent.transaction_hash,
-            nonce = intent.nonce,
-            operations = intent.user_operation_hashes.len(),
-            gas_limit,
-            fee_token = %tempo::PATH_USD,
-            "submitted Tempo 0x76 handleOps transaction"
-        );
-        Ok(())
-    }
-
     async fn tempo_transaction_context(
         &self,
         chain_id: u64,
@@ -1535,128 +613,6 @@ impl ExecutorEngine {
         })
     }
 
-    /// Distinguishes a future keyed nonce (retry later) from a stale nonce (durably reject).
-    /// This is called only for explicit AA25/invalid-account-nonce simulation failures, keeping
-    /// the common path free of extra chain reads.
-    async fn resolve_nonce_mismatches(
-        &self,
-        chain_id: u64,
-        entry_point: Address,
-        candidates: Vec<Candidate>,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-    ) {
-        if candidates.is_empty() {
-            return;
-        }
-        let calls = candidates
-            .iter()
-            .map(|candidate| RpcBatchCall {
-                method: "eth_call",
-                params: json!([{
-                    "to": entry_point.to_string(),
-                    "data": format!(
-                        "0x{}",
-                        hex::encode(get_nonce_calldata(
-                            candidate.packed.sender,
-                            candidate.packed.packed.nonce,
-                        ))
-                    ),
-                }, "latest"]),
-            })
-            .collect::<Vec<_>>();
-        let responses = match self.rpc.batch(chain_id, &calls).await {
-            Ok(responses) => responses,
-            Err(error) => {
-                tracing::warn!(
-                    chain_id,
-                    count = candidates.len(),
-                    %error,
-                    "could not resolve account nonce mismatches"
-                );
-                for candidate in candidates {
-                    results[candidate.result_index] = Some(item_error(
-                        "account nonce lookup is temporarily unavailable",
-                    ));
-                }
-                return;
-            }
-        };
-
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            let onchain_nonce = match response_abi_u256(&responses, index, "EntryPoint getNonce") {
-                Ok(nonce) => nonce,
-                Err(error) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        %error,
-                        "could not decode EntryPoint account nonce"
-                    );
-                    results[candidate.result_index] = Some(item_error(
-                        "account nonce lookup is temporarily unavailable",
-                    ));
-                    continue;
-                }
-            };
-            let user_nonce = candidate.packed.packed.nonce;
-            if user_nonce > onchain_nonce {
-                match self
-                    .store
-                    .defer_user_operation(&candidate.delayed_operation, self.delayed_payload_ttl())
-                    .await
-                {
-                    Ok(attempt) => {
-                        tracing::info!(
-                            chain_id,
-                            user_operation_hash = %candidate.hash_string,
-                            user_nonce = %user_nonce,
-                            onchain_nonce = %onchain_nonce,
-                            attempt,
-                            "future account nonce moved to durable delayed inbox"
-                        );
-                        // Redis now owns a complete immutable copy. A successful item result lets
-                        // Iggy advance past this nonce without losing at-least-once execution.
-                        results[candidate.result_index] = Some(Ok(()));
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %candidate.hash_string,
-                            %error,
-                            "could not persist future nonce in delayed inbox"
-                        );
-                        results[candidate.result_index] =
-                            Some(item_error("could not persist future UserOperation"));
-                    }
-                }
-                continue;
-            }
-
-            match self.store.mark_rejected(&candidate.hash_string).await {
-                Ok(_) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        user_nonce = %user_nonce,
-                        onchain_nonce = %onchain_nonce,
-                        "stale account nonce rejected UserOperation"
-                    );
-                    results[candidate.result_index] = Some(Ok(()));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        %error,
-                        "could not persist stale nonce rejection"
-                    );
-                    results[candidate.result_index] =
-                        Some(item_error("could not persist stale nonce rejection"));
-                }
-            }
-        }
-    }
-
     fn delayed_payload_ttl(&self) -> Duration {
         self.config.attempt_ttl.max(USER_OPERATION_QUEUE_RETENTION)
     }
@@ -1670,32 +626,6 @@ impl ExecutorEngine {
             Ok(true) => Ok(()),
             Ok(false) => Err(ExecutorItemError("executor lease was lost".into())),
             Err(error) => Err(store_item_error(error)),
-        }
-    }
-
-    async fn run_with_lease_heartbeat<T, F>(
-        &self,
-        scope: &str,
-        token: &str,
-        future: F,
-    ) -> Result<T, ExecutorItemError>
-    where
-        F: Future<Output = Result<T, ExecutorItemError>>,
-    {
-        let period = (self.config.lease_ttl / 3).max(Duration::from_millis(1));
-        let start = tokio::time::Instant::now() + period;
-        let mut heartbeat = tokio::time::interval_at(start, period);
-        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        tokio::pin!(future);
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = heartbeat.tick() => {
-                    self.ensure_lease(scope, token).await?;
-                }
-                result = &mut future => return result,
-            }
         }
     }
 
@@ -1786,18 +716,17 @@ impl ExecutorEngine {
                     .ok_or_else(|| {
                         ExecutorItemError("eth_gasPrice returned an invalid quantity".into())
                     })?;
-                gas_price.checked_sub(base_fee).ok_or_else(|| {
-                    ExecutorItemError("gas price is below the latest base fee".into())
-                })?
+                vela_relay_core::gas_math::tip_from_legacy_gas_price(gas_price, base_fee)
+                    .ok_or_else(|| {
+                        ExecutorItemError("gas price is below the latest base fee".into())
+                    })?
             }
         };
         let base_fee = u128::try_from(base_fee)
             .map_err(|_| ExecutorItemError("base fee exceeds uint128".into()))?;
         let tip = u128::try_from(tip)
             .map_err(|_| ExecutorItemError("priority fee exceeds uint128".into()))?;
-        let max_fee_per_gas = base_fee
-            .checked_mul(2)
-            .and_then(|fee| fee.checked_add(tip))
+        let max_fee_per_gas = vela_relay_core::gas_math::quoted_outer_fee(base_fee, tip)
             .ok_or_else(|| ExecutorItemError("EIP-1559 fee overflow".into()))?;
         let nonce = u64::try_from(response_quantity(&responses, 3, "eth_getTransactionCount")?)
             .map_err(|_| ExecutorItemError("relayer nonce exceeds uint64".into()))?;
@@ -1813,215 +742,14 @@ impl ExecutorEngine {
         })
     }
 
-    /// Parks a UserOperation whose signed reimbursement the current market has priced out.
-    ///
-    /// Returns `true` when the operation is now owned by the delayed inbox and the caller should
-    /// drop it from this bundle, `false` when its waiting budget is spent and it must be rejected
-    /// so the wallet can tell the user to resend at today's prices. A hold that exceeds the budget
-    /// leaves one scheduled delayed entry behind; the next claim sees a durable `rejected` status,
-    /// acks, and removes it.
-    async fn hold_for_affordable_market(
-        &self,
-        chain_id: u64,
-        candidate: &Candidate,
-        evaluation: &SettlementEvaluation,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-    ) -> Result<bool, ExecutorItemError> {
-        let attempt = match self
-            .store
-            .defer_user_operation(&candidate.delayed_operation, self.delayed_payload_ttl())
-            .await
-        {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    %error,
-                    "could not hold UserOperation for a cheaper market"
-                );
-                return Ok(false);
-            }
-        };
-        if attempt > self.config.settlement_hold_max_attempts {
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %candidate.hash_string,
-                attempt,
-                paid = %evaluation.paid_amount,
-                required = %evaluation.required_amount,
-                "in-band reimbursement stayed unaffordable for the whole hold budget"
-            );
-            return Ok(false);
-        }
-        let reason = settlement_hold_reason(
-            evaluation.paid_amount,
-            evaluation.required_amount,
-            attempt,
-            self.config.settlement_hold_max_attempts,
-        );
-        self.record_executor_deferred(
-            chain_id,
-            &candidate.hash_string,
-            "in_band_settlement_hold",
-            &reason,
-        )
-        .await;
-        // Redis owns a complete copy now, so letting Iggy advance keeps at-least-once execution
-        // while unblocking every operation queued behind this one.
-        results[candidate.result_index] = Some(Ok(()));
-        tracing::info!(
-            chain_id,
-            user_operation_hash = %candidate.hash_string,
-            attempt,
-            paid = %evaluation.paid_amount,
-            required = %evaluation.required_amount,
-            "holding UserOperation until the market fits its signed reimbursement"
-        );
-        Ok(true)
-    }
-
-    /// Settles the bundle at a fee the payers can actually fund.
-    ///
-    /// The quoted cap is `2 × base fee + tip`. That multiple buys inclusion headroom, not cost —
-    /// the chain only ever charges `base fee + tip` — so a reimbursement that falls short of the
-    /// requirement at the quoted cap is usually still a perfectly good payment at a lower one.
-    /// Rather than refuse a signature the user already gave, the executor treats that signed
-    /// reimbursement as the budget and reprices the outer transaction down into it, provided the
-    /// result still clears the inclusion floor. The markup survives untouched: the requirement is
-    /// linear in the cap, so paying `markup × gas × new cap` still covers `markup ×` whatever the
-    /// chain charges, which can never exceed the new cap.
-    ///
-    /// Repricing only ever lowers the cap, so an operation accepted at the quoted fee stays
-    /// accepted. Anything still short after this is genuinely unaffordable at the current market
-    /// and is held, not rejected — see the settlement gate in `execute_bundle`.
-    async fn settle_at_affordable_fee(
-        &self,
-        chain_id: u64,
-        chain_assets: &ChainAssetConfig,
-        native_symbol: &str,
-        candidates: &[Candidate],
-        allocations: &[U256],
-        context: &mut TransactionContext,
-    ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
-        let costs_at = |fee: u128| -> Result<Vec<U256>, ExecutorItemError> {
-            allocations
-                .iter()
-                .map(|gas| {
-                    native_cost(*gas, fee)
-                        .ok_or_else(|| ExecutorItemError("bundle native cost overflow".into()))
-                })
-                .collect()
-        };
-
-        let quoted_fee = context.max_fee_per_gas;
-        let settlement = self
-            .evaluate_settlement(
-                chain_id,
-                chain_assets,
-                native_symbol,
-                candidates,
-                &costs_at(quoted_fee)?,
-            )
-            .await?;
-        // Nothing to renegotiate, or a rejection no price can cure (malformed calldata, an
-        // unsupported asset): leave the quote alone and let the gate speak.
-        if settlement.all_accepted()
-            || settlement
-                .operations
-                .iter()
-                .any(|evaluation| !evaluation.accepted() && !evaluation.is_shortfall())
-        {
-            return Ok(settlement);
-        }
-
-        let Some(affordable) = affordable_fee_per_gas(quoted_fee, &settlement.operations) else {
-            return Ok(settlement);
-        };
-        let Some(floor) = inclusion_floor_fee_per_gas(
-            context.base_fee_per_gas,
-            context.max_priority_fee_per_gas,
-            self.config.settlement_inclusion_floor_bps,
-        ) else {
-            return Ok(settlement);
-        };
-        if affordable < floor || affordable >= quoted_fee {
-            tracing::info!(
-                chain_id,
-                quoted_fee,
-                affordable,
-                floor,
-                base_fee = context.base_fee_per_gas,
-                "in-band reimbursement cannot fund an includable outer fee"
-            );
-            return Ok(settlement);
-        }
-
-        let repriced = self
-            .evaluate_settlement(
-                chain_id,
-                chain_assets,
-                native_symbol,
-                candidates,
-                &costs_at(affordable)?,
-            )
-            .await?;
-        if !repriced.all_accepted() {
-            return Ok(settlement);
-        }
-        tracing::info!(
-            chain_id,
-            quoted_fee,
-            repriced_fee = affordable,
-            base_fee = context.base_fee_per_gas,
-            tip = context.max_priority_fee_per_gas,
-            "repriced the outer transaction to the signed in-band budget"
-        );
-        context.max_fee_per_gas = affordable;
-        Ok(repriced)
-    }
-
-    async fn evaluate_settlement(
-        &self,
-        chain_id: u64,
-        chain_assets: &ChainAssetConfig,
-        native_symbol: &str,
-        candidates: &[Candidate],
-        costs: &[U256],
-    ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
-        let inputs = candidates
-            .iter()
-            .zip(costs)
-            .map(|(candidate, cost)| SettlementInput {
-                call_data: candidate.packed.call_data.as_ref(),
-                gas_native_cost: *cost,
-            })
-            .collect::<Vec<_>>();
-        let native_usd_price =
-            if has_stablecoin_payment(self.treasury_address, chain_assets, &inputs) {
-                Some(self.market_usd_price(chain_id, native_symbol).await?)
-            } else {
-                None
-            };
-        evaluate_batch(
-            self.treasury_address,
-            chain_assets,
-            &inputs,
-            native_usd_price,
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))
-    }
-
     async fn market_usd_price(
         &self,
-        chain_id: u64,
+        _chain_id: u64,
         symbol: &str,
     ) -> Result<U256, ExecutorItemError> {
-        // xDAI is the native Gnosis gas asset and is defined to be USD-pegged. This also keeps
-        // Gnosis stablecoin settlement and relayer funding independent of Binance availability.
-        if is_gnosis_chain(chain_id) {
-            return Ok(U256::from(USD_PRICE_SCALE));
-        }
+        // The Gnosis xDAI peg is decided in the core program
+        // (`settlement::pegged_native_usd_price`); this executor is only asked
+        // for genuinely market-priced chains.
         let symbol = symbol.trim().to_ascii_uppercase();
         if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return Err(ExecutorItemError(
@@ -2047,37 +775,6 @@ impl ExecutorEngine {
             },
         );
         Ok(price)
-    }
-
-    /// Cap one native-token relayer top-up at 20 USD when Binance has a fresh quote. A network
-    /// with no usable market price intentionally keeps the operator's static wei-denominated
-    /// safety cap instead of blocking execution on the price service.
-    async fn native_top_up_cap(
-        &self,
-        chain_id: u64,
-        native_symbol: &str,
-        native_decimals: u32,
-    ) -> U256 {
-        let fallback = U256::from(self.config.top_up_max_wei);
-        let Ok(price) = self.market_usd_price(chain_id, native_symbol).await else {
-            return fallback;
-        };
-        let Some(cap) = native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_USD_CAP)
-        else {
-            tracing::warn!(
-                native_symbol,
-                native_decimals,
-                "could not convert USD relayer top-up cap to native units; using static cap"
-            );
-            return fallback;
-        };
-        tracing::debug!(
-            native_symbol,
-            native_decimals,
-            native_units = %cap,
-            "using USD-denominated relayer top-up cap"
-        );
-        cap
     }
 
     async fn resume_bundle_intent(
@@ -2152,61 +849,7 @@ impl ExecutorEngine {
             .get_many(&intent.user_operation_hashes)
             .await
             .map_err(store_item_error)?;
-        if records.len() != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "Redis returned incomplete prepared bundle membership".into(),
-            ));
-        }
-
-        let mut audit = BundleReplayAudit::default();
-        for (hash, record) in intent.user_operation_hashes.iter().zip(records) {
-            let Some(record) = record else {
-                audit.expired += 1;
-                continue;
-            };
-            if record.chain_id != intent.chain_id
-                || !record.entry_point.eq_ignore_ascii_case(&intent.entry_point)
-            {
-                return Err(ExecutorItemError(format!(
-                    "prepared bundle member {hash} no longer matches its chain and EntryPoint"
-                )));
-            }
-
-            match record.status {
-                UserOperationStatusKind::Queued | UserOperationStatusKind::NotSubmitted => {
-                    if !record.admitted {
-                        return Err(ExecutorItemError(format!(
-                            "prepared bundle member {hash} is no longer admitted"
-                        )));
-                    }
-                    audit.active += 1;
-                    audit.awaiting_submission += 1;
-                }
-                UserOperationStatusKind::Submitted => {
-                    if !record
-                        .transaction_hash
-                        .as_ref()
-                        .is_some_and(|transaction_hash| {
-                            transaction_hash.eq_ignore_ascii_case(&intent.transaction_hash)
-                        })
-                    {
-                        return Err(ExecutorItemError(format!(
-                            "prepared bundle member {hash} belongs to another transaction"
-                        )));
-                    }
-                    audit.active += 1;
-                }
-                UserOperationStatusKind::Rejected
-                | UserOperationStatusKind::Included
-                | UserOperationStatusKind::Failed => audit.terminal += 1,
-                UserOperationStatusKind::NotFound => {
-                    return Err(ExecutorItemError(format!(
-                        "prepared bundle member {hash} has an invalid stored status"
-                    )));
-                }
-            }
-        }
-        Ok(audit)
+        core_execution::audit_bundle_replay(intent, &records).map_err(ExecutorItemError)
     }
 
     async fn clear_obsolete_bundle_intent(
@@ -2617,564 +1260,6 @@ impl ExecutorEngine {
         }
         Ok(())
     }
-
-    async fn ensure_tempo_relayer_funded(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        let minimum = required_prefund.max(U256::from(tempo::TEMPO_FLOAT_MIN));
-        if relayer_balance >= minimum {
-            return Ok(FundingReadiness::Ready);
-        }
-
-        let scope = format!("treasury:{chain_id}");
-        let token = unique_token("tempo-treasury");
-        if !self
-            .store
-            .acquire_lease(&scope, &token, self.config.lease_ttl)
-            .await
-            .map_err(store_item_error)?
-        {
-            return Ok(FundingReadiness::Pending);
-        }
-        let result = self
-            .run_with_lease_heartbeat(
-                &scope,
-                &token,
-                self.ensure_tempo_relayer_funded_locked(
-                    chain_id,
-                    relayer,
-                    relayer_balance,
-                    required_prefund,
-                    max_fee_per_gas,
-                    &scope,
-                    &token,
-                ),
-            )
-            .await;
-        if let Err(error) = self.store.release_lease(&scope, &token).await {
-            tracing::warn!(chain_id, %error, "could not release Tempo treasury nonce lease");
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_tempo_relayer_funded_locked(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        if let Some(intent) = self
-            .store
-            .get_prepared_funding_intent(chain_id)
-            .await
-            .map_err(store_item_error)?
-        {
-            self.resume_funding_intent(&intent).await?;
-            return Ok(FundingReadiness::Pending);
-        }
-
-        let target = required_prefund.max(U256::from(tempo::TEMPO_FLOAT_TARGET));
-        let amount = target
-            .checked_sub(relayer_balance)
-            .ok_or_else(|| ExecutorItemError("Tempo relayer funding amount underflow".into()))?;
-        if amount.is_zero() {
-            return Ok(FundingReadiness::Ready);
-        }
-        let amount_u128 = u128::try_from(amount)
-            .map_err(|_| ExecutorItemError("Tempo relayer top-up exceeds uint128".into()))?;
-        let transfer_calldata = tempo::path_usd_transfer_calldata(relayer, amount);
-
-        let calls = [
-            RpcBatchCall {
-                method: "eth_getTransactionCount",
-                params: json!([self.treasury_address.to_string(), "pending"]),
-            },
-            RpcBatchCall {
-                method: "eth_call",
-                params: json!([{
-                    "to": tempo::PATH_USD.to_string(),
-                    "data": format!("0x{}", hex::encode(tempo::path_usd_balance_calldata(self.treasury_address))),
-                }, "latest"]),
-            },
-            RpcBatchCall {
-                method: "eth_estimateGas",
-                params: json!([{
-                    "from": self.treasury_address.to_string(),
-                    "to": tempo::PATH_USD.to_string(),
-                    "data": format!("0x{}", hex::encode(&transfer_calldata)),
-                    "feeToken": tempo::PATH_USD.to_string(),
-                }, "latest"]),
-            },
-        ];
-        let responses = self
-            .rpc
-            .batch(chain_id, &calls)
-            .await
-            .map_err(rpc_item_error)?;
-        let nonce = u64::try_from(response_quantity(&responses, 0, "Tempo treasury nonce")?)
-            .map_err(|_| ExecutorItemError("Tempo treasury nonce exceeds uint64".into()))?;
-        let treasury_balance = response_abi_u256(&responses, 1, "Tempo treasury pathUSD balance")?;
-        let top_up_gas_limit = u64::try_from(response_quantity(
-            &responses,
-            2,
-            "Tempo pathUSD top-up eth_estimateGas",
-        )?)
-        .map_err(|_| ExecutorItemError("Tempo pathUSD top-up gas estimate exceeds uint64".into()))?
-        .checked_mul(TEMPO_TOP_UP_GAS_BUFFER_BPS)
-        .map(|value| value / 10_000)
-        .ok_or_else(|| ExecutorItemError("Tempo pathUSD top-up gas buffer overflow".into()))?;
-        let top_up_gas_cost =
-            tempo_cost_in_path_usd(U256::from(top_up_gas_limit), U256::from(max_fee_per_gas))?;
-        let required_treasury = amount
-            .checked_add(top_up_gas_cost)
-            .and_then(|value| value.checked_add(U256::from(tempo::TEMPO_TREASURY_FLOOR)))
-            .ok_or_else(|| {
-                ExecutorItemError("Tempo treasury balance requirement overflow".into())
-            })?;
-        if treasury_balance < required_treasury {
-            tracing::warn!(
-                chain_id,
-                treasury_path_usd_balance = %treasury_balance,
-                required_path_usd = %required_treasury,
-                top_up_path_usd = %amount,
-                top_up_gas_limit,
-                top_up_gas_path_usd = %top_up_gas_cost,
-                reserve_path_usd = tempo::TEMPO_TREASURY_FLOOR,
-                "Tempo treasury cannot fund the pending relayer top-up"
-            );
-            return Err(ExecutorItemError(
-                "Tempo treasury pathUSD is below top-up amount, gas, and reserve floor".into(),
-            ));
-        }
-
-        self.ensure_lease(lease_scope, lease_token).await?;
-        let signed = sign_tempo(
-            &self.treasury_key,
-            TempoTransactionPlan {
-                chain_id,
-                nonce,
-                gas_limit: top_up_gas_limit,
-                max_fee_per_gas,
-                max_priority_fee_per_gas: 0,
-                fee_token: tempo::PATH_USD,
-                to: tempo::PATH_USD,
-                input: transfer_calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedFundingIntent {
-            chain_id,
-            relayer: relayer.to_string(),
-            amount_wei: amount_u128,
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash,
-            nonce: signed.nonce,
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_funding_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            if let Some(existing) = self
-                .store
-                .get_prepared_funding_intent(chain_id)
-                .await
-                .map_err(store_item_error)?
-            {
-                self.resume_funding_intent(&existing).await?;
-                return Ok(FundingReadiness::Pending);
-            }
-            return Err(ExecutorItemError(
-                "another Tempo treasury relayer top-up is pending".into(),
-            ));
-        }
-        self.broadcast_funding_intent(&intent).await?;
-        tracing::info!(
-            chain_id,
-            relayer = %relayer,
-            amount_path_usd = amount_u128,
-            transaction_hash = %intent.transaction_hash,
-            "submitted Tempo treasury pathUSD relayer top-up"
-        );
-        Ok(FundingReadiness::Pending)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_relayer_funded(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-        top_up_max: U256,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        // The current bundle takes precedence over filling the relayer float. A relayer that can
-        // already cover this handleOps must never be held back merely because it has not reached
-        // the preferred float target yet.
-        if relayer_balance >= required_prefund {
-            return Ok(FundingReadiness::Ready);
-        }
-
-        let scope = format!("treasury:{chain_id}");
-        let token = unique_token("treasury");
-        if !self
-            .store
-            .acquire_lease(&scope, &token, self.config.lease_ttl)
-            .await
-            .map_err(store_item_error)?
-        {
-            return Ok(FundingReadiness::Pending);
-        }
-        let result = self
-            .run_with_lease_heartbeat(
-                &scope,
-                &token,
-                self.ensure_relayer_funded_locked(
-                    chain_id,
-                    relayer,
-                    relayer_balance,
-                    required_prefund,
-                    max_fee_per_gas,
-                    max_priority_fee_per_gas,
-                    top_up_max,
-                    &scope,
-                    &token,
-                ),
-            )
-            .await;
-        if let Err(error) = self.store.release_lease(&scope, &token).await {
-            tracing::warn!(chain_id, %error, "could not release treasury nonce lease");
-        }
-        result
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn ensure_relayer_funded_locked(
-        &self,
-        chain_id: u64,
-        relayer: Address,
-        relayer_balance: U256,
-        required_prefund: U256,
-        max_fee_per_gas: u128,
-        max_priority_fee_per_gas: u128,
-        top_up_max: U256,
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<FundingReadiness, ExecutorItemError> {
-        if let Some(intent) = self
-            .store
-            .get_prepared_funding_intent(chain_id)
-            .await
-            .map_err(store_item_error)?
-        {
-            self.resume_funding_intent(&intent).await?;
-            return Ok(FundingReadiness::Pending);
-        }
-
-        let target_from_cost = required_prefund
-            .checked_mul(U256::from(self.config.relayer_float_cost_multiplier))
-            .ok_or_else(|| ExecutorItemError("relayer float target overflow".into()))?;
-        let target = target_from_cost
-            .max(U256::from(self.config.relayer_float_target_wei))
-            .max(U256::from(self.config.relayer_float_min_wei));
-        let desired_amount = target
-            .checked_sub(relayer_balance)
-            .ok_or_else(|| ExecutorItemError("relayer funding amount underflow".into()))?;
-        let deficit = required_prefund
-            .checked_sub(relayer_balance)
-            .ok_or_else(|| ExecutorItemError("relayer funding deficit underflow".into()))?;
-        if deficit > top_up_max {
-            return Err(ExecutorItemError(format!(
-                "current UserOperation prefund exceeds the per-transfer cap: deficit={deficit}, cap={top_up_max}"
-            )));
-        }
-        // A float target may be much larger than one bundle. Cap the discretionary part instead
-        // of deferring an otherwise fundable operation.
-        let capped_amount = desired_amount.min(top_up_max);
-
-        let calls = [
-            RpcBatchCall {
-                method: "eth_getTransactionCount",
-                params: json!([self.treasury_address.to_string(), "pending"]),
-            },
-            RpcBatchCall {
-                method: "eth_getBalance",
-                params: json!([self.treasury_address.to_string(), "pending"]),
-            },
-        ];
-        let responses = self
-            .rpc
-            .batch(chain_id, &calls)
-            .await
-            .map_err(rpc_item_error)?;
-        let nonce = u64::try_from(response_quantity(
-            &responses,
-            0,
-            "treasury eth_getTransactionCount",
-        )?)
-        .map_err(|_| ExecutorItemError("treasury nonce exceeds uint64".into()))?;
-        let treasury_balance = response_quantity(&responses, 1, "treasury eth_getBalance")?;
-        let top_up_gas_cost = U256::from(TOP_UP_GAS_LIMIT)
-            .checked_mul(U256::from(max_fee_per_gas))
-            .ok_or_else(|| ExecutorItemError("top-up gas cost overflow".into()))?;
-        let protected_treasury = top_up_gas_cost
-            .checked_add(U256::from(self.config.treasury_floor_wei))
-            .ok_or_else(|| ExecutorItemError("treasury reserve requirement overflow".into()))?;
-        // If the treasury can satisfy this bundle but not the preferred float, make a partial
-        // top-up. The next bundle will replenish the float when more treasury funds arrive.
-        let Some(amount) = treasury_affordable_top_up(
-            capped_amount,
-            deficit,
-            treasury_balance,
-            protected_treasury,
-        ) else {
-            let required_treasury = deficit
-                .checked_add(protected_treasury)
-                .ok_or_else(|| ExecutorItemError("treasury balance requirement overflow".into()))?;
-            tracing::warn!(
-                chain_id,
-                treasury_native_balance = %treasury_balance,
-                required_native_balance = %required_treasury,
-                requested_top_up_native_amount = %capped_amount,
-                minimum_top_up_native_amount = %deficit,
-                top_up_gas_cost = %top_up_gas_cost,
-                reserve_native_amount = self.config.treasury_floor_wei,
-                "treasury cannot fund the current UserOperation relayer prefund"
-            );
-            return Err(ExecutorItemError(
-                "treasury balance cannot cover the current UserOperation prefund, top-up gas, and reserve floor".into(),
-            ));
-        };
-        if amount < capped_amount {
-            tracing::info!(
-                chain_id,
-                requested_top_up_native_amount = %capped_amount,
-                submitted_top_up_native_amount = %amount,
-                minimum_top_up_native_amount = %deficit,
-                "treasury funding the current UserOperation with a partial relayer float top-up"
-            );
-        }
-        let amount_u128 = u128::try_from(amount)
-            .map_err(|_| ExecutorItemError("top-up amount exceeds uint128".into()))?;
-
-        self.ensure_lease(lease_scope, lease_token).await?;
-        let signed = sign_eip1559(
-            &self.treasury_key,
-            TransactionPlan {
-                chain_id,
-                nonce,
-                gas_limit: TOP_UP_GAS_LIMIT,
-                max_fee_per_gas,
-                max_priority_fee_per_gas,
-                to: relayer,
-                value: amount,
-                input: Bytes::new(),
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedFundingIntent {
-            chain_id,
-            relayer: relayer.to_string(),
-            amount_wei: amount_u128,
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash,
-            nonce: signed.nonce,
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_funding_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            if let Some(existing) = self
-                .store
-                .get_prepared_funding_intent(chain_id)
-                .await
-                .map_err(store_item_error)?
-            {
-                self.resume_funding_intent(&existing).await?;
-                return Ok(FundingReadiness::Pending);
-            }
-            return Err(ExecutorItemError(
-                "another treasury relayer top-up is pending".into(),
-            ));
-        }
-        self.broadcast_funding_intent(&intent).await?;
-        tracing::info!(
-            chain_id,
-            relayer = %relayer,
-            amount_wei = amount_u128,
-            transaction_hash = %intent.transaction_hash,
-            "submitted treasury relayer gas top-up"
-        );
-        Ok(FundingReadiness::Pending)
-    }
-
-    async fn resume_funding_intent(
-        &self,
-        intent: &PreparedFundingIntent,
-    ) -> Result<(), ExecutorItemError> {
-        self.broadcast_funding_intent(intent).await?;
-        let claimed = self
-            .store
-            .acquire_lease(
-                &format!("receipt:{}:{}", intent.chain_id, intent.transaction_hash),
-                &unique_token("funding-receipt"),
-                self.config.receipt_poll_interval,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if !claimed {
-            return Ok(());
-        }
-        let receipt = self
-            .rpc
-            .call(
-                intent.chain_id,
-                "eth_getTransactionReceipt",
-                json!([intent.transaction_hash]),
-            )
-            .await
-            .map_err(rpc_item_error)?;
-        if receipt.is_null() {
-            return Ok(());
-        }
-        let Some(success) = receipt_succeeded(&receipt) else {
-            return Err(ExecutorItemError(
-                "funding transaction receipt has invalid status".into(),
-            ));
-        };
-        self.store
-            .clear_prepared_funding_intent(intent.chain_id, &intent.transaction_hash)
-            .await
-            .map_err(store_item_error)?;
-        self.broadcast_seen
-            .lock()
-            .await
-            .remove(&intent.transaction_hash);
-        if !success {
-            tracing::error!(
-                chain_id = intent.chain_id,
-                relayer = %intent.relayer,
-                amount_wei = intent.amount_wei,
-                transaction_hash = %intent.transaction_hash,
-                "treasury relayer top-up transaction reverted"
-            );
-            return Err(ExecutorItemError(format!(
-                "treasury relayer top-up transaction reverted: {}",
-                intent.transaction_hash
-            )));
-        }
-        tracing::info!(
-            chain_id = intent.chain_id,
-            relayer = %intent.relayer,
-            amount_wei = intent.amount_wei,
-            transaction_hash = %intent.transaction_hash,
-            "treasury relayer gas top-up included"
-        );
-        Ok(())
-    }
-
-    async fn broadcast_funding_intent(
-        &self,
-        intent: &PreparedFundingIntent,
-    ) -> Result<(), ExecutorItemError> {
-        let raw = validate_raw_transaction(&intent.raw_transaction, &intent.transaction_hash)?;
-        if self
-            .recently_confirmed_broadcast(&intent.transaction_hash)
-            .await
-        {
-            return Ok(());
-        }
-        let outcome = match self
-            .rpc
-            .broadcast_raw_transaction(intent.chain_id, &raw)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                return Err(rpc_item_error(error));
-            }
-        };
-        match outcome {
-            BroadcastOutcome::Accepted(hash)
-                if hash.eq_ignore_ascii_case(&intent.transaction_hash) =>
-            {
-                self.remember_confirmed_broadcast(&intent.transaction_hash)
-                    .await;
-                Ok(())
-            }
-            BroadcastOutcome::Accepted(_) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                Err(ExecutorItemError(
-                    "RPC returned a different funding transaction hash".into(),
-                ))
-            }
-            BroadcastOutcome::Ambiguous(reason) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                tracing::debug!(
-                    chain_id = intent.chain_id,
-                    transaction_hash = %intent.transaction_hash,
-                    reason,
-                    "funding broadcast is ambiguous; retaining exact outbox"
-                );
-                Ok(())
-            }
-            BroadcastOutcome::Rejected(reason) => {
-                self.broadcast_seen
-                    .lock()
-                    .await
-                    .remove(&intent.transaction_hash);
-                if self
-                    .transaction_is_known(intent.chain_id, &intent.transaction_hash)
-                    .await
-                {
-                    self.remember_confirmed_broadcast(&intent.transaction_hash)
-                        .await;
-                } else {
-                    tracing::warn!(
-                        chain_id = intent.chain_id,
-                        transaction_hash = %intent.transaction_hash,
-                        reason,
-                        "rejected broadcast is unproven; retaining exact funding outbox"
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-fn should_notify_executor_deferred(stage: &str) -> bool {
-    matches!(
-        stage,
-        "rpc" | "assets" | "simulation" | "bundle_simulation" | "broadcast" | "execution"
-    )
 }
 
 impl UserOperationHandler for ExecutorEngine {
@@ -3204,152 +1289,1460 @@ impl UserOperationHandler for ExecutorEngine {
     }
 }
 
-fn has_stablecoin_payment(
-    recipient: Address,
-    chain_assets: &ChainAssetConfig,
-    inputs: &[SettlementInput<'_>],
-) -> bool {
-    let allowlist = chain_assets
-        .stablecoins
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    inputs.iter().any(|input| {
-        parse_reimbursement(input.call_data, recipient, &allowlist)
-            .is_ok_and(|reimbursement| !reimbursement.stablecoins.is_empty())
-    })
+/// The shell side of one lane-batch program: executes the core's requested
+/// operations against real infrastructure. Failures fold into result data —
+/// the core decides what they mean.
+/// First-failure latch shared with the lease heartbeat tasks. A failed
+/// renewal (lease gone or store error) trips it once; the driver then answers
+/// every pending non-bookkeeping operation with `Interrupted`, abandoning the
+/// in-flight one at the same moment the old engine's biased `select!` dropped
+/// the pipeline future mid-await.
+struct LeaseInterrupt {
+    reason: std::sync::Mutex<Option<String>>,
+    notify: tokio::sync::Notify,
 }
 
-/// Tempo's outer `0x76` gas limit deliberately comes from the UserOperations' declared limits,
-/// rather than `eth_estimateGas`: EntryPoint catches an inner OOG and an estimate can therefore
-/// succeed while a user's actual execution runs out of gas.
-fn tempo_handle_ops_gas_limit(candidates: &[Candidate]) -> Result<u64, ExecutorItemError> {
-    let declared = candidates.iter().try_fold(U256::ZERO, |total, candidate| {
-        let limits = candidate.packed.packed.accountGasLimits.as_slice();
-        let verification = U256::from_be_slice(&limits[..16]);
-        let call = U256::from_be_slice(&limits[16..]);
-        total
-            .checked_add(verification)?
-            .checked_add(call)?
-            .checked_add(candidate.packed.packed.preVerificationGas)
-    });
-    let declared =
-        declared.ok_or_else(|| ExecutorItemError("Tempo declared gas overflow".into()))?;
-    let gas = declared
-        .checked_mul(U256::from(64u8))
-        .map(|value| value / U256::from(63u8))
-        .and_then(|value| {
-            value.checked_add(U256::from(candidates.len()).checked_mul(U256::from(50_000u64))?)
+impl LeaseInterrupt {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reason: std::sync::Mutex::new(None),
+            notify: tokio::sync::Notify::new(),
         })
-        .and_then(|value| value.checked_add(U256::from(60_000u64)))
-        .ok_or_else(|| ExecutorItemError("Tempo outer gas limit overflow".into()))?;
-    u64::try_from(gas).map_err(|_| ExecutorItemError("Tempo outer gas limit exceeds uint64".into()))
+    }
+
+    fn trip(&self, reason: String) {
+        let mut slot = self.reason.lock().expect("lease interrupt mutex");
+        if slot.is_none() {
+            *slot = Some(reason);
+        }
+        drop(slot);
+        self.notify.notify_one();
+    }
+
+    fn reason(&self) -> Option<String> {
+        self.reason.lock().expect("lease interrupt mutex").clone()
+    }
 }
 
-/// Converts Tempo's `attodollars/gas` price to micro-pathUSD, always rounding up so the relay
-/// never accepts an in-band reimbursement below the cost it is about to front.
-fn tempo_cost_in_path_usd(gas: U256, price_atto: U256) -> Result<U256, ExecutorItemError> {
-    let numerator = gas
-        .checked_mul(price_atto)
-        .and_then(|value| {
-            value.checked_mul(U256::from(10u8).pow(U256::from(tempo::PATH_USD_DECIMALS)))
-        })
-        .ok_or_else(|| ExecutorItemError("Tempo pathUSD cost overflow".into()))?;
-    let denominator = U256::from(10u8).pow(U256::from(18u8));
-    let quotient = numerator / denominator;
-    let remainder = numerator % denominator;
-    quotient
-        .checked_add(U256::from(u8::from(!remainder.is_zero())))
-        .ok_or_else(|| ExecutorItemError("Tempo pathUSD cost overflow".into()))
+struct BatchShell<'a> {
+    engine: &'a ExecutorEngine,
+    operations: &'a [RoutedUserOperation],
+    chain_id: u64,
+    lane: u8,
+    lease_scope: String,
+    lease_token: String,
+    assets: Option<ResolvedChainAssets>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    lease_acquired: bool,
+    treasury_scope: String,
+    treasury_token: String,
+    treasury_heartbeat: Option<tokio::task::JoinHandle<()>>,
+    treasury_lease_acquired: bool,
+    interrupt: Arc<LeaseInterrupt>,
 }
 
-fn marked_tempo_cost(cost: U256, markup_bps: u64) -> Result<U256, ExecutorItemError> {
-    let numerator = cost
-        .checked_mul(U256::from(markup_bps))
-        .ok_or_else(|| ExecutorItemError("Tempo settlement markup overflow".into()))?;
-    let denominator = U256::from(10_000u64);
-    let marked = (numerator / denominator)
-        .checked_add(U256::from(u8::from(!(numerator % denominator).is_zero())))
-        .ok_or_else(|| ExecutorItemError("Tempo settlement markup overflow".into()))?;
-    // Keep the same $0.01 minimum used by the generic stablecoin settlement path.
-    Ok(marked.max(U256::from(10u128.pow(tempo::PATH_USD_DECIMALS - 2))))
+impl BatchShell<'_> {
+    /// Executes one requested operation behind the lease-interrupt fence.
+    /// Bookkeeping (deferral diagnostics, Telegram, log emission, cache
+    /// forget/remember, treasury release) still runs after an interrupt —
+    /// the old engine likewise performed that work after aborting the
+    /// pipeline. Every other operation is answered `Interrupted` without
+    /// executing, and an in-flight one is abandoned mid-await.
+    async fn execute_fenced(
+        &mut self,
+        operation: &core_execution::ExecutionOperation,
+    ) -> core_execution::ExecutionOutcome {
+        use core_execution::{ExecutionOperation as Op, ExecutionOutcome as Out};
+        if matches!(
+            operation,
+            Op::RecordDeferred { .. }
+                | Op::NotifyIssue { .. }
+                | Op::EmitDiagnostic { .. }
+                | Op::ReleaseTreasuryLease
+                | Op::RememberBroadcast { .. }
+                | Op::ForgetBroadcast { .. }
+                | Op::RecordUnprovenBroadcast { .. }
+        ) {
+            return self.execute(operation).await;
+        }
+        if let Some(reason) = self.interrupt.reason() {
+            return Out::Interrupted { reason };
+        }
+        let interrupt = self.interrupt.clone();
+        tokio::select! {
+            biased;
+            _ = interrupt.notify.notified() => Out::Interrupted {
+                reason: interrupt
+                    .reason()
+                    .unwrap_or_else(|| "executor lease was lost".to_owned()),
+            },
+            outcome = self.execute(operation) => outcome,
+        }
+    }
+
+    async fn execute(
+        &mut self,
+        operation: &core_execution::ExecutionOperation,
+    ) -> core_execution::ExecutionOutcome {
+        use core_execution::{ExecutionOperation as Op, ExecutionOutcome as Out};
+        let engine = self.engine;
+        let chain_id = self.chain_id;
+        match operation {
+            Op::CheckChainSupported => {
+                let supported = engine.rpc.supports_chain(chain_id).await;
+                if !supported {
+                    tracing::warn!(
+                        chain_id,
+                        "Iggy stream discovered without a trusted executor RPC"
+                    );
+                }
+                Out::Supported { supported }
+            }
+            Op::LoadChainAssets => {
+                let resolved = if tempo::is_tempo_chain(chain_id) {
+                    Ok(engine.tempo_chain_assets())
+                } else {
+                    engine.chain_assets_for(chain_id).await
+                };
+                match resolved {
+                    Ok(resolved) => {
+                        self.assets = Some(resolved.clone());
+                        Out::Assets {
+                            resolved: core_execution::ResolvedChainAssets {
+                                assets: resolved.assets,
+                                native_symbol: resolved.native_symbol,
+                            },
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(chain_id, %error, "Iggy stream has no usable executor asset policy");
+                        Out::AssetsUnavailable {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            Op::LoadRecords { hashes } => match engine.store.get_many(hashes).await {
+                Ok(records) => Out::Records { records },
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::DeadLetterRouted { index, reason } => Out::Persisted {
+                persisted: engine
+                    .dead_letter_routed(&self.operations[*index], reason)
+                    .await
+                    .is_ok(),
+            },
+            Op::RestoreQueued { queued, .. } => {
+                match engine
+                    .store
+                    .restore_queued_from_durable_payload(queued.clone())
+                    .await
+                {
+                    Ok(_) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ReloadRecord { hash } => match engine.store.get(hash).await {
+                Ok(record) => {
+                    if record.is_some() {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            "rebuilt expired UserOperation status from durable queue payload"
+                        );
+                    }
+                    Out::Record { record }
+                }
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::MarkAdmitted { hash } => match engine.store.mark_admitted(hash).await {
+                Ok(marked) => {
+                    if marked {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            "recovered Redis admission after Iggy producer crash window"
+                        );
+                    }
+                    Out::Marked { marked }
+                }
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::MarkRejected { hash, cause } => match engine.store.mark_rejected(hash).await {
+                Ok(_) => {
+                    match cause {
+                        core_execution::RejectionCause::InvalidQueuedPayload { reason } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                reason,
+                                "rejected invalid queued UserOperation"
+                            );
+                        }
+                        core_execution::RejectionCause::SimulationRejected { reason } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                reason,
+                                "single-operation simulation rejected UserOperation"
+                            );
+                        }
+                        core_execution::RejectionCause::StaleNonce {
+                            user_nonce,
+                            onchain_nonce,
+                        } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                user_nonce = %user_nonce,
+                                onchain_nonce = %onchain_nonce,
+                                "stale account nonce rejected UserOperation"
+                            );
+                        }
+                        core_execution::RejectionCause::UnsupportedTempoFeeToken { fee_token } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                fee_token = ?fee_token,
+                                "Tempo UserOperation requested an unsupported fee token"
+                            );
+                        }
+                    }
+                    Out::Done
+                }
+                Err(error) => {
+                    if let core_execution::RejectionCause::StaleNonce { .. } = cause {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            %error,
+                            "could not persist stale nonce rejection"
+                        );
+                    }
+                    Out::Failed {
+                        message: error.to_string(),
+                    }
+                }
+            },
+            Op::MarkRejectedWithReason {
+                hash,
+                stage,
+                reason,
+            } => {
+                match engine
+                    .store
+                    .mark_rejected_with_executor_reason(hash, stage, reason)
+                    .await
+                {
+                    // The field-rich rejection warns are core-driven
+                    // `EmitDiagnostic` lines, matching the old engine's.
+                    Ok(_) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::DeferOperation { index, cause } => {
+                let delayed = delayed_operation_from_routed(&self.operations[*index]);
+                match engine
+                    .store
+                    .defer_user_operation(&delayed, engine.delayed_payload_ttl())
+                    .await
+                {
+                    Ok(attempt) => {
+                        match cause {
+                            core_execution::DeferCause::AffordableMarketHold => {
+                                tracing::info!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    attempt,
+                                    "holding UserOperation until the market fits its signed reimbursement"
+                                );
+                            }
+                            core_execution::DeferCause::FutureNonce {
+                                user_nonce,
+                                onchain_nonce,
+                            } => {
+                                tracing::info!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    user_nonce = %user_nonce,
+                                    onchain_nonce = %onchain_nonce,
+                                    attempt,
+                                    "future account nonce moved to durable delayed inbox"
+                                );
+                            }
+                        }
+                        Out::Deferred { attempt }
+                    }
+                    Err(error) => {
+                        match cause {
+                            core_execution::DeferCause::AffordableMarketHold => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    %error,
+                                    "could not hold UserOperation for a cheaper market"
+                                );
+                            }
+                            core_execution::DeferCause::FutureNonce { .. } => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    %error,
+                                    "could not persist future nonce in delayed inbox"
+                                );
+                            }
+                        }
+                        Out::Failed {
+                            message: error.to_string(),
+                        }
+                    }
+                }
+            }
+            Op::RecordDeferred {
+                hash,
+                stage,
+                reason,
+            } => {
+                engine
+                    .record_deferred_diagnostic(chain_id, hash, stage, reason)
+                    .await;
+                Out::Done
+            }
+            Op::NotifyIssue {
+                hash,
+                stage,
+                reason,
+            } => {
+                engine.notify_executor_issue(chain_id, stage, hash, reason);
+                Out::Done
+            }
+            // Renders the historical operator log lines whose data lives in
+            // core decisions; message texts, levels, and field names are the
+            // old engine's, byte for byte.
+            Op::EmitDiagnostic { diagnostic } => {
+                use core_execution::ExecutionDiagnostic as Diagnostic;
+                let lane = self.lane;
+                match diagnostic {
+                    Diagnostic::SimulationDeploymentWait { hash, reason } => {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            reason,
+                            "single-operation simulation is waiting for automatic contract deployment"
+                        );
+                    }
+                    Diagnostic::SimulationUnavailable { hash, reason } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            reason,
+                            "single-operation simulation unavailable"
+                        );
+                    }
+                    Diagnostic::BundleSimulationRejected { reason } => {
+                        tracing::warn!(
+                            chain_id,
+                            lane,
+                            reason,
+                            "final handleOps simulation rejected bundle"
+                        );
+                    }
+                    Diagnostic::BundleSimulationNonceMismatch => {
+                        tracing::warn!(
+                            chain_id,
+                            lane,
+                            "final handleOps simulation reported an account nonce mismatch"
+                        );
+                    }
+                    Diagnostic::BundleSimulationDeploymentWait { reason } => {
+                        tracing::info!(
+                            chain_id,
+                            lane,
+                            reason,
+                            "final handleOps simulation is waiting for automatic contract deployment"
+                        );
+                    }
+                    Diagnostic::FloorUnfundable {
+                        quoted_fee,
+                        affordable,
+                        floor,
+                        base_fee,
+                    } => {
+                        tracing::info!(
+                            chain_id,
+                            quoted_fee,
+                            affordable,
+                            floor,
+                            base_fee,
+                            "in-band reimbursement cannot fund an includable outer fee"
+                        );
+                    }
+                    Diagnostic::Repriced {
+                        quoted_fee,
+                        repriced_fee,
+                        base_fee,
+                        tip,
+                    } => {
+                        tracing::info!(
+                            chain_id,
+                            quoted_fee,
+                            repriced_fee,
+                            base_fee,
+                            tip,
+                            "repriced the outer transaction to the signed in-band budget"
+                        );
+                    }
+                    Diagnostic::HoldBudgetExhausted {
+                        hash,
+                        attempt,
+                        paid,
+                        required,
+                    } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            attempt,
+                            paid = %paid,
+                            required = %required,
+                            "in-band reimbursement stayed unaffordable for the whole hold budget"
+                        );
+                    }
+                    Diagnostic::SettlementRejected {
+                        hash,
+                        payment_asset,
+                        paid,
+                        required,
+                        stable_logs_valid,
+                    } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            payment_asset = ?payment_asset,
+                            paid = %paid,
+                            required = %required,
+                            stable_logs_valid,
+                            "in-band settlement rejected UserOperation"
+                        );
+                    }
+                    Diagnostic::TempoSettlementRejected {
+                        hash,
+                        paid,
+                        required,
+                        stable_logs_valid,
+                    } => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            paid = %paid,
+                            required = %required,
+                            stable_logs_valid,
+                            "Tempo pathUSD in-band settlement rejected UserOperation"
+                        );
+                    }
+                    Diagnostic::TopUpCapUsd { native_units } => {
+                        let (native_symbol, native_decimals) = self
+                            .assets
+                            .as_ref()
+                            .map(|assets| {
+                                (assets.native_symbol.as_str(), assets.assets.native_decimals)
+                            })
+                            .unwrap_or(("", 0));
+                        tracing::debug!(
+                            native_symbol,
+                            native_decimals,
+                            native_units = %native_units,
+                            "using USD-denominated relayer top-up cap"
+                        );
+                    }
+                    Diagnostic::TopUpCapUnconvertible => {
+                        let (native_symbol, native_decimals) = self
+                            .assets
+                            .as_ref()
+                            .map(|assets| {
+                                (assets.native_symbol.as_str(), assets.assets.native_decimals)
+                            })
+                            .unwrap_or(("", 0));
+                        tracing::warn!(
+                            native_symbol,
+                            native_decimals,
+                            "could not convert USD relayer top-up cap to native units; using static cap"
+                        );
+                    }
+                    Diagnostic::ExecutionDeferred { reason } => {
+                        tracing::warn!(
+                            chain_id,
+                            lane,
+                            error = %reason,
+                            "UserOperation lane execution deferred"
+                        );
+                    }
+                }
+                Out::Done
+            }
+            Op::AcquireLaneLease => {
+                let acquired = engine
+                    .store
+                    .acquire_lease(
+                        &self.lease_scope,
+                        &self.lease_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if acquired {
+                    self.lease_acquired = true;
+                    self.start_heartbeat();
+                }
+                Out::LeaseAcquired { acquired }
+            }
+            Op::EnsureLaneLease => {
+                match engine
+                    .store
+                    .renew_lease(
+                        &self.lease_scope,
+                        &self.lease_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                {
+                    Ok(held) => Out::LeaseHeld { held },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::LoadPreparedBundle => {
+                match engine
+                    .store
+                    .get_prepared_bundle_intent(chain_id, self.lane)
+                    .await
+                {
+                    Ok(intent) => Out::Intent { intent },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ResumeBundleIntent { intent } => match engine.resume_bundle_intent(intent).await {
+                Ok(disposition) => Out::Resumed {
+                    known_outcome: disposition != BundleResumeDisposition::Unknown,
+                },
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::SimulateIndividually {
+                entry_point,
+                operations,
+            } => {
+                let packed = operations
+                    .iter()
+                    .map(|(_, packed)| packed.clone())
+                    .collect::<Vec<_>>();
+                let hashes = operations.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let verdicts = simulate_individually(
+                    &engine.rpc,
+                    chain_id,
+                    *entry_point,
+                    engine.relayer_addresses[self.lane as usize],
+                    engine.treasury_address,
+                    &engine.simulation_deployer,
+                    &packed,
+                    &hashes,
+                )
+                .await;
+                Out::OperationVerdicts {
+                    verdicts: verdicts
+                        .into_iter()
+                        .map(|verdict| match verdict {
+                            SimulationVerdict::Success(_) => {
+                                core_execution::OperationSimVerdict::Success
+                            }
+                            SimulationVerdict::NonceMismatch => {
+                                core_execution::OperationSimVerdict::NonceMismatch
+                            }
+                            SimulationVerdict::Rejected(reason) => {
+                                core_execution::OperationSimVerdict::Rejected {
+                                    reason: reason.to_string(),
+                                }
+                            }
+                            SimulationVerdict::Pending(reason) => {
+                                core_execution::OperationSimVerdict::Pending {
+                                    reason: reason.to_string(),
+                                }
+                            }
+                            SimulationVerdict::Transient(reason) => {
+                                core_execution::OperationSimVerdict::Transient {
+                                    reason: reason.to_string(),
+                                }
+                            }
+                        })
+                        .collect(),
+                }
+            }
+            Op::FetchAccountNonces {
+                entry_point,
+                probes,
+            } => {
+                let calls = probes
+                    .iter()
+                    .map(|(sender, nonce)| RpcBatchCall {
+                        method: "eth_call",
+                        params: json!([{
+                            "to": entry_point.to_string(),
+                            "data": format!(
+                                "0x{}",
+                                hex::encode(get_nonce_calldata(*sender, *nonce))
+                            ),
+                        }, "latest"]),
+                    })
+                    .collect::<Vec<_>>();
+                match engine.rpc.batch(chain_id, &calls).await {
+                    Ok(responses) => Out::AccountNonces {
+                        nonces: (0..probes.len())
+                            .map(|index| {
+                                response_abi_u256(&responses, index, "EntryPoint getNonce")
+                                    .map_err(|error| {
+                                        tracing::warn!(
+                                            chain_id,
+                                            %error,
+                                            "could not decode EntryPoint account nonce"
+                                        );
+                                    })
+                                    .ok()
+                            })
+                            .collect(),
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            chain_id,
+                            count = probes.len(),
+                            %error,
+                            "could not resolve account nonce mismatches"
+                        );
+                        Out::Failed {
+                            message: error.to_string(),
+                        }
+                    }
+                }
+            }
+            Op::SimulateBundle {
+                entry_point,
+                operations,
+            } => {
+                let packed = operations
+                    .iter()
+                    .map(|(_, packed)| packed.clone())
+                    .collect::<Vec<_>>();
+                let hashes = operations.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let verdict = simulate_bundle(
+                    &engine.rpc,
+                    chain_id,
+                    *entry_point,
+                    engine.relayer_addresses[self.lane as usize],
+                    engine.treasury_address,
+                    &engine.simulation_deployer,
+                    &packed,
+                    &hashes,
+                )
+                .await;
+                Out::BundleVerdict {
+                    verdict: match verdict {
+                        SimulationVerdict::Success(simulation) => {
+                            core_execution::BundleSimVerdict::Success(
+                                core_execution::BundleSimulationData {
+                                    gas_used: simulation.gas_used,
+                                    operation_gas_used: simulation
+                                        .events
+                                        .iter()
+                                        .map(|event| event.actual_gas_used)
+                                        .collect(),
+                                    logs: simulation
+                                        .logs
+                                        .iter()
+                                        .map(|log| SettlementLog {
+                                            address: log.address,
+                                            topics: log.topics.clone(),
+                                            data: log.data.clone(),
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        }
+                        SimulationVerdict::NonceMismatch => {
+                            core_execution::BundleSimVerdict::NonceMismatch
+                        }
+                        SimulationVerdict::Rejected(reason) => {
+                            core_execution::BundleSimVerdict::Rejected {
+                                reason: reason.to_string(),
+                            }
+                        }
+                        SimulationVerdict::Pending(reason) => {
+                            core_execution::BundleSimVerdict::Pending {
+                                reason: reason.to_string(),
+                            }
+                        }
+                        SimulationVerdict::Transient(reason) => {
+                            core_execution::BundleSimVerdict::Transient {
+                                reason: reason.to_string(),
+                            }
+                        }
+                    },
+                }
+            }
+            Op::FetchTransactionContext {
+                entry_point,
+                calldata,
+            } => {
+                let calldata: Bytes = calldata.clone().into();
+                match engine
+                    .transaction_context(
+                        chain_id,
+                        engine.relayer_addresses[self.lane as usize],
+                        *entry_point,
+                        &calldata,
+                    )
+                    .await
+                {
+                    Ok(context) => Out::Context {
+                        context: core_execution::TransactionContext {
+                            estimated_gas: context.estimated_gas,
+                            base_fee_per_gas: context.base_fee_per_gas,
+                            max_fee_per_gas: context.max_fee_per_gas,
+                            max_priority_fee_per_gas: context.max_priority_fee_per_gas,
+                            nonce: context.nonce,
+                            relayer_balance: context.relayer_balance,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchMarketPrice => {
+                let Some(assets) = &self.assets else {
+                    return Out::Failed {
+                        message: "chain assets were not resolved".into(),
+                    };
+                };
+                match engine
+                    .market_usd_price(chain_id, &assets.native_symbol)
+                    .await
+                {
+                    Ok(price) => Out::Price { price },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignBundle { request } => {
+                match sign_eip1559(
+                    &engine.relayer_keys[self.lane as usize],
+                    TransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: request.gas_limit,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+                        to: request.entry_point,
+                        value: U256::ZERO,
+                        input: request.calldata.clone().into(),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SavePreparedBundle { intent } => {
+                match engine.store.save_prepared_bundle_intent(intent).await {
+                    Ok(saved) => Out::Saved { saved },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::CheckBroadcastSeen { transaction_hash } => Out::Seen {
+                seen: engine.recently_confirmed_broadcast(transaction_hash).await,
+            },
+            Op::BroadcastRaw {
+                raw_transaction,
+                transaction_hash: _,
+            } => match engine
+                .rpc
+                .broadcast_raw_transaction(chain_id, raw_transaction)
+                .await
+            {
+                Ok(outcome) => Out::Sent {
+                    reply: match outcome {
+                        BroadcastOutcome::Accepted(hash) => {
+                            core_execution::BroadcastReply::Accepted {
+                                transaction_hash: hash,
+                            }
+                        }
+                        BroadcastOutcome::Ambiguous(reason) => {
+                            core_execution::BroadcastReply::Ambiguous { reason }
+                        }
+                        BroadcastOutcome::Rejected(reason) => {
+                            core_execution::BroadcastReply::Rejected { reason }
+                        }
+                    },
+                },
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::RememberBroadcast { transaction_hash } => {
+                engine.remember_confirmed_broadcast(transaction_hash).await;
+                Out::Done
+            }
+            Op::ForgetBroadcast { transaction_hash } => {
+                engine.broadcast_seen.lock().await.remove(transaction_hash);
+                Out::Done
+            }
+            Op::ProbeTransactionKnown { transaction_hash } => Out::Known {
+                known: engine
+                    .transaction_is_known(chain_id, transaction_hash)
+                    .await,
+            },
+            Op::ProbeStaleNonce { intent } => Out::Stale {
+                stale: engine.bundle_nonce_is_stale(intent).await,
+            },
+            Op::ClearStaleIntent { intent, reason } => {
+                match engine.clear_stale_bundle_intent(intent, reason).await {
+                    Ok(()) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::AcquireTreasuryLease => {
+                match engine
+                    .store
+                    .acquire_lease(
+                        &self.treasury_scope,
+                        &self.treasury_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                {
+                    Ok(acquired) => {
+                        if acquired {
+                            self.treasury_lease_acquired = true;
+                            self.start_treasury_heartbeat();
+                        }
+                        Out::LeaseAcquired { acquired }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::EnsureTreasuryLease => {
+                match engine
+                    .store
+                    .renew_lease(
+                        &self.treasury_scope,
+                        &self.treasury_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                {
+                    Ok(held) => Out::LeaseHeld { held },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ReleaseTreasuryLease => {
+                self.release_treasury_lease().await;
+                Out::Done
+            }
+            Op::LoadPreparedFunding => {
+                match engine.store.get_prepared_funding_intent(chain_id).await {
+                    Ok(intent) => Out::FundingIntent { intent },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SaveFundingIntent { intent } => {
+                match engine.store.save_prepared_funding_intent(intent).await {
+                    Ok(saved) => Out::Saved { saved },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ClearFundingIntent { transaction_hash } => {
+                match engine
+                    .store
+                    .clear_prepared_funding_intent(chain_id, transaction_hash)
+                    .await
+                {
+                    Ok(_) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTreasuryContext => {
+                let calls = [
+                    RpcBatchCall {
+                        method: "eth_getTransactionCount",
+                        params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_getBalance",
+                        params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                ];
+                match engine.rpc.batch(chain_id, &calls).await {
+                    Ok(responses) => {
+                        let context =
+                            response_quantity(&responses, 0, "treasury eth_getTransactionCount")
+                                .and_then(|nonce| {
+                                    let nonce = u64::try_from(nonce).map_err(|_| {
+                                        ExecutorItemError("treasury nonce exceeds uint64".into())
+                                    })?;
+                                    let balance = response_quantity(
+                                        &responses,
+                                        1,
+                                        "treasury eth_getBalance",
+                                    )?;
+                                    Ok((nonce, balance))
+                                });
+                        match context {
+                            Ok((nonce, balance)) => Out::TreasuryContext { nonce, balance },
+                            Err(error) => Out::Failed {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTempoTreasuryContext { transfer_amount } => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
+                let transfer_calldata =
+                    tempo::path_usd_transfer_calldata(relayer, *transfer_amount);
+                let calls = [
+                    RpcBatchCall {
+                        method: "eth_getTransactionCount",
+                        params: json!([engine.treasury_address.to_string(), "pending"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_call",
+                        params: json!([{
+                            "to": tempo::PATH_USD.to_string(),
+                            "data": format!("0x{}", hex::encode(tempo::path_usd_balance_calldata(engine.treasury_address))),
+                        }, "latest"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_estimateGas",
+                        params: json!([{
+                            "from": engine.treasury_address.to_string(),
+                            "to": tempo::PATH_USD.to_string(),
+                            "data": format!("0x{}", hex::encode(&transfer_calldata)),
+                            "feeToken": tempo::PATH_USD.to_string(),
+                        }, "latest"]),
+                    },
+                ];
+                match engine.rpc.batch(chain_id, &calls).await {
+                    Ok(responses) => {
+                        let context = response_quantity(&responses, 0, "Tempo treasury nonce")
+                            .and_then(|nonce| {
+                                let nonce = u64::try_from(nonce).map_err(|_| {
+                                    ExecutorItemError("Tempo treasury nonce exceeds uint64".into())
+                                })?;
+                                let balance = response_abi_u256(
+                                    &responses,
+                                    1,
+                                    "Tempo treasury pathUSD balance",
+                                )?;
+                                let raw_gas_estimate = u64::try_from(response_quantity(
+                                    &responses,
+                                    2,
+                                    "Tempo pathUSD top-up eth_estimateGas",
+                                )?)
+                                .map_err(|_| {
+                                    ExecutorItemError(
+                                        "Tempo pathUSD top-up gas estimate exceeds uint64".into(),
+                                    )
+                                })?;
+                                Ok((nonce, balance, raw_gas_estimate))
+                            });
+                        match context {
+                            Ok((nonce, balance, raw_gas_estimate)) => Out::TempoTreasuryContext {
+                                nonce,
+                                balance,
+                                raw_gas_estimate,
+                            },
+                            Err(error) => Out::Failed {
+                                message: error.to_string(),
+                            },
+                        }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTreasuryTransfer { request } => {
+                match sign_eip1559(
+                    &engine.treasury_key,
+                    TransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: TOP_UP_GAS_LIMIT,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+                        to: engine.relayer_addresses[self.lane as usize],
+                        value: request.amount,
+                        input: Bytes::new(),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTreasuryPathUsd { request } => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
+                match sign_tempo(
+                    &engine.treasury_key,
+                    TempoTransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: request.gas_limit,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: 0,
+                        fee_token: tempo::PATH_USD,
+                        to: tempo::PATH_USD,
+                        input: tempo::path_usd_transfer_calldata(relayer, request.amount),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::AcquireReceiptProbe { transaction_hash } => {
+                match engine
+                    .store
+                    .acquire_lease(
+                        &format!("receipt:{chain_id}:{transaction_hash}"),
+                        &unique_token("funding-receipt"),
+                        engine.config.receipt_poll_interval,
+                    )
+                    .await
+                {
+                    Ok(acquired) => Out::LeaseAcquired { acquired },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTransactionReceipt { transaction_hash } => {
+                match engine
+                    .rpc
+                    .call(
+                        chain_id,
+                        "eth_getTransactionReceipt",
+                        json!([transaction_hash]),
+                    )
+                    .await
+                {
+                    Ok(receipt) => Out::Receipt {
+                        receipt: (!receipt.is_null()).then_some(receipt),
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::RecordTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                requested,
+                minimum,
+                top_up_gas_cost,
+            } => {
+                tracing::warn!(
+                    chain_id,
+                    treasury_native_balance = %treasury_balance,
+                    required_native_balance = %required_treasury,
+                    requested_top_up_native_amount = %requested,
+                    minimum_top_up_native_amount = %minimum,
+                    top_up_gas_cost = %top_up_gas_cost,
+                    reserve_native_amount = engine.config.treasury_floor_wei,
+                    "treasury cannot fund the current UserOperation relayer prefund"
+                );
+                Out::Done
+            }
+            Op::RecordTempoTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                top_up,
+                top_up_gas_limit,
+                top_up_gas_cost,
+            } => {
+                tracing::warn!(
+                    chain_id,
+                    treasury_path_usd_balance = %treasury_balance,
+                    required_path_usd = %required_treasury,
+                    top_up_path_usd = %top_up,
+                    top_up_gas_limit,
+                    top_up_gas_path_usd = %top_up_gas_cost,
+                    reserve_path_usd = tempo::TEMPO_TREASURY_FLOOR,
+                    "Tempo treasury cannot fund the pending relayer top-up"
+                );
+                Out::Done
+            }
+            Op::RecordPartialTopUp {
+                requested,
+                submitted,
+                minimum,
+            } => {
+                tracing::info!(
+                    chain_id,
+                    requested_top_up_native_amount = %requested,
+                    submitted_top_up_native_amount = %submitted,
+                    minimum_top_up_native_amount = %minimum,
+                    "treasury funding the current UserOperation with a partial relayer float top-up"
+                );
+                Out::Done
+            }
+            Op::RecordFundingSubmitted {
+                amount,
+                transaction_hash,
+                tempo: is_tempo,
+            } => {
+                let relayer = engine.relayer_addresses[self.lane as usize];
+                if *is_tempo {
+                    tracing::info!(
+                        chain_id,
+                        relayer = %relayer,
+                        amount_path_usd = %amount,
+                        transaction_hash = %transaction_hash,
+                        "submitted Tempo treasury pathUSD relayer top-up"
+                    );
+                } else {
+                    tracing::info!(
+                        chain_id,
+                        relayer = %relayer,
+                        amount_wei = %amount,
+                        transaction_hash = %transaction_hash,
+                        "submitted treasury relayer gas top-up"
+                    );
+                }
+                Out::Done
+            }
+            Op::RecordUnprovenFunding {
+                transaction_hash,
+                ambiguous,
+                reason,
+            } => {
+                if *ambiguous {
+                    tracing::debug!(
+                        chain_id,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "funding broadcast is ambiguous; retaining exact outbox"
+                    );
+                } else {
+                    tracing::warn!(
+                        chain_id,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "rejected broadcast is unproven; retaining exact funding outbox"
+                    );
+                }
+                Out::Done
+            }
+            Op::NoteFundingReceipt { intent, success } => {
+                if *success {
+                    tracing::info!(
+                        chain_id = intent.chain_id,
+                        relayer = %intent.relayer,
+                        amount_wei = intent.amount_wei,
+                        transaction_hash = %intent.transaction_hash,
+                        "treasury relayer gas top-up included"
+                    );
+                } else {
+                    tracing::error!(
+                        chain_id = intent.chain_id,
+                        relayer = %intent.relayer,
+                        amount_wei = intent.amount_wei,
+                        transaction_hash = %intent.transaction_hash,
+                        "treasury relayer top-up transaction reverted"
+                    );
+                }
+                Out::Done
+            }
+            Op::RecordUnprovenBroadcast {
+                transaction_hash,
+                ambiguous,
+                reason,
+            } => {
+                if *ambiguous {
+                    tracing::warn!(
+                        chain_id,
+                        lane = self.lane,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "ambiguous handleOps broadcast is not yet observable"
+                    );
+                } else {
+                    tracing::warn!(
+                        chain_id,
+                        lane = self.lane,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "rejected broadcast is unproven; retaining exact handleOps outbox"
+                    );
+                }
+                Out::Done
+            }
+            Op::MarkBundleSubmitted { intent, gas_limit } => {
+                match engine
+                    .store
+                    .mark_bundle_submitted(
+                        chain_id,
+                        &intent.transaction_hash,
+                        &intent.user_operation_hashes,
+                    )
+                    .await
+                {
+                    Ok(indexed) => {
+                        if indexed == intent.user_operation_hashes.len() {
+                            if intent.raw_transaction.starts_with("0x76") {
+                                tracing::info!(
+                                    chain_id,
+                                    lane = self.lane,
+                                    relayer = %engine.relayer_addresses[self.lane as usize],
+                                    transaction_hash = %intent.transaction_hash,
+                                    nonce = intent.nonce,
+                                    operations = intent.user_operation_hashes.len(),
+                                    gas_limit,
+                                    fee_token = %tempo::PATH_USD,
+                                    "submitted Tempo 0x76 handleOps transaction"
+                                );
+                            } else {
+                                tracing::info!(
+                                    chain_id,
+                                    lane = self.lane,
+                                    relayer = %engine.relayer_addresses[self.lane as usize],
+                                    transaction_hash = %intent.transaction_hash,
+                                    nonce = intent.nonce,
+                                    operations = intent.user_operation_hashes.len(),
+                                    gas_limit,
+                                    "submitted handleOps transaction"
+                                );
+                            }
+                        }
+                        Out::Indexed { indexed }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchTempoContext => {
+                match engine
+                    .tempo_transaction_context(
+                        chain_id,
+                        engine.relayer_addresses[self.lane as usize],
+                    )
+                    .await
+                {
+                    Ok(context) => Out::TempoContext {
+                        base_fee_atto: context.base_fee_atto,
+                        nonce: context.nonce,
+                        relayer_path_usd_balance: context.relayer_path_usd_balance,
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTempoBundle { request } => {
+                match sign_tempo(
+                    &engine.relayer_keys[self.lane as usize],
+                    TempoTransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: request.gas_limit,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: 0,
+                        fee_token: tempo::PATH_USD,
+                        to: request.entry_point,
+                        input: request.calldata.clone().into(),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+        }
+    }
+
+    fn start_heartbeat(&mut self) {
+        let engine = self.engine.clone();
+        let scope = self.lease_scope.clone();
+        let token = self.lease_token.clone();
+        let ttl = engine.config.lease_ttl;
+        let interrupt = self.interrupt.clone();
+        self.heartbeat = Some(tokio::spawn(async move {
+            let period = (ttl / 3).max(Duration::from_millis(1));
+            let start = tokio::time::Instant::now() + period;
+            let mut heartbeat = tokio::time::interval_at(start, period);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                heartbeat.tick().await;
+                if let Err(error) = engine.ensure_lease(&scope, &token).await {
+                    tracing::warn!(%error, "lane lease heartbeat stopped");
+                    interrupt.trip(error.to_string());
+                    return;
+                }
+            }
+        }));
+    }
+
+    fn start_treasury_heartbeat(&mut self) {
+        let engine = self.engine.clone();
+        let scope = self.treasury_scope.clone();
+        let token = self.treasury_token.clone();
+        let ttl = engine.config.lease_ttl;
+        let interrupt = self.interrupt.clone();
+        self.treasury_heartbeat = Some(tokio::spawn(async move {
+            let period = (ttl / 3).max(Duration::from_millis(1));
+            let start = tokio::time::Instant::now() + period;
+            let mut heartbeat = tokio::time::interval_at(start, period);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                heartbeat.tick().await;
+                if let Err(error) = engine.ensure_lease(&scope, &token).await {
+                    tracing::warn!(%error, "treasury lease heartbeat stopped");
+                    interrupt.trip(error.to_string());
+                    return;
+                }
+            }
+        }));
+    }
+
+    async fn release_treasury_lease(&mut self) {
+        if let Some(heartbeat) = self.treasury_heartbeat.take() {
+            heartbeat.abort();
+        }
+        if self.treasury_lease_acquired {
+            self.treasury_lease_acquired = false;
+            if let Err(error) = self
+                .engine
+                .store
+                .release_lease(&self.treasury_scope, &self.treasury_token)
+                .await
+            {
+                if tempo::is_tempo_chain(self.chain_id) {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        %error,
+                        "could not release Tempo treasury nonce lease"
+                    );
+                } else {
+                    tracing::warn!(
+                        chain_id = self.chain_id,
+                        %error,
+                        "could not release treasury nonce lease"
+                    );
+                }
+            }
+        }
+    }
+
+    async fn finish(&mut self) {
+        // Backstop: a transiently erroring program must never leak the
+        // treasury lease past the batch.
+        self.release_treasury_lease().await;
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        if self.lease_acquired
+            && let Err(error) = self
+                .engine
+                .store
+                .release_lease(&self.lease_scope, &self.lease_token)
+                .await
+        {
+            tracing::warn!(
+                chain_id = self.chain_id,
+                lane = self.lane,
+                %error,
+                "could not release relayer lane lease"
+            );
+        }
+    }
 }
 
-fn candidate_from_record(
-    result_index: usize,
-    routed: &RoutedUserOperation,
-    record: StoredUserOperation,
-    pool_width: usize,
-) -> Result<Candidate, &'static str> {
-    let hash = B256::from_str(&routed.user_operation_hash)
-        .map_err(|_| "queue UserOperation hash is invalid")?;
-    let entry_point = Address::from_str(&routed.entry_point)
-        .map_err(|_| "queue EntryPoint address is invalid")?;
-    if relayer_index_for_sender(&routed.sender, pool_width) != routed.lane as usize {
-        return Err("sender route does not match relayer lane");
-    }
-    let packed = PackedOperation::try_from(&record.user_operation)
-        .map_err(|_| "could not pack queued UserOperation")?;
-    if packed.has_eip7702_authorization {
-        return Err("EIP-7702 UserOperations are not enabled in the executor");
-    }
-    if !packed
-        .sender
-        .to_string()
-        .eq_ignore_ascii_case(&routed.sender)
-    {
-        return Err("queue sender does not match UserOperation sender");
-    }
-    if user_operation_hash(&packed, entry_point, routed.chain_id) != hash {
-        return Err("queue UserOperation hash does not match immutable payload");
-    }
-    Ok(Candidate {
-        result_index,
-        hash,
-        hash_string: routed.user_operation_hash.to_ascii_lowercase(),
-        entry_point,
-        packed,
-        delayed_operation: delayed_operation_from_routed(routed),
-    })
-}
-
-fn queued_operation_from_routed(
-    routed: &RoutedUserOperation,
-    pool_width: usize,
-) -> Result<QueuedUserOperation, &'static str> {
-    let operation = serde_json::from_value::<UserOperation>(routed.user_operation.clone())
-        .map_err(|_| "queue UserOperation payload is not canonical v0.7 JSON")?;
-    if serde_json::to_value(&operation).ok().as_ref() != Some(&routed.user_operation) {
-        return Err("queue UserOperation payload is not canonical JSON");
-    }
-    let entry_point = Address::from_str(&routed.entry_point)
-        .map_err(|_| "queue EntryPoint address is invalid")?;
-    let hash = B256::from_str(&routed.user_operation_hash)
-        .map_err(|_| "queue UserOperation hash is invalid")?;
-    let packed =
-        PackedOperation::try_from(&operation).map_err(|_| "could not pack queue UserOperation")?;
-    if packed.has_eip7702_authorization {
-        return Err("EIP-7702 UserOperations are not enabled in the executor");
-    }
-    if !packed
-        .sender
-        .to_string()
-        .eq_ignore_ascii_case(&routed.sender)
-    {
-        return Err("queue sender does not match UserOperation sender");
-    }
-    if relayer_index_for_sender(&routed.sender, pool_width) != routed.lane as usize {
-        return Err("sender route does not match relayer lane");
-    }
-    if user_operation_hash(&packed, entry_point, routed.chain_id) != hash {
-        return Err("queue UserOperation hash does not match immutable payload");
-    }
-    Ok(QueuedUserOperation {
-        user_operation_hash: routed.user_operation_hash.to_ascii_lowercase(),
-        chain_id: routed.chain_id,
-        entry_point: routed.entry_point.clone(),
-        user_operation: operation,
-    })
+fn validate_raw_transaction(
+    raw_transaction: &str,
+    transaction_hash: &str,
+) -> Result<Vec<u8>, ExecutorItemError> {
+    vela_relay_core::broadcast::validate_raw_transaction(raw_transaction, transaction_hash)
+        .map_err(|error| ExecutorItemError(error.to_string()))
 }
 
 fn delayed_operation_from_routed(routed: &RoutedUserOperation) -> DelayedUserOperation {
@@ -3380,31 +2773,6 @@ fn routed_operation_from_delayed(operation: &DelayedUserOperation) -> RoutedUser
         partition_id: operation.partition_id,
         offset: operation.offset,
     }
-}
-
-fn queue_record_matches(routed: &RoutedUserOperation, record: &StoredUserOperation) -> bool {
-    record.chain_id == routed.chain_id
-        && record.entry_point.eq_ignore_ascii_case(&routed.entry_point)
-        && serde_json::to_value(&record.user_operation).ok().as_ref()
-            == Some(&routed.user_operation)
-}
-
-fn admission_action(admitted: bool, envelope_matches: bool) -> AdmissionAction {
-    match (admitted, envelope_matches) {
-        (_, false) => AdmissionAction::DeadLetter,
-        (false, true) => AdmissionAction::Recover,
-        (true, true) => AdmissionAction::Execute,
-    }
-}
-
-fn is_durable_status(status: UserOperationStatusKind) -> bool {
-    matches!(
-        status,
-        UserOperationStatusKind::Submitted
-            | UserOperationStatusKind::Rejected
-            | UserOperationStatusKind::Included
-            | UserOperationStatusKind::Failed
-    )
 }
 
 fn item_error(message: &str) -> Result<(), UserOperationHandlerError> {
@@ -3476,148 +2844,17 @@ fn parse_quantity(value: &str) -> Option<U256> {
     U256::from_str_radix(digits, 16).ok()
 }
 
-fn nonce_too_low(reason: &str) -> bool {
-    reason.to_ascii_lowercase().contains("nonce too low")
-}
-
-/// Returns a full or partial float top-up only when the treasury can still cover the immediate
-/// UserOperation prefund after reserving this transfer's gas and the configured floor.
-fn treasury_affordable_top_up(
-    capped_amount: U256,
-    deficit: U256,
-    treasury_balance: U256,
-    protected_treasury: U256,
-) -> Option<U256> {
-    let amount = capped_amount.min(treasury_balance.saturating_sub(protected_treasury));
-    (amount >= deficit).then_some(amount)
-}
-
-/// The diagnostic a held operation carries while it waits. Deliberately distinct from
-/// `settlement_rejection_reason` — a wallet polling the status endpoint must be able to tell
-/// "still going, waiting for gas to come down" from "this will never execute".
-fn settlement_hold_reason(paid: U256, required: U256, attempt: u32, max_attempts: u32) -> String {
-    format!(
-        "waiting for network fees to fit the signed in-band reimbursement: paid={paid}, required={required}, shortfall={}, attempt={attempt}/{max_attempts}",
-        required.saturating_sub(paid)
-    )
-}
-
-fn settlement_rejection_reason(paid: U256, required: U256, stable_logs_valid: bool) -> String {
-    if paid < required {
-        format!(
-            "in-band reimbursement is below the required amount: paid={paid}, required={required}, shortfall={}",
-            required.saturating_sub(paid)
-        )
-    } else if !stable_logs_valid {
-        "in-band reimbursement transfer logs do not prove payment to the settlement recipient"
-            .into()
-    } else {
-        "in-band reimbursement was rejected".into()
-    }
-}
-
-/// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
-/// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
-fn parse_market_usd_price(value: &str) -> Option<U256> {
-    let value = value.trim();
-    let mut parts = value.split('.');
-    let whole = parts.next()?;
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let scale = U256::from(USD_PRICE_SCALE);
-    let whole = U256::from_str(whole).ok()?.checked_mul(scale)?;
-    let kept = &fraction[..fraction.len().min(USD_PRICE_DECIMALS as usize)];
-    let fraction = if kept.is_empty() {
-        U256::ZERO
-    } else {
-        U256::from_str(kept)
-            .ok()?
-            .checked_mul(U256::from(10u8).pow(U256::from(USD_PRICE_DECIMALS - kept.len() as u32)))?
-    };
-    let mut price = whole.checked_add(fraction)?;
-    if value
-        .split_once('.')
-        .is_some_and(|(_, fraction)| fraction.len() > USD_PRICE_DECIMALS as usize)
-        && value.split_once('.').is_some_and(|(_, fraction)| {
-            fraction[USD_PRICE_DECIMALS as usize..]
-                .bytes()
-                .any(|byte| byte != b'0')
-        })
-    {
-        price = price.checked_add(U256::ONE)?;
-    }
-    (!price.is_zero()).then_some(price)
-}
-
-/// Convert a USD-denominated relayer funding cap into a chain's smallest native unit,
-/// rounding up so a positive USD cap never becomes zero through integer division.
-fn native_amount_for_usd_cap(
-    native_decimals: u32,
-    native_usd_price: U256,
-    usd_cap: u64,
-) -> Option<U256> {
-    if native_usd_price.is_zero() || native_decimals > 38 {
-        return None;
-    }
-    let native_scale =
-        (0..native_decimals).try_fold(U256::ONE, |value, _| value.checked_mul(U256::from(10u8)))?;
-    let numerator = U256::from(usd_cap)
-        .checked_mul(U256::from(USD_PRICE_SCALE))?
-        .checked_mul(native_scale)?;
-    let quotient = numerator / native_usd_price;
-    let remainder = numerator % native_usd_price;
-    quotient.checked_add(U256::from(u8::from(!remainder.is_zero())))
-}
-
-fn parse_hex_bytes(value: &str) -> Option<Bytes> {
-    let digits = value.strip_prefix("0x")?;
-    if !digits.len().is_multiple_of(2) {
-        return None;
-    }
-    hex::decode(digits).ok().map(Into::into)
-}
-
-fn validate_raw_transaction(
-    raw_transaction: &str,
-    transaction_hash: &str,
-) -> Result<Vec<u8>, ExecutorItemError> {
-    let raw = parse_hex_bytes(raw_transaction)
-        .filter(|raw| !raw.is_empty())
-        .ok_or_else(|| ExecutorItemError("prepared raw transaction is invalid".into()))?;
-    if !matches!(raw.first(), Some(0x02 | 0x76)) {
-        return Err(ExecutorItemError(
-            "prepared transaction is not a supported type 0x02 or Tempo type 0x76".into(),
-        ));
-    }
-    let expected = B256::from_str(transaction_hash)
-        .map_err(|_| ExecutorItemError("prepared transaction hash is invalid".into()))?;
-    if alloy::primitives::keccak256(&raw) != expected {
-        return Err(ExecutorItemError(
-            "prepared transaction hash does not match raw bytes".into(),
-        ));
-    }
-    Ok(raw.to_vec())
-}
+// Settlement reason strings live in `vela_relay_core::settlement`; the hold
+// ladder and budget in `vela_relay_core::hold`; broadcast judgement and
+// funding policy in their core modules.
+use vela_relay_core::broadcast::{nonce_too_low, parse_hex_bytes};
+use vela_relay_core::execution as core_execution;
+use vela_relay_core::execution::BundleReplayAudit;
+use vela_relay_core::funding::TOP_UP_GAS_LIMIT;
+use vela_relay_core::settlement::parse_market_usd_price;
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {
     (0..count).map(|_| item_error(message)).collect()
-}
-
-fn finish_results(
-    results: Vec<Option<Result<(), UserOperationHandlerError>>>,
-    default_error: &str,
-) -> UserOperationBatchResults {
-    results
-        .into_iter()
-        .map(|result| result.unwrap_or_else(|| item_error(default_error)))
-        .collect()
 }
 
 fn unique_token(prefix: &str) -> String {
@@ -3631,17 +2868,10 @@ fn unique_token(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, U256};
+    use alloy::primitives::U256;
     use serde_json::json;
 
-    use super::{
-        AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
-        marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
-        parse_market_usd_price, parse_quantity, response_quantity, settlement_rejection_reason,
-        should_notify_executor_deferred, tempo_cost_in_path_usd, treasury_affordable_top_up,
-        validate_raw_transaction,
-    };
-    use crate::utils::tempo;
+    use super::{ExecutorItemError, RpcError, parse_quantity, response_quantity};
 
     #[test]
     fn parses_canonical_rpc_quantities_only() {
@@ -3653,105 +2883,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_binance_native_usd_prices_with_bundler_favourable_rounding() {
-        assert_eq!(
-            parse_market_usd_price("3024.12"),
-            Some(U256::from(302_412_000_000u64))
-        );
-        assert_eq!(
-            parse_market_usd_price("1.0000000001"),
-            Some(U256::from(100_000_001u64))
-        );
-        for invalid in ["", "0", "-1", "1e3", "1.2.3"] {
-            assert_eq!(parse_market_usd_price(invalid), None, "{invalid}");
-        }
-    }
-
-    #[test]
-    fn converts_twenty_usd_top_up_cap_to_native_units_with_ceiling_rounding() {
-        // MATIC at $0.20: $20 is exactly 100 MATIC.
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(20_000_000u64), NATIVE_TOP_UP_USD_CAP),
-            Some(U256::from(100_000_000_000_000_000_000u128))
-        );
-        // ETH at $2,500: $20 is 0.008 ETH.
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(250_000_000_000u64), NATIVE_TOP_UP_USD_CAP,),
-            Some(U256::from(8_000_000_000_000_000u64))
-        );
-        // A non-integral conversion is rounded toward the relayer.
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(300_000_000u64), NATIVE_TOP_UP_USD_CAP),
-            Some(U256::from(6_666_666_666_666_666_667u128))
-        );
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::ZERO, NATIVE_TOP_UP_USD_CAP),
-            None
-        );
-        assert_eq!(
-            native_amount_for_usd_cap(39, U256::ONE, NATIVE_TOP_UP_USD_CAP),
-            None
-        );
-    }
-
-    #[test]
-    fn recognizes_a_nonce_too_low_broadcast_diagnostic() {
-        assert!(nonce_too_low(
-            "RPC code -32000: nonce too low: next nonce 1, tx nonce 0"
-        ));
-        assert!(nonce_too_low("NONCE TOO LOW"));
-        assert!(!nonce_too_low("replacement transaction underpriced"));
-    }
-
-    #[test]
-    fn funds_the_current_bundle_when_the_preferred_float_is_not_affordable() {
-        let protected = U256::from(100_231_000_000_000u64);
-        // 0.011971738426977855 ETH in the treasury can still pay the requested 0.002 ETH
-        // float after retaining the 0.0001 ETH floor and the transfer gas.
-        assert_eq!(
-            treasury_affordable_top_up(
-                U256::from(2_000_000_000_000_000u64),
-                U256::from(1_000_000_000_000_000u64),
-                U256::from(11_971_738_426_977_855u64),
-                protected,
-            ),
-            Some(U256::from(2_000_000_000_000_000u64))
-        );
-
-        // A tight treasury is allowed to provide a reduced float as long as this operation's
-        // exact deficit remains covered.
-        assert_eq!(
-            treasury_affordable_top_up(
-                U256::from(2_000u64),
-                U256::from(1_000u64),
-                U256::from(1_500u64),
-                U256::ZERO,
-            ),
-            Some(U256::from(1_500u64))
-        );
-        assert_eq!(
-            treasury_affordable_top_up(
-                U256::from(2_000u64),
-                U256::from(1_000u64),
-                U256::from(999u64),
-                U256::ZERO,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn explains_an_insufficient_in_band_reimbursement() {
-        assert_eq!(
-            settlement_rejection_reason(
-                U256::from(105_959_625_000_000_000u64),
-                U256::from(111_625_968_750_000_000u64),
-                true,
-            ),
-            "in-band reimbursement is below the required amount: paid=105959625000000000, required=111625968750000000, shortfall=5666343750000000"
-        );
-    }
+    // Money-math and broadcast-judgement tests moved to `vela_relay_core`
+    // (settlement, funding, broadcast) with their functions.
 
     #[test]
     fn batch_quantity_helper_distinguishes_errors_and_invalid_values() {
@@ -3770,58 +2903,8 @@ mod tests {
     }
 
     #[test]
-    fn validates_raw_transaction_type_and_hash() {
-        let raw = [0x02, 0x01, 0x02, 0x03];
-        let hash = alloy::primitives::keccak256(raw).to_string();
-        assert_eq!(validate_raw_transaction("0x02010203", &hash).unwrap(), raw);
-        assert!(validate_raw_transaction("0x01010203", &hash).is_err());
-        assert!(validate_raw_transaction("0x02010203", &B256::ZERO.to_string()).is_err());
-        assert!(parse_hex_bytes("0x1").is_none());
-    }
-
-    #[test]
-    fn prices_tempo_path_usd_with_ceiling_and_the_default_one_point_four_x_gate() {
-        // 100,000 gas at Tempo's 20e9 attodollar base fee is exactly 0.002 pathUSD.
-        assert_eq!(
-            tempo_cost_in_path_usd(
-                U256::from(100_000u64),
-                U256::from(tempo::TEMPO_BASE_FEE_ATTO),
-            )
-            .unwrap(),
-            U256::from(2_000u64)
-        );
-        // The normal in-band 1.4x markup still applies, then the common $0.01 floor protects
-        // micro-transactions from consuming a relayer float for a dust reimbursement.
-        assert_eq!(
-            marked_tempo_cost(U256::from(2_000u64), 14_000).unwrap(),
-            U256::from(10_000u64)
-        );
-        assert_eq!(
-            marked_tempo_cost(U256::from(20_000u64), 14_000).unwrap(),
-            U256::from(28_000u64)
-        );
-    }
-
-    #[test]
     fn executor_item_error_is_sendable() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ExecutorItemError>();
-    }
-
-    #[test]
-    fn recovers_only_a_matching_unadmitted_queue_record() {
-        assert_eq!(admission_action(true, true), AdmissionAction::Execute);
-        assert_eq!(admission_action(false, true), AdmissionAction::Recover);
-        assert_eq!(admission_action(true, false), AdmissionAction::DeadLetter);
-        assert_eq!(admission_action(false, false), AdmissionAction::DeadLetter);
-    }
-
-    #[test]
-    fn alerts_only_for_executor_failures_not_expected_handoffs() {
-        assert!(should_notify_executor_deferred("execution"));
-        assert!(should_notify_executor_deferred("simulation"));
-        assert!(!should_notify_executor_deferred("lease"));
-        assert!(!should_notify_executor_deferred("funding"));
-        assert!(!should_notify_executor_deferred("simulation_deployment"));
     }
 }

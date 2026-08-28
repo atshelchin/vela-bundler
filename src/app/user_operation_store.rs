@@ -9,9 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    app::rpc::types::{
-        TransactionHash, UserOperation, UserOperationStatus, UserOperationStatusKind,
-    },
+    app::rpc::types::{UserOperationStatus, UserOperationStatusKind},
     utils::config::RedisConfig,
 };
 
@@ -30,29 +28,24 @@ const DELAYED_OPERATION_KEY_PREFIX: &str = "vela:relay:delayed-user-operation:";
 const DELAYED_OPERATION_CLAIM_KEY_PREFIX: &str = "vela:relay:delayed-user-operation-claim:";
 const EXECUTOR_ALERT_KEY_PREFIX: &str = "vela:relay:executor-alert:";
 const DELAYED_OPERATION_SCHEDULE_KEY: &str = "vela:relay:delayed-user-operation-schedule";
-const DELAYED_RETRY_BASE_MS: u64 = 5_000;
-const DELAYED_RETRY_MAX_MS: u64 = 5 * 60 * 1_000;
+// The retry backoff schedule lives in `vela_relay_core::hold`; the store only
+// forwards its precomputed lookup table to the scripts.
 
+// Whether a status transition is legal is decided by `vela_relay_core::lifecycle`
+// before this script runs. The script is a mechanical guarded merge: it only
+// verifies that the stored status still equals the status the decision was
+// computed against (ARGV[2]) so a concurrent writer forces a re-decision
+// instead of being silently overruled.
 const PATCH_RECORD_SCRIPT: &str = r#"
 local raw = redis.call('GET', KEYS[1])
 if not raw then
   return 0
 end
 local record = cjson.decode(raw)
-local patch = cjson.decode(ARGV[1])
-local current_status = record['status']
-local next_status = patch['status']
-local allowed = {
-  queued = {not_submitted = true, submitted = true, rejected = true, failed = true},
-  not_submitted = {submitted = true, rejected = true, failed = true},
-  submitted = {rejected = true, included = true, failed = true}
-}
-if next_status and next_status ~= current_status then
-  local transitions = allowed[current_status]
-  if not transitions or not transitions[next_status] then
-    return 0
-  end
+if record['status'] ~= ARGV[2] then
+  return -1
 end
+local patch = cjson.decode(ARGV[1])
 for key, value in pairs(patch) do
   record[key] = value
 end
@@ -60,39 +53,47 @@ redis.call('SET', KEYS[1], cjson.encode(record), 'KEEPTTL')
 return 1
 "#;
 
+/// Bounded retries for the optimistic status guard in [`PATCH_RECORD_SCRIPT`]
+/// and the bundle-submission apply script. Statuses only move forward through
+/// a finite lattice, so contention resolves in one or two rounds.
+const LIFECYCLE_GUARD_ATTEMPTS: usize = 4;
+
+// Which bundle members transition, index idempotently, or are skipped is
+// decided by `vela_relay_core::lifecycle::decide_bundle_submission` (including
+// the decimal-text chain comparison with its fail-closed legacy fallback).
+// This script mechanically applies those decisions, guarded per member on the
+// observed status (and, for idempotent re-indexing, the observed transaction
+// hash) so a concurrent writer forces a re-decision. Per member, three ARGV
+// entries follow the fixed pair: kind ('t' transition / 'i' index-only), the
+// observed status, and the member hash to index.
 const MARK_BUNDLE_SUBMITTED_SCRIPT: &str = r#"
-local indexed = 0
+local indexed = {}
 for index = 2, #KEYS do
+  local base = 3 * (index - 2) + 3
+  local kind = ARGV[base]
+  local observed_status = ARGV[base + 1]
+  local member_hash = ARGV[base + 2]
   local raw = redis.call('GET', KEYS[index])
   if raw then
     local record = cjson.decode(raw)
-    local stored_chain_id = record['chainIdText']
-    -- New records compare decimal strings so all uint64 chain IDs remain exact. The tostring
-    -- fallback only supports legacy records when Lua can render their JSON number canonically;
-    -- it deliberately fails closed for rounded/scientific values instead of aliasing chains.
-    local same_chain = stored_chain_id == ARGV[2]
-    if not stored_chain_id then
-      same_chain = tostring(record['chainId']) == ARGV[2]
-    end
-    local current_status = record['status']
-    local should_index = false
-    if same_chain and (current_status == 'queued' or current_status == 'not_submitted') then
+    local applied = false
+    if kind == 't' and record['status'] == observed_status then
       record['status'] = 'submitted'
       record['transactionHash'] = ARGV[1]
       record['admitted'] = true
       redis.call('SET', KEYS[index], cjson.encode(record), 'KEEPTTL')
-      should_index = true
-    elseif same_chain and current_status == 'submitted' and record['transactionHash'] == ARGV[1] then
-      should_index = true
+      applied = true
+    elseif kind == 'i' and record['status'] == observed_status and record['transactionHash'] == ARGV[1] then
+      applied = true
     end
-    if should_index then
-      redis.call('SADD', KEYS[1], ARGV[index + 1])
-      indexed = indexed + 1
+    if applied then
+      redis.call('SADD', KEYS[1], member_hash)
+      table.insert(indexed, member_hash)
     end
   end
 end
-if indexed > 0 then
-  redis.call('EXPIRE', KEYS[1], ARGV[#ARGV])
+if #indexed > 0 then
+  redis.call('EXPIRE', KEYS[1], ARGV[2])
 end
 return indexed
 "#;
@@ -189,6 +190,11 @@ end
 return redis.call('DEL', KEYS[1])
 "#;
 
+// The retry schedule is decided by `vela_relay_core::hold` and arrives as a
+// precomputed lookup table (ARGV[5] = table length, ARGV[6..] = delays for
+// attempts 1..N, attempts past the end reuse the last entry). The attempt
+// counter and the due-time clock stay server-side so writers and the claim
+// reader share one clock; no delay value is computed here.
 const SAVE_DELAYED_OPERATION_SCRIPT: &str = r#"
 local canonical = redis.call('GET', KEYS[1])
 local existing = redis.call('HGET', KEYS[2], 'payload')
@@ -205,13 +211,8 @@ if not existing then
 end
 
 local attempts = redis.call('HINCRBY', KEYS[2], 'attempts', 1)
-local delay = tonumber(ARGV[5])
-local maximum = tonumber(ARGV[6])
-local remaining = attempts
-while remaining > 1 and delay < maximum do
-  delay = math.min(delay * 2, maximum)
-  remaining = remaining - 1
-end
+local slots = tonumber(ARGV[5])
+local delay = tonumber(ARGV[5 + math.min(attempts, slots)])
 local redis_time = redis.call('TIME')
 local now = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
 local due = now + delay
@@ -271,23 +272,18 @@ if redis.call('EXISTS', KEYS[1]) == 0 then
 end
 
 local canonical = redis.call('GET', KEYS[4])
-if canonical and canonical ~= ARGV[6] then
+if canonical and canonical ~= ARGV[4] then
   return -2
 end
 if not canonical then
-  redis.call('SET', KEYS[4], ARGV[6], 'PX', ARGV[3])
+  redis.call('SET', KEYS[4], ARGV[4], 'PX', ARGV[3])
 else
   redis.call('PEXPIRE', KEYS[4], ARGV[3])
 end
 
 local attempts = redis.call('HINCRBY', KEYS[1], 'attempts', 1)
-local delay = tonumber(ARGV[4])
-local maximum = tonumber(ARGV[5])
-local remaining = attempts
-while remaining > 1 and delay < maximum do
-  delay = math.min(delay * 2, maximum)
-  remaining = remaining - 1
-end
+local slots = tonumber(ARGV[5])
+local delay = tonumber(ARGV[5 + math.min(attempts, slots)])
 local redis_time = redis.call('TIME')
 local now = redis_time[1] * 1000 + math.floor(redis_time[2] / 1000)
 local due = now + delay
@@ -299,69 +295,34 @@ redis.call('DEL', KEYS[3])
 return attempts
 "#;
 
-/// Redis-backed lifecycle state for an accepted UserOperation.
-///
-/// `admitted` is an internal two-phase marker: a `queued` record is created before the Iggy
-/// append, then marked admitted only after Iggy acknowledges it. It is never exposed via RPC.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct StoredUserOperation {
-    pub status: UserOperationStatusKind,
-    pub transaction_hash: Option<TransactionHash>,
-    pub chain_id: u64,
-    /// Decimal text used by Redis Lua because cjson numbers cannot represent every u64 exactly.
-    #[serde(default)]
-    pub chain_id_text: String,
-    pub entry_point: String,
-    pub user_operation: UserOperation,
-    pub admitted: bool,
-    #[serde(default)]
-    pub next_receipt_check_at_ms: u64,
-    pub block_hash: Option<String>,
-    pub block_number: Option<String>,
-    pub receipt: Option<Value>,
-    pub event: Option<UserOperationEvent>,
-    /// The last executor diagnostic. It explains either a pending retry or a terminal local
-    /// rejection (for example an insufficient in-band reimbursement).
-    #[serde(default)]
-    pub last_executor_stage: Option<String>,
-    #[serde(default)]
-    pub last_executor_error: Option<String>,
-    #[serde(default)]
-    pub last_executor_attempt_at_ms: Option<u64>,
-}
+pub use vela_relay_core::task::StoredUserOperation;
 
-impl StoredUserOperation {
-    pub fn rpc_status(&self) -> UserOperationStatus {
-        let exposes_executor_diagnostic = matches!(
-            self.status,
-            UserOperationStatusKind::Queued
-                | UserOperationStatusKind::NotSubmitted
-                | UserOperationStatusKind::Rejected
-        );
-        UserOperationStatus {
-            status: self.status,
-            transaction_hash: self.transaction_hash.clone(),
-            last_executor_stage: exposes_executor_diagnostic
-                .then(|| self.last_executor_stage.clone())
-                .flatten(),
-            last_executor_error: exposes_executor_diagnostic
-                .then(|| self.last_executor_error.clone())
-                .flatten(),
-            last_executor_attempt_at_ms: exposes_executor_diagnostic
-                .then_some(self.last_executor_attempt_at_ms)
-                .flatten(),
-        }
+/// The RPC-facing status view of a stored record. (Formerly
+/// `StoredUserOperation::rpc_status`; the record type now lives in the core
+/// and the response shape is transport vocabulary that stays here.)
+pub fn rpc_status(record: &StoredUserOperation) -> UserOperationStatus {
+    let exposes_executor_diagnostic = matches!(
+        record.status,
+        UserOperationStatusKind::Queued
+            | UserOperationStatusKind::NotSubmitted
+            | UserOperationStatusKind::Rejected
+    );
+    UserOperationStatus {
+        status: record.status,
+        transaction_hash: record.transaction_hash.clone(),
+        last_executor_stage: exposes_executor_diagnostic
+            .then(|| record.last_executor_stage.clone())
+            .flatten(),
+        last_executor_error: exposes_executor_diagnostic
+            .then(|| record.last_executor_error.clone())
+            .flatten(),
+        last_executor_attempt_at_ms: exposes_executor_diagnostic
+            .then_some(record.last_executor_attempt_at_ms)
+            .flatten(),
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct QueuedUserOperation {
-    pub user_operation_hash: String,
-    pub chain_id: u64,
-    pub entry_point: String,
-    pub user_operation: UserOperation,
-}
+pub use vela_relay_core::task::QueuedUserOperation;
 
 /// Lossless immutable copy of a routed Iggy message that was deferred for a future account nonce.
 ///
@@ -388,44 +349,11 @@ pub struct ClaimedDelayedUserOperation {
     pub operation: DelayedUserOperation,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserOperationEvent {
-    pub user_operation_hash: String,
-    pub success: bool,
-    pub actual_gas_cost: String,
-    pub actual_gas_used: String,
-}
+pub use vela_relay_core::task::UserOperationEvent;
 
-/// A fully signed outer transaction persisted before its first broadcast.
-///
-/// One intent may exist for a `(chain_id, lane)` pair. If a worker dies after broadcasting but
-/// before updating UserOperation status, its successor loads and rebroadcasts this exact byte
-/// sequence instead of allocating another nonce.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreparedBundleIntent {
-    pub chain_id: u64,
-    pub lane: u8,
-    pub entry_point: String,
-    pub raw_transaction: String,
-    pub transaction_hash: String,
-    pub nonce: u64,
-    pub user_operation_hashes: Vec<String>,
-}
+pub use vela_relay_core::task::PreparedBundleIntent;
 
-/// A signed treasury transfer persisted before broadcast. Only one funding transaction may be
-/// outstanding per chain, which serializes the treasury nonce across all relayer lanes.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PreparedFundingIntent {
-    pub chain_id: u64,
-    pub relayer: String,
-    pub amount_wei: u128,
-    pub raw_transaction: String,
-    pub transaction_hash: String,
-    pub nonce: u64,
-}
+pub use vela_relay_core::task::PreparedFundingIntent;
 
 /// A signed canonical-CREATE2 deployment persisted before broadcast. One deployment intent is
 /// allowed per chain because it shares the treasury nonce with relayer top-ups.
@@ -589,26 +517,90 @@ impl UserOperationStatusStore {
             return Ok(0);
         }
 
-        let unique_hashes = user_operation_hashes
+        let mut remaining: Vec<&str> = user_operation_hashes
             .iter()
             .map(String::as_str)
-            .collect::<BTreeSet<_>>();
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let mut indexed_total = 0usize;
 
-        let mut command = redis::cmd("EVAL");
-        command
-            .arg(MARK_BUNDLE_SUBMITTED_SCRIPT)
-            .arg(unique_hashes.len() + 1)
-            .arg(bundle_key(chain_id, transaction_hash));
-        for hash in &unique_hashes {
-            command.arg(status_key(hash));
+        for _ in 0..LIFECYCLE_GUARD_ATTEMPTS {
+            if remaining.is_empty() {
+                break;
+            }
+            let mut read = redis::cmd("MGET");
+            for hash in &remaining {
+                read.arg(status_key(hash));
+            }
+            let raws: Vec<Option<String>> = self.query(read).await?;
+
+            // (hash, kind, observed status) for every member the core decided
+            // to touch; skips are final for this call, exactly as before.
+            let mut planned: Vec<(&str, char, String)> = Vec::new();
+            for (hash, raw) in remaining.iter().zip(&raws) {
+                let Some(raw) = raw else { continue };
+                let record: Value = serde_json::from_str(raw).map_err(|_| {
+                    UserOperationStatusStoreError("could not parse stored UserOperation record")
+                })?;
+                let Some((observed_wire, status)) = parse_stored_status(&record) else {
+                    continue;
+                };
+                let record_transaction_hash = record.get("transactionHash").and_then(Value::as_str);
+                let record_chain_id = record.get("chainId").and_then(Value::as_u64).unwrap_or(0);
+                let record_chain_id_text = record
+                    .get("chainIdText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                match vela_relay_core::lifecycle::decide_bundle_submission(
+                    status,
+                    record_transaction_hash,
+                    record_chain_id,
+                    record_chain_id_text,
+                    chain_id,
+                    transaction_hash,
+                ) {
+                    vela_relay_core::lifecycle::BundleSubmissionDecision::Transition => {
+                        planned.push((hash, 't', observed_wire));
+                    }
+                    vela_relay_core::lifecycle::BundleSubmissionDecision::IndexOnly => {
+                        planned.push((hash, 'i', observed_wire));
+                    }
+                    vela_relay_core::lifecycle::BundleSubmissionDecision::Skip => {}
+                }
+            }
+            if planned.is_empty() {
+                break;
+            }
+
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(MARK_BUNDLE_SUBMITTED_SCRIPT)
+                .arg(planned.len() + 1)
+                .arg(bundle_key(chain_id, transaction_hash));
+            for (hash, _, _) in &planned {
+                command.arg(status_key(hash));
+            }
+            command.arg(transaction_hash).arg(USER_OPERATION_TTL_SECS);
+            for (hash, kind, observed) in &planned {
+                command.arg(kind.to_string()).arg(observed).arg(*hash);
+            }
+            let applied: Vec<String> = self.query(command).await?;
+            indexed_total += applied.len();
+            if applied.len() == planned.len() {
+                break;
+            }
+
+            // A guard failed because the record moved between read and apply:
+            // re-read and re-decide just those members.
+            let applied: HashSet<String> = applied.into_iter().collect();
+            remaining = planned
+                .into_iter()
+                .filter(|(hash, _, _)| !applied.contains(*hash))
+                .map(|(hash, _, _)| hash)
+                .collect();
         }
-        command.arg(transaction_hash).arg(chain_id);
-        for hash in &unique_hashes {
-            command.arg(hash);
-        }
-        command.arg(USER_OPERATION_TTL_SECS);
-        let updated: i64 = self.query(command).await?;
-        Ok(updated as usize)
+        Ok(indexed_total)
     }
 
     /// A reverted handleOps transaction fails every UserOperation in its bundle.
@@ -774,9 +766,8 @@ impl UserOperationStatusStore {
             .arg(canonical_payload)
             .arg(payload)
             .arg(&identifier)
-            .arg(duration_millis(ttl)?)
-            .arg(DELAYED_RETRY_BASE_MS)
-            .arg(DELAYED_RETRY_MAX_MS);
+            .arg(duration_millis(ttl)?);
+        append_retry_schedule(&mut command);
         let attempts: i64 = self.query(command).await?;
         if attempts < 0 {
             return Err(UserOperationStatusStoreError(
@@ -865,9 +856,8 @@ impl UserOperationStatusStore {
             .arg(token)
             .arg(&identifier)
             .arg(duration_millis(ttl)?)
-            .arg(DELAYED_RETRY_BASE_MS)
-            .arg(DELAYED_RETRY_MAX_MS)
             .arg(canonical_payload);
+        append_retry_schedule(&mut command);
         let retried: i64 = self.query(command).await?;
         if retried == -2 {
             return Err(UserOperationStatusStoreError(
@@ -1254,17 +1244,62 @@ impl UserOperationStatusStore {
         user_operation_hash: &str,
         patch: Value,
     ) -> Result<bool, UserOperationStatusStoreError> {
+        let requested = match patch.get("status") {
+            None => None,
+            Some(value) => Some(
+                serde_json::from_value::<UserOperationStatusKind>(value.clone())
+                    .map_err(|_| UserOperationStatusStoreError("could not parse patch status"))?,
+            ),
+        };
         let patch = serde_json::to_string(&patch).map_err(|_| {
             UserOperationStatusStoreError("could not serialize UserOperation status")
         })?;
-        let mut command = redis::cmd("EVAL");
-        command
-            .arg(PATCH_RECORD_SCRIPT)
-            .arg(1)
-            .arg(status_key(user_operation_hash))
-            .arg(patch);
-        let updated: i64 = self.query(command).await?;
-        Ok(updated == 1)
+
+        for _ in 0..LIFECYCLE_GUARD_ATTEMPTS {
+            let mut read = redis::cmd("GET");
+            read.arg(status_key(user_operation_hash));
+            let raw: Option<String> = self.query(read).await?;
+            let Some(raw) = raw else {
+                return Ok(false);
+            };
+            let record: Value = serde_json::from_str(&raw).map_err(|_| {
+                UserOperationStatusStoreError("could not parse stored UserOperation record")
+            })?;
+            let Some((current_wire, current)) = parse_stored_status(&record) else {
+                // Every record writer stamps a status; a record we cannot judge
+                // refuses status changes (as the old table lookup did) and
+                // errors instead of merging blindly.
+                return match requested {
+                    Some(_) => Ok(false),
+                    None => Err(UserOperationStatusStoreError(
+                        "could not parse stored UserOperation status",
+                    )),
+                };
+            };
+            match vela_relay_core::lifecycle::decide_patch(current, requested) {
+                vela_relay_core::lifecycle::PatchDecision::RefuseIllegalTransition => {
+                    return Ok(false);
+                }
+                vela_relay_core::lifecycle::PatchDecision::Apply => {}
+            }
+
+            let mut command = redis::cmd("EVAL");
+            command
+                .arg(PATCH_RECORD_SCRIPT)
+                .arg(1)
+                .arg(status_key(user_operation_hash))
+                .arg(&patch)
+                .arg(current_wire);
+            let updated: i64 = self.query(command).await?;
+            match updated {
+                1 => return Ok(true),
+                0 => return Ok(false),
+                _ => {} // concurrent status change: re-read and re-decide
+            }
+        }
+        Err(UserOperationStatusStoreError(
+            "UserOperation status kept changing while patching",
+        ))
     }
 
     async fn query<T: FromRedisValue>(
@@ -1626,17 +1661,23 @@ fn partition_bundle_events<'a>(
     (included, outside)
 }
 
-#[cfg(test)]
-fn transition_is_allowed(current: UserOperationStatusKind, next: UserOperationStatusKind) -> bool {
-    use UserOperationStatusKind::{Failed, Included, NotSubmitted, Queued, Rejected, Submitted};
+/// Appends the delayed-inbox retry schedule (length, then the delay for each
+/// attempt) to a script invocation. The values come from the decision core.
+fn append_retry_schedule(command: &mut redis::Cmd) {
+    let schedule = vela_relay_core::hold::retry_delay_schedule_ms();
+    command.arg(schedule.len());
+    for delay in schedule {
+        command.arg(delay);
+    }
+}
 
-    current == next
-        || matches!(
-            (current, next),
-            (Queued, NotSubmitted | Submitted | Rejected | Failed)
-                | (NotSubmitted, Submitted | Rejected | Failed)
-                | (Submitted, Included | Rejected | Failed)
-        )
+/// Extracts a record's status as both its exact stored wire string (used as
+/// the optimistic-concurrency guard) and the parsed vocabulary value (used by
+/// the `vela_relay_core::lifecycle` decisions).
+fn parse_stored_status(record: &Value) -> Option<(String, UserOperationStatusKind)> {
+    let wire = record.get("status")?.as_str()?.to_owned();
+    let kind = serde_json::from_value(Value::String(wire.clone())).ok()?;
+    Some((wire, kind))
 }
 
 #[cfg(test)]
@@ -1657,61 +1698,32 @@ mod tests {
         UserOperationEvent, UserOperationStatusKind, canonical_delayed_payload,
         delayed_operation_identifier, deserialize_claimed_delayed_operations,
         deserialize_prepared_bundle_intents, deserialize_stored_operations, duration_millis,
-        lease_key, malformed_dead_letter, malformed_dead_letter_key, partition_bundle_events,
-        prepared_bundle_key, prepared_funding_key, prepared_simulation_deployment_key,
-        transition_is_allowed, truncate_diagnostic, validate_lease_identity,
+        lease_key, malformed_dead_letter, malformed_dead_letter_key, parse_stored_status,
+        partition_bundle_events, prepared_bundle_key, prepared_funding_key,
+        prepared_simulation_deployment_key, truncate_diagnostic, validate_lease_identity,
         validate_prepared_bundle_intent, validate_prepared_funding_intent,
         validate_prepared_simulation_deployment_intent,
     };
 
+    // The transition table itself is pinned in `vela_relay_core::lifecycle`; the
+    // scripts here must stay mechanical — guards on observed state, no policy.
     #[test]
-    fn status_transition_matrix_is_monotonic() {
-        use UserOperationStatusKind::{
-            Failed, Included, NotFound, NotSubmitted, Queued, Rejected, Submitted,
-        };
-
-        assert!(transition_is_allowed(Queued, NotSubmitted));
-        assert!(transition_is_allowed(Queued, Submitted));
-        assert!(transition_is_allowed(Queued, Rejected));
-        assert!(transition_is_allowed(Queued, Failed));
-        assert!(transition_is_allowed(NotSubmitted, Submitted));
-        assert!(transition_is_allowed(NotSubmitted, Rejected));
-        assert!(transition_is_allowed(NotSubmitted, Failed));
-        assert!(transition_is_allowed(Submitted, Included));
-        assert!(transition_is_allowed(Submitted, Rejected));
-        assert!(transition_is_allowed(Submitted, Failed));
-
-        for terminal in [Rejected, Included, Failed] {
-            for next in [
-                NotFound,
-                Queued,
-                NotSubmitted,
-                Submitted,
-                Rejected,
-                Included,
-                Failed,
-            ] {
-                assert_eq!(
-                    transition_is_allowed(terminal, next),
-                    terminal == next,
-                    "terminal {terminal:?} must not transition to {next:?}"
-                );
-            }
-        }
-        assert!(!transition_is_allowed(Submitted, Queued));
-        assert!(!transition_is_allowed(NotSubmitted, Queued));
-        assert!(!transition_is_allowed(Queued, Included));
+    fn patch_lua_is_a_mechanical_guarded_merge() {
+        assert!(PATCH_RECORD_SCRIPT.contains("record['status'] ~= ARGV[2]"));
+        assert!(PATCH_RECORD_SCRIPT.contains("return -1"));
+        assert!(PATCH_RECORD_SCRIPT.contains("KEEPTTL"));
+        assert!(!PATCH_RECORD_SCRIPT.contains("allowed"));
+        assert!(!PATCH_RECORD_SCRIPT.contains("queued"));
+        assert!(!PATCH_RECORD_SCRIPT.contains("not_submitted"));
     }
 
     #[test]
-    fn patch_lua_has_the_same_terminal_guards() {
-        assert!(PATCH_RECORD_SCRIPT.contains("next_status ~= current_status"));
-        assert!(PATCH_RECORD_SCRIPT.contains("queued = {not_submitted = true"));
-        assert!(PATCH_RECORD_SCRIPT.contains("not_submitted = {submitted = true"));
-        assert!(PATCH_RECORD_SCRIPT.contains("submitted = {rejected = true, included = true"));
-        assert!(!PATCH_RECORD_SCRIPT.contains("included = {"));
-        assert!(!PATCH_RECORD_SCRIPT.contains("rejected = {"));
-        assert!(!PATCH_RECORD_SCRIPT.contains("failed = {"));
+    fn stored_status_parses_wire_names_and_refuses_garbage() {
+        let (wire, kind) = parse_stored_status(&json!({ "status": "not_submitted" })).unwrap();
+        assert_eq!(wire, "not_submitted");
+        assert_eq!(kind, UserOperationStatusKind::NotSubmitted);
+        assert!(parse_stored_status(&json!({ "status": "shipped" })).is_none());
+        assert!(parse_stored_status(&json!({})).is_none());
     }
 
     #[test]
@@ -1721,16 +1733,18 @@ mod tests {
         assert_eq!(truncate_diagnostic("你好世界", 7), "你...");
     }
 
+    // Eligibility (status, chain comparison, idempotent same-transaction
+    // re-indexing) is decided by `vela_relay_core::lifecycle`; the script only
+    // applies decisions guarded on the observed state.
     #[test]
-    fn submitted_lua_indexes_only_new_or_idempotent_same_transaction_members() {
-        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("current_status == 'queued'"));
-        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("current_status == 'not_submitted'"));
-        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("current_status == 'submitted'"));
+    fn submitted_lua_applies_core_decisions_behind_observed_state_guards() {
+        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("record['status'] == observed_status"));
         assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("record['transactionHash'] == ARGV[1]"));
-        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("same_chain"));
-        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("record['chainIdText']"));
-        assert!(!MARK_BUNDLE_SUBMITTED_SCRIPT.contains("tonumber(record['chainId'])"));
-        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("if should_index then"));
+        assert!(MARK_BUNDLE_SUBMITTED_SCRIPT.contains("KEEPTTL"));
+        assert!(!MARK_BUNDLE_SUBMITTED_SCRIPT.contains("same_chain"));
+        assert!(!MARK_BUNDLE_SUBMITTED_SCRIPT.contains("chainIdText"));
+        assert!(!MARK_BUNDLE_SUBMITTED_SCRIPT.contains("'queued'"));
+        assert!(!MARK_BUNDLE_SUBMITTED_SCRIPT.contains("'not_submitted'"));
     }
 
     #[test]
@@ -1976,7 +1990,16 @@ mod tests {
             assert!(script.contains("redis.call('GET', KEYS[3]) ~= ARGV[1]"));
         }
         assert!(RETRY_DELAYED_OPERATION_SCRIPT.contains("redis.call('PEXPIRE', KEYS[4], ARGV[3])"));
-        assert!(RETRY_DELAYED_OPERATION_SCRIPT.contains("canonical ~= ARGV[6]"));
+        assert!(RETRY_DELAYED_OPERATION_SCRIPT.contains("canonical ~= ARGV[4]"));
+        // The backoff schedule is decided in `vela_relay_core::hold`; scripts
+        // must only look the delay up, never compute it.
+        for script in [
+            SAVE_DELAYED_OPERATION_SCRIPT,
+            RETRY_DELAYED_OPERATION_SCRIPT,
+        ] {
+            assert!(script.contains("math.min(attempts, slots)"));
+            assert!(!script.contains("delay * 2"));
+        }
         assert_eq!(
             DELAYED_OPERATION_SCHEDULE_KEY,
             "vela:relay:delayed-user-operation-schedule"

@@ -8,12 +8,12 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub type Address = String;
 pub type BlockHash = String;
-pub type HexData = String;
-pub type Quantity = String;
-pub type TransactionHash = String;
 pub type UserOperationHash = String;
+
+/// Wire vocabulary owned by the decision core; re-exported under the shell's
+/// historical paths.
+pub use vela_relay_core::task::{Address, HexData, Quantity, TransactionHash};
 
 #[derive(Debug, Deserialize)]
 pub struct RpcRequest {
@@ -313,53 +313,7 @@ pub struct InBandGasQuoteRequest {
     pub safe_address: Address,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum UserOperation {
-    V0_7(Box<UserOperationV0_7>),
-    V0_6(Box<UserOperationV0_6>),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UserOperationV0_7 {
-    pub sender: Address,
-    pub nonce: Quantity,
-    pub factory: Option<Address>,
-    pub factory_data: Option<HexData>,
-    pub call_data: HexData,
-    pub call_gas_limit: Quantity,
-    pub verification_gas_limit: Quantity,
-    pub pre_verification_gas: Quantity,
-    pub max_fee_per_gas: Quantity,
-    pub max_priority_fee_per_gas: Quantity,
-    pub paymaster: Option<Address>,
-    pub paymaster_verification_gas_limit: Option<Quantity>,
-    pub paymaster_post_op_gas_limit: Option<Quantity>,
-    pub paymaster_data: Option<HexData>,
-    pub signature: HexData,
-    pub eip7702_auth: Option<Eip7702Authorization>,
-    /// Tempo extension: the token used by the outer `0x76` transaction. It is deliberately
-    /// outside ERC-4337's packed hash, but must survive queue persistence verbatim.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fee_token: Option<Address>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct UserOperationV0_6 {
-    pub sender: Address,
-    pub nonce: Quantity,
-    pub init_code: HexData,
-    pub call_data: HexData,
-    pub call_gas_limit: Quantity,
-    pub verification_gas_limit: Quantity,
-    pub pre_verification_gas: Quantity,
-    pub max_fee_per_gas: Quantity,
-    pub max_priority_fee_per_gas: Quantity,
-    pub paymaster_and_data: HexData,
-    pub signature: HexData,
-}
+pub use vela_relay_core::task::UserOperation;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
@@ -408,16 +362,7 @@ pub struct EstimatableUserOperationV0_6 {
     pub signature: Option<HexData>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Eip7702Authorization {
-    pub chain_id: Quantity,
-    pub address: Address,
-    pub nonce: Quantity,
-    pub y_parity: Quantity,
-    pub r: Quantity,
-    pub s: Quantity,
-}
+pub use vela_relay_core::task::Eip7702Authorization;
 
 pub type StateOverrideSet = BTreeMap<Address, StateOverride>;
 
@@ -535,17 +480,9 @@ pub struct GasPriceTier {
     pub max_priority_fee_per_gas: Quantity,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UserOperationStatusKind {
-    NotFound,
-    Queued,
-    NotSubmitted,
-    Submitted,
-    Rejected,
-    Included,
-    Failed,
-}
+/// The status vocabulary is owned by the decision core; the shell re-exports
+/// it under its historical name so wire shapes and call sites are unchanged.
+pub use vela_relay_core::task::UserOperationStatus as UserOperationStatusKind;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserOperationStatus {

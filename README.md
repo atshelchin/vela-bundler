@@ -11,6 +11,32 @@ oracle configuration is required. Tempo is the exception by design:
 it has no native gas coin, so Relay uses pathUSD directly and does not query either the chain
 directory or Binance for Tempo quotes.
 
+## Architecture
+
+The repository is a two-crate workspace with a strict core/shell split
+(mirroring the discipline of `p256-index`):
+
+- **`vela-relay-core`** owns every business decision and is deliberately
+  I/O-free — no Redis, no Iggy, no HTTP clients, no runtime, no clocks.
+  Modules are business domains: `admission` (the two-phase
+  `eth_sendUserOperation` program), `execution` (the per-lane batch program),
+  `lifecycle` (the single authoritative status transition table), `settlement`
+  (reimbursement parsing, evaluation, and the accept/reprice verdict), `hold`
+  (the delayed-inbox ladder and budget), `broadcast`, `funding`, `gas_math`,
+  `abi`, `signing`, `vault`, `tempo`, and the shared `task` vocabulary.
+  `cargo test -p vela-relay-core` runs the whole decision suite in well under
+  a second with no infrastructure.
+- **`vela-relay`** (this crate) is the shell: Axum transport, Redis storage
+  (Lua reduced to mechanical guarded writes), Iggy queueing, EVM RPC, key
+  custody, Binance, and Telegram. HTTP admission and the lane executor both
+  drive one crux `Core` per unit of work — the shell executes the requested
+  operations and reports what happened back as data; failures fold into
+  result variants and the core decides what they mean.
+
+The refactor is governed by the Spec Kit artifacts in
+`specs/001-crux-core-split/` (spec, plan, tasks, per-story equivalence notes)
+and the project constitution in `.specify/memory/constitution.md`.
+
 ## Requirements
 
 - Remote Iggy instance reachable from the Relay process.

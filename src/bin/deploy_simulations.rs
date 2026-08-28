@@ -20,9 +20,7 @@ use alloy::{
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-#[allow(dead_code)]
-#[path = "../utils/vault.rs"]
-mod vault;
+use vela_relay_core::vault;
 
 const MONAD_CHAIN_ID: u64 = 143;
 const MONAD_RPC_URL: &str = "https://rpc.monad.xyz";

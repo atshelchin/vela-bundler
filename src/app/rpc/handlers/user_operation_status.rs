@@ -16,7 +16,7 @@ pub async fn get_status(
 ) -> RpcResponse<Value> {
     let GetUserOperationStatusParams([user_operation_hash]) = params;
     match load_from_redis(state, &user_operation_hash).await {
-        Ok(Some(operation)) => result(id, operation.rpc_status()),
+        Ok(Some(operation)) => result(id, crate::app::user_operation_store::rpc_status(&operation)),
         Ok(None) => result(
             id,
             UserOperationStatus {
@@ -146,8 +146,10 @@ mod tests {
     use serde_json::json;
 
     use super::receipt_response;
-    use crate::app::rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7};
-    use crate::app::{StoredUserOperation, UserOperationEvent};
+    use crate::app::StoredUserOperation;
+    use crate::app::rpc::types::{UserOperation, UserOperationStatusKind};
+    use vela_relay_core::task::UserOperationEvent;
+    use vela_relay_core::task::UserOperationV0_7;
 
     fn stored_operation(
         status: UserOperationStatusKind,
@@ -218,7 +220,7 @@ mod tests {
         );
         operation.last_executor_attempt_at_ms = Some(1_753_000_000_000);
 
-        let status = operation.rpc_status();
+        let status = crate::app::user_operation_store::rpc_status(&operation);
         assert_eq!(
             status.last_executor_stage.as_deref(),
             Some("in_band_settlement")
