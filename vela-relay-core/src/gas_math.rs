@@ -7,6 +7,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
+use alloy::primitives::U256;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -116,6 +117,21 @@ pub fn scale_price(price: GasPrice, multiplier: u128) -> Result<GasPrice, GasPri
         max_fee_per_gas,
         max_priority_fee_per_gas,
     })
+}
+
+/// The executor's quoted outer-fee cap: `2 × base fee + tip`. The multiple
+/// buys inclusion headroom, not cost — the chain only ever charges
+/// `base fee + tip`. `None` on overflow.
+pub fn quoted_outer_fee(base_fee_per_gas: u128, max_priority_fee_per_gas: u128) -> Option<u128> {
+    base_fee_per_gas
+        .checked_mul(2)?
+        .checked_add(max_priority_fee_per_gas)
+}
+
+/// The legacy-endpoint tip fallback: `eth_gasPrice − base fee`. `None` when
+/// the gas price is below the base fee (a node inconsistency worth refusing).
+pub fn tip_from_legacy_gas_price(gas_price: U256, base_fee: U256) -> Option<U256> {
+    gas_price.checked_sub(base_fee)
 }
 
 /// The fallback tip when neither fee-history rewards nor
@@ -235,6 +251,22 @@ mod tests {
         .unwrap();
 
         assert_eq!(median_priority_fee(&rewards), Some(6));
+    }
+
+    #[test]
+    fn quotes_double_base_plus_tip_with_overflow_checks() {
+        use super::{quoted_outer_fee, tip_from_legacy_gas_price};
+        use alloy::primitives::U256;
+        assert_eq!(quoted_outer_fee(100, 7), Some(207));
+        assert_eq!(quoted_outer_fee(u128::MAX, 0), None);
+        assert_eq!(
+            tip_from_legacy_gas_price(U256::from(150u64), U256::from(100u64)),
+            Some(U256::from(50u64))
+        );
+        assert_eq!(
+            tip_from_legacy_gas_price(U256::from(90u64), U256::from(100u64)),
+            None
+        );
     }
 
     #[test]

@@ -175,9 +175,11 @@ pub enum ExecutionOperation {
         reason: String,
     },
     /// Park item `index` in the durable delayed inbox (post-increment attempt
-    /// count comes back; the hold budget is judged here).
+    /// count comes back). `cause` carries the business context for the
+    /// shell's diagnostics.
     DeferOperation {
         index: usize,
+        cause: DeferCause,
     },
     // --- diagnostics (best-effort writes; Telegram policy decided here) ---
     RecordDeferred {
@@ -204,10 +206,11 @@ pub enum ExecutionOperation {
         entry_point: Address,
         operations: Vec<(B256, PackedOperation)>,
     },
-    /// Composite: batch getNonce probe + defer/reject per mismatch (T034).
-    ResolveNonceMismatches {
+    /// Batch `EntryPoint.getNonce` probe for AA25 mismatches; one `Option`
+    /// per probe (`None` = undecodable response).
+    FetchAccountNonces {
         entry_point: Address,
-        items: Vec<NonceMismatchItem>,
+        probes: Vec<(Address, U256)>,
     },
     SimulateBundle {
         entry_point: Address,
@@ -233,10 +236,36 @@ pub enum ExecutionOperation {
     SavePreparedBundle {
         intent: PreparedBundleIntent,
     },
-    /// Composite: recently-confirmed cache, broadcast, observability probes
-    /// (its judgement already lives in `crate::broadcast`; T034 sequences it).
-    BroadcastBundle {
+    // --- broadcast (sequenced here; judgement in `crate::broadcast`) ---
+    CheckBroadcastSeen {
+        transaction_hash: String,
+    },
+    BroadcastRaw {
+        raw_transaction: Vec<u8>,
+        transaction_hash: String,
+    },
+    RememberBroadcast {
+        transaction_hash: String,
+    },
+    ForgetBroadcast {
+        transaction_hash: String,
+    },
+    ProbeTransactionKnown {
+        transaction_hash: String,
+    },
+    ProbeStaleNonce {
         intent: PreparedBundleIntent,
+    },
+    ClearStaleIntent {
+        intent: PreparedBundleIntent,
+        reason: String,
+    },
+    /// An unproven broadcast is being retained for retry; the shell records
+    /// the appropriate diagnostic.
+    RecordUnprovenBroadcast {
+        transaction_hash: String,
+        ambiguous: bool,
+        reason: String,
     },
     MarkBundleSubmitted {
         intent: PreparedBundleIntent,
@@ -255,16 +284,37 @@ pub enum ExecutionOperation {
 /// operation so the shell can emit its historical diagnostics.
 #[derive(Debug, PartialEq)]
 pub enum RejectionCause {
-    InvalidQueuedPayload { reason: &'static str },
-    SimulationRejected { reason: String },
+    InvalidQueuedPayload {
+        reason: &'static str,
+    },
+    SimulationRejected {
+        reason: String,
+    },
+    /// The account nonce has already been consumed on-chain.
+    StaleNonce {
+        user_nonce: U256,
+        onchain_nonce: U256,
+    },
 }
 
+/// Why an item is entering the durable delayed inbox.
 #[derive(Debug, PartialEq)]
-pub struct NonceMismatchItem {
-    pub index: usize,
-    pub hash: String,
-    pub sender: Address,
-    pub nonce: U256,
+pub enum DeferCause {
+    /// Waiting for the market to fit the signed reimbursement (US2 hold).
+    AffordableMarketHold,
+    /// A keyed nonce ahead of the account's on-chain nonce.
+    FutureNonce {
+        user_nonce: U256,
+        onchain_nonce: U256,
+    },
+}
+
+/// Mirror of the node's raw-broadcast reply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BroadcastReply {
+    Accepted { transaction_hash: String },
+    Ambiguous { reason: String },
+    Rejected { reason: String },
 }
 
 #[derive(Debug)]
@@ -313,8 +363,8 @@ pub enum ExecutionOutcome {
     OperationVerdicts {
         verdicts: Vec<OperationSimVerdict>,
     },
-    MismatchResolutions {
-        resolutions: Vec<(usize, ItemResolution)>,
+    AccountNonces {
+        nonces: Vec<Option<U256>>,
     },
     BundleVerdict {
         verdict: BundleSimVerdict,
@@ -334,8 +384,17 @@ pub enum ExecutionOutcome {
     Saved {
         saved: bool,
     },
-    Broadcast {
-        confirmed: bool,
+    Seen {
+        seen: bool,
+    },
+    Sent {
+        reply: BroadcastReply,
+    },
+    Known {
+        known: bool,
+    },
+    Stale {
+        stale: bool,
     },
     Indexed {
         indexed: usize,
@@ -983,38 +1042,7 @@ async fn execute_with_lane_lease(
         }
     }
     if !nonce_mismatches.is_empty() {
-        let items = nonce_mismatches
-            .iter()
-            .map(|candidate| NonceMismatchItem {
-                index: candidate.result_index,
-                hash: candidate.hash_string.clone(),
-                sender: candidate.packed.sender,
-                nonce: candidate.packed.packed.nonce,
-            })
-            .collect();
-        match request(
-            ctx,
-            ExecutionOperation::ResolveNonceMismatches { entry_point, items },
-        )
-        .await
-        {
-            ExecutionOutcome::MismatchResolutions { resolutions } => {
-                for (index, resolution) in resolutions {
-                    match resolution {
-                        ItemResolution::Durable => results.durable(index),
-                        ItemResolution::Failed { reason } => results.failed(index, reason),
-                    }
-                }
-            }
-            _ => {
-                for candidate in &nonce_mismatches {
-                    results.failed(
-                        candidate.result_index,
-                        "account nonce lookup is temporarily unavailable",
-                    );
-                }
-            }
-        }
+        resolve_nonce_mismatches(ctx, entry_point, &nonce_mismatches, results).await;
     }
     if survivors.is_empty() {
         return Ok(());
@@ -1119,11 +1147,16 @@ async fn execute_with_lane_lease(
         .map(|candidate| candidate.packed.call_data.as_ref())
         .collect::<Vec<&[u8]>>();
     let treasury = start_treasury(start);
+    let chain_id = start.operations[0].chain_id;
     let native_usd_price = if has_stablecoin_payment(treasury, &chain_assets.assets, &call_datas) {
-        match request(ctx, ExecutionOperation::FetchMarketPrice).await {
-            ExecutionOutcome::Price { price } => Some(price),
-            ExecutionOutcome::Failed { message } => return Err(message),
-            _ => return Err("unexpected shell response".to_owned()),
+        // xDAI is USD-pegged: Gnosis settlement never consults the market.
+        match crate::settlement::pegged_native_usd_price(chain_id) {
+            Some(price) => Some(price),
+            None => match request(ctx, ExecutionOperation::FetchMarketPrice).await {
+                ExecutionOutcome::Price { price } => Some(price),
+                ExecutionOutcome::Failed { message } => return Err(message),
+                _ => return Err("unexpected shell response".to_owned()),
+            },
         }
     } else {
         None
@@ -1173,6 +1206,7 @@ async fn execute_with_lane_lease(
                 ctx,
                 ExecutionOperation::DeferOperation {
                     index: candidate.result_index,
+                    cause: DeferCause::AffordableMarketHold,
                 },
             )
             .await
@@ -1244,17 +1278,24 @@ async fn execute_with_lane_lease(
         .checked_mul(U256::from(context.max_fee_per_gas))
         .ok_or_else(|| "bundle prefund overflow".to_owned())?;
 
-    // Per-transfer top-up cap: USD-denominated when a market price exists,
-    // otherwise the static wei cap (fail-open on price unavailability).
-    let top_up_max = match request(ctx, ExecutionOperation::FetchMarketPrice).await {
-        ExecutionOutcome::Price { price } => native_amount_for_usd_cap(
-            chain_assets.assets.native_decimals,
-            price,
-            NATIVE_TOP_UP_USD_CAP,
-        )
-        .unwrap_or(U256::from(policy.top_up_max_wei)),
-        _ => U256::from(policy.top_up_max_wei),
+    // Per-transfer top-up cap: USD-denominated when a price exists (pegged on
+    // Gnosis, otherwise from the market), failing open to the static wei cap.
+    let top_up_price = match crate::settlement::pegged_native_usd_price(chain_id) {
+        Some(price) => Some(price),
+        None => match request(ctx, ExecutionOperation::FetchMarketPrice).await {
+            ExecutionOutcome::Price { price } => Some(price),
+            _ => None,
+        },
     };
+    let top_up_max = top_up_price
+        .and_then(|price| {
+            native_amount_for_usd_cap(
+                chain_assets.assets.native_decimals,
+                price,
+                NATIVE_TOP_UP_USD_CAP,
+            )
+        })
+        .unwrap_or(U256::from(policy.top_up_max_wei));
 
     // The current bundle takes precedence over filling the relayer float.
     if context.relayer_balance < prefund {
@@ -1355,27 +1396,15 @@ async fn execute_with_lane_lease(
         ExecutionOutcome::Failed { message } => return Err(message),
         _ => return Err("unexpected shell response".to_owned()),
     }
-    match request(
-        ctx,
-        ExecutionOperation::BroadcastBundle {
-            intent: intent.clone(),
-        },
-    )
-    .await
-    {
-        ExecutionOutcome::Broadcast { confirmed: true } => {}
-        ExecutionOutcome::Broadcast { confirmed: false } => {
-            record_candidates_deferred(
-                ctx,
-                &survivors,
-                "broadcast",
-                "signed handleOps transaction awaits broadcast confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        ExecutionOutcome::Failed { message } => return Err(message),
-        _ => return Err("unexpected shell response".to_owned()),
+    if !broadcast_bundle(ctx, &intent).await? {
+        record_candidates_deferred(
+            ctx,
+            &survivors,
+            "broadcast",
+            "signed handleOps transaction awaits broadcast confirmation",
+        )
+        .await;
+        return Ok(());
     }
     let indexed = match request(
         ctx,
@@ -1397,6 +1426,224 @@ async fn execute_with_lane_lease(
         results.durable(candidate.result_index);
     }
     Ok(())
+}
+
+/// Distinguishes a future keyed nonce (durable defer) from a stale nonce
+/// (durable reject). Called only for explicit AA25 simulation failures.
+async fn resolve_nonce_mismatches(
+    ctx: &Ctx,
+    entry_point: Address,
+    mismatches: &[Candidate],
+    results: &mut Results,
+) {
+    const LOOKUP_UNAVAILABLE: &str = "account nonce lookup is temporarily unavailable";
+    let nonces = match request(
+        ctx,
+        ExecutionOperation::FetchAccountNonces {
+            entry_point,
+            probes: mismatches
+                .iter()
+                .map(|candidate| (candidate.packed.sender, candidate.packed.packed.nonce))
+                .collect(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::AccountNonces { nonces } if nonces.len() == mismatches.len() => nonces,
+        _ => {
+            for candidate in mismatches {
+                results.failed(candidate.result_index, LOOKUP_UNAVAILABLE);
+            }
+            return;
+        }
+    };
+    for (candidate, onchain_nonce) in mismatches.iter().zip(nonces) {
+        let Some(onchain_nonce) = onchain_nonce else {
+            results.failed(candidate.result_index, LOOKUP_UNAVAILABLE);
+            continue;
+        };
+        let user_nonce = candidate.packed.packed.nonce;
+        if user_nonce > onchain_nonce {
+            // Redis takes a complete immutable copy; a durable item result
+            // lets Iggy advance past this nonce without losing at-least-once
+            // execution.
+            match request(
+                ctx,
+                ExecutionOperation::DeferOperation {
+                    index: candidate.result_index,
+                    cause: DeferCause::FutureNonce {
+                        user_nonce,
+                        onchain_nonce,
+                    },
+                },
+            )
+            .await
+            {
+                ExecutionOutcome::Deferred { .. } => results.durable(candidate.result_index),
+                _ => results.failed(
+                    candidate.result_index,
+                    "could not persist future UserOperation",
+                ),
+            }
+            continue;
+        }
+        match request(
+            ctx,
+            ExecutionOperation::MarkRejected {
+                hash: candidate.hash_string.clone(),
+                cause: RejectionCause::StaleNonce {
+                    user_nonce,
+                    onchain_nonce,
+                },
+            },
+        )
+        .await
+        {
+            ExecutionOutcome::Failed { .. } => results.failed(
+                candidate.result_index,
+                "could not persist stale nonce rejection",
+            ),
+            _ => results.durable(candidate.result_index),
+        }
+    }
+}
+
+/// The broadcast sequence for a freshly signed bundle intent: cache probe,
+/// send, and — for unproven outcomes — the observability and stale-nonce
+/// probes judged by `crate::broadcast::resolve_unproven_broadcast`. Returns
+/// whether the transaction is confirmed observable; `Err` is the transient
+/// deferral channel.
+async fn broadcast_bundle(ctx: &Ctx, intent: &PreparedBundleIntent) -> Result<bool, String> {
+    crate::broadcast::validate_raw_transaction(&intent.raw_transaction, &intent.transaction_hash)
+        .map_err(|error| error.to_string())?;
+    match request(
+        ctx,
+        ExecutionOperation::CheckBroadcastSeen {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Seen { seen: true } => return Ok(true),
+        ExecutionOutcome::Seen { seen: false } => {}
+        _ => return Err("unexpected shell response".to_owned()),
+    }
+    let raw = crate::broadcast::parse_hex_bytes(&intent.raw_transaction)
+        .map(|bytes| bytes.to_vec())
+        .unwrap_or_default();
+    let reply = match request(
+        ctx,
+        ExecutionOperation::BroadcastRaw {
+            raw_transaction: raw,
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Sent { reply } => reply,
+        ExecutionOutcome::Failed { message } => {
+            forget_broadcast(ctx, intent).await;
+            return Err(message);
+        }
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    let (ambiguous, reason) = match reply {
+        BroadcastReply::Accepted { transaction_hash }
+            if transaction_hash.eq_ignore_ascii_case(&intent.transaction_hash) =>
+        {
+            remember_broadcast(ctx, intent).await;
+            return Ok(true);
+        }
+        BroadcastReply::Accepted { .. } => {
+            forget_broadcast(ctx, intent).await;
+            return Err("RPC returned a transaction hash different from the signed bytes".into());
+        }
+        BroadcastReply::Ambiguous { reason } => (true, reason),
+        BroadcastReply::Rejected { reason } => (false, reason),
+    };
+    forget_broadcast(ctx, intent).await;
+    let known = match request(
+        ctx,
+        ExecutionOperation::ProbeTransactionKnown {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await
+    {
+        ExecutionOutcome::Known { known } => known,
+        _ => return Err("unexpected shell response".to_owned()),
+    };
+    match crate::broadcast::resolve_unproven_broadcast(&reason, known) {
+        crate::broadcast::UnprovenBroadcast::Confirmed => {
+            remember_broadcast(ctx, intent).await;
+            Ok(true)
+        }
+        crate::broadcast::UnprovenBroadcast::CheckStaleNonce => {
+            let stale = match request(
+                ctx,
+                ExecutionOperation::ProbeStaleNonce {
+                    intent: intent.clone(),
+                },
+            )
+            .await
+            {
+                ExecutionOutcome::Stale { stale } => stale,
+                _ => return Err("unexpected shell response".to_owned()),
+            };
+            if stale {
+                if let ExecutionOutcome::Failed { message } = request(
+                    ctx,
+                    ExecutionOperation::ClearStaleIntent {
+                        intent: intent.clone(),
+                        reason: reason.clone(),
+                    },
+                )
+                .await
+                {
+                    return Err(message);
+                }
+                return Ok(false);
+            }
+            note_unproven(ctx, intent, ambiguous, &reason).await;
+            Ok(false)
+        }
+        crate::broadcast::UnprovenBroadcast::RetainOutbox => {
+            note_unproven(ctx, intent, ambiguous, &reason).await;
+            Ok(false)
+        }
+    }
+}
+
+async fn remember_broadcast(ctx: &Ctx, intent: &PreparedBundleIntent) {
+    let _ = request(
+        ctx,
+        ExecutionOperation::RememberBroadcast {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await;
+}
+
+async fn forget_broadcast(ctx: &Ctx, intent: &PreparedBundleIntent) {
+    let _ = request(
+        ctx,
+        ExecutionOperation::ForgetBroadcast {
+            transaction_hash: intent.transaction_hash.clone(),
+        },
+    )
+    .await;
+}
+
+async fn note_unproven(ctx: &Ctx, intent: &PreparedBundleIntent, ambiguous: bool, reason: &str) {
+    let _ = request(
+        ctx,
+        ExecutionOperation::RecordUnprovenBroadcast {
+            transaction_hash: intent.transaction_hash.clone(),
+            ambiguous,
+            reason: reason.to_owned(),
+        },
+    )
+    .await;
 }
 
 async fn ensure_lane_lease(ctx: &Ctx) -> Result<(), String> {
@@ -1444,9 +1691,9 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        BundleSimVerdict, BundleSimulationData, ExecutionApp, ExecutionEvent, ExecutionOperation,
-        ExecutionOutcome, ExecutionPolicy, ItemResolution, OperationSimVerdict,
-        ResolvedChainAssets, SignedBundle, StartBatch, TransactionContext,
+        BroadcastReply, BundleSimVerdict, BundleSimulationData, DeferCause, ExecutionApp,
+        ExecutionEvent, ExecutionOperation, ExecutionOutcome, ExecutionPolicy, ItemResolution,
+        OperationSimVerdict, ResolvedChainAssets, SignedBundle, StartBatch, TransactionContext,
     };
     use crate::{
         abi::{PackedOperation, user_operation_hash},
@@ -1580,9 +1827,13 @@ mod tests {
     }
 
     fn user_op(paid: u128) -> UserOperationV0_7 {
+        user_op_with_nonce(paid, "0x0")
+    }
+
+    fn user_op_with_nonce(paid: u128, nonce: &str) -> UserOperationV0_7 {
         UserOperationV0_7 {
             sender: SENDER.into(),
-            nonce: "0x0".into(),
+            nonce: nonce.into(),
             factory: None,
             factory_data: None,
             call_data: format!("0x{}", hex::encode(native_payment_calldata(paid))),
@@ -1609,7 +1860,11 @@ mod tests {
     }
 
     fn fixture(paid: u128) -> Fixture {
-        let operation = UserOperation::V0_7(Box::new(user_op(paid)));
+        fixture_with_nonce(paid, "0x0")
+    }
+
+    fn fixture_with_nonce(paid: u128, nonce: &str) -> Fixture {
+        let operation = UserOperation::V0_7(Box::new(user_op_with_nonce(paid, nonce)));
         let packed = PackedOperation::try_from(&operation).expect("fixture packs");
         let entry_point: Address = ENTRY_POINT.parse().unwrap();
         let hash = user_operation_hash(&packed, entry_point, CHAIN_ID);
@@ -1758,6 +2013,8 @@ mod tests {
             ExecutionOperation::EnsureLaneLease,
             ExecutionOutcome::LeaseHeld { held: true },
         );
+        let signed_raw = [0x02u8, 0x01, 0x02, 0x03];
+        let signed_hash = alloy::primitives::keccak256(signed_raw).to_string();
         driver.step(
             ExecutionOperation::SignBundle {
                 request: super::BundleSignRequest {
@@ -1771,8 +2028,8 @@ mod tests {
             },
             ExecutionOutcome::Signed {
                 signed: SignedBundle {
-                    raw_transaction_hex: "0x02aabb".into(),
-                    transaction_hash: "0xdeadbeef".into(),
+                    raw_transaction_hex: "0x02010203".into(),
+                    transaction_hash: signed_hash.clone(),
                     nonce: 7,
                 },
             },
@@ -1785,8 +2042,8 @@ mod tests {
             chain_id: CHAIN_ID,
             lane: fixture.routed.lane,
             entry_point: entry_point.to_string(),
-            raw_transaction: "0x02aabb".into(),
-            transaction_hash: "0xdeadbeef".into(),
+            raw_transaction: "0x02010203".into(),
+            transaction_hash: signed_hash.clone(),
             nonce: 7,
             user_operation_hashes: vec![fixture.hash_string.clone()],
         };
@@ -1797,10 +2054,27 @@ mod tests {
             ExecutionOutcome::Saved { saved: true },
         );
         driver.step(
-            ExecutionOperation::BroadcastBundle {
-                intent: intent.clone(),
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: signed_hash.clone(),
             },
-            ExecutionOutcome::Broadcast { confirmed: true },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: signed_raw.to_vec(),
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Accepted {
+                    transaction_hash: signed_hash.to_ascii_uppercase(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::RememberBroadcast {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Done,
         );
         driver.step(
             ExecutionOperation::MarkBundleSubmitted {
@@ -1967,7 +2241,10 @@ mod tests {
             ExecutionOutcome::Context { context: context() },
         );
         driver.step(
-            ExecutionOperation::DeferOperation { index: 0 },
+            ExecutionOperation::DeferOperation {
+                index: 0,
+                cause: DeferCause::AffordableMarketHold,
+            },
             ExecutionOutcome::Deferred { attempt: 3 },
         );
         driver.step(
@@ -1991,6 +2268,264 @@ mod tests {
             ExecutionOutcome::Done,
         );
         driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    /// Walks triage + simulation for a single candidate and returns the
+    /// driver positioned right before the bundle simulation.
+    fn walk_to_bundle_simulation(fixture: &Fixture) -> Driver {
+        let mut driver = Driver::start(start(vec![fixture.routed.clone()]));
+        driver.step(
+            ExecutionOperation::CheckChainSupported,
+            ExecutionOutcome::Supported { supported: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadChainAssets,
+            ExecutionOutcome::Assets { resolved: assets() },
+        );
+        driver.step(
+            ExecutionOperation::LoadRecords {
+                hashes: vec![fixture.hash_string.clone()],
+            },
+            ExecutionOutcome::Records {
+                records: vec![Some(fixture.record.clone())],
+            },
+        );
+        driver.step(
+            ExecutionOperation::AcquireLaneLease,
+            ExecutionOutcome::LeaseAcquired { acquired: true },
+        );
+        driver.step(
+            ExecutionOperation::LoadPreparedBundle,
+            ExecutionOutcome::Intent { intent: None },
+        );
+        driver
+    }
+
+    #[test]
+    fn a_future_account_nonce_defers_durably() {
+        let fixture = fixture_with_nonce(280, "0x5");
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::NonceMismatch],
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchAccountNonces {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                probes: vec![(SENDER.parse().unwrap(), U256::from(5u64))],
+            },
+            ExecutionOutcome::AccountNonces {
+                nonces: vec![Some(U256::from(3u64))],
+            },
+        );
+        driver.step(
+            ExecutionOperation::DeferOperation {
+                index: 0,
+                cause: DeferCause::FutureNonce {
+                    user_nonce: U256::from(5u64),
+                    onchain_nonce: U256::from(3u64),
+                },
+            },
+            ExecutionOutcome::Deferred { attempt: 1 },
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_stale_account_nonce_rejects_durably() {
+        let fixture = fixture_with_nonce(280, "0x5");
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::NonceMismatch],
+            },
+        );
+        driver.step(
+            ExecutionOperation::FetchAccountNonces {
+                entry_point: ENTRY_POINT.parse().unwrap(),
+                probes: vec![(SENDER.parse().unwrap(), U256::from(5u64))],
+            },
+            ExecutionOutcome::AccountNonces {
+                nonces: vec![Some(U256::from(9u64))],
+            },
+        );
+        driver.step(
+            ExecutionOperation::MarkRejected {
+                hash: fixture.hash_string.clone(),
+                cause: super::RejectionCause::StaleNonce {
+                    user_nonce: U256::from(5u64),
+                    onchain_nonce: U256::from(9u64),
+                },
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Durable]);
+    }
+
+    #[test]
+    fn a_nonce_too_low_rejection_with_a_stale_lane_clears_the_intent_and_defers() {
+        // Walk the full pipeline to broadcast, then: rejected with
+        // "nonce too low", not observable, lane nonce stale → clear intent,
+        // retain nothing, defer the batch with broadcast diagnostics.
+        let fixture = fixture(280);
+        let entry_point: Address = ENTRY_POINT.parse().unwrap();
+        let mut driver = walk_to_bundle_simulation(&fixture);
+        driver.step(
+            ExecutionOperation::SimulateIndividually {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::OperationVerdicts {
+                verdicts: vec![OperationSimVerdict::Success],
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        driver.step(
+            ExecutionOperation::SimulateBundle {
+                entry_point,
+                operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
+            },
+            ExecutionOutcome::BundleVerdict {
+                verdict: BundleSimVerdict::Success(sim_data()),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let calldata =
+            crate::abi::handle_ops_calldata(std::slice::from_ref(&fixture.packed.packed), TREASURY)
+                .to_vec();
+        driver.step(
+            ExecutionOperation::FetchTransactionContext {
+                entry_point,
+                calldata: calldata.clone(),
+            },
+            ExecutionOutcome::Context { context: context() },
+        );
+        driver.step(
+            ExecutionOperation::FetchMarketPrice,
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let signed_raw = [0x02u8, 0x01, 0x02, 0x03];
+        let signed_hash = alloy::primitives::keccak256(signed_raw).to_string();
+        driver.step(
+            ExecutionOperation::SignBundle {
+                request: super::BundleSignRequest {
+                    nonce: 7,
+                    gas_limit: 100,
+                    max_fee_per_gas: 2,
+                    max_priority_fee_per_gas: 0,
+                    entry_point,
+                    calldata,
+                },
+            },
+            ExecutionOutcome::Signed {
+                signed: SignedBundle {
+                    raw_transaction_hex: "0x02010203".into(),
+                    transaction_hash: signed_hash.clone(),
+                    nonce: 7,
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::EnsureLaneLease,
+            ExecutionOutcome::LeaseHeld { held: true },
+        );
+        let intent = crate::task::PreparedBundleIntent {
+            chain_id: CHAIN_ID,
+            lane: fixture.routed.lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: "0x02010203".into(),
+            transaction_hash: signed_hash.clone(),
+            nonce: 7,
+            user_operation_hashes: vec![fixture.hash_string.clone()],
+        };
+        driver.step(
+            ExecutionOperation::SavePreparedBundle {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Saved { saved: true },
+        );
+        driver.step(
+            ExecutionOperation::CheckBroadcastSeen {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Seen { seen: false },
+        );
+        driver.step(
+            ExecutionOperation::BroadcastRaw {
+                raw_transaction: signed_raw.to_vec(),
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Sent {
+                reply: BroadcastReply::Rejected {
+                    reason: "nonce too low: next nonce 8".into(),
+                },
+            },
+        );
+        driver.step(
+            ExecutionOperation::ForgetBroadcast {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::ProbeTransactionKnown {
+                transaction_hash: signed_hash.clone(),
+            },
+            ExecutionOutcome::Known { known: false },
+        );
+        driver.step(
+            ExecutionOperation::ProbeStaleNonce {
+                intent: intent.clone(),
+            },
+            ExecutionOutcome::Stale { stale: true },
+        );
+        driver.step(
+            ExecutionOperation::ClearStaleIntent {
+                intent,
+                reason: "nonce too low: next nonce 8".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::RecordDeferred {
+                hash: fixture.hash_string.clone(),
+                stage: "broadcast",
+                reason: "signed handleOps transaction awaits broadcast confirmation".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.step(
+            ExecutionOperation::NotifyIssue {
+                hash: fixture.hash_string.clone(),
+                stage: "broadcast",
+                reason: "signed handleOps transaction awaits broadcast confirmation".into(),
+            },
+            ExecutionOutcome::Done,
+        );
+        driver.assert_settled(&[ItemResolution::Failed {
+            reason: "UserOperation execution was deferred".into(),
+        }]);
     }
 }
 

@@ -1,9 +1,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 
-pub const GNOSIS_CHAIN_ID: u64 = 100;
-
-const BINANCE_TICKER_URLS: [&str; 3] = [
+pub const BINANCE_TICKER_URLS: [&str; 3] = [
     "https://api.binance.com/api/v3/ticker/price?symbol=",
     "https://data-api.binance.vision/api/v3/ticker/price?symbol=",
     "https://api.binance.us/api/v3/ticker/price?symbol=",
@@ -38,9 +36,7 @@ pub async fn binance_usdt_price(client: &Client, symbol: &str) -> Option<String>
     None
 }
 
-pub const fn is_gnosis_chain(chain_id: u64) -> bool {
-    chain_id == GNOSIS_CHAIN_ID
-}
+pub use vela_relay_core::settlement::is_gnosis_chain;
 
 fn valid_positive_decimal(value: &str) -> bool {
     let value = value.trim();
@@ -56,7 +52,8 @@ fn valid_positive_decimal(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GNOSIS_CHAIN_ID, is_gnosis_chain, valid_positive_decimal};
+    use super::{is_gnosis_chain, valid_positive_decimal};
+    use vela_relay_core::settlement::GNOSIS_CHAIN_ID;
 
     #[test]
     fn accepts_only_positive_decimal_market_prices() {

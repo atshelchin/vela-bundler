@@ -637,6 +637,22 @@ fn narrow_u512(value: U512) -> Result<U256, SettlementError> {
 /// pricing (`10^USD_PRICE_DECIMALS`).
 pub const USD_PRICE_SCALE: u64 = 100_000_000;
 
+/// Gnosis mainnet: xDAI is the native gas asset and is defined to be
+/// USD-pegged.
+pub const GNOSIS_CHAIN_ID: u64 = 100;
+
+pub const fn is_gnosis_chain(chain_id: u64) -> bool {
+    chain_id == GNOSIS_CHAIN_ID
+}
+
+/// The native/USD price source for a chain. xDAI is defined to be USD-pegged,
+/// which also keeps Gnosis stablecoin settlement and relayer funding
+/// independent of Binance availability; every other chain consults the
+/// market.
+pub fn pegged_native_usd_price(chain_id: u64) -> Option<U256> {
+    is_gnosis_chain(chain_id).then_some(U256::from(USD_PRICE_SCALE))
+}
+
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
 /// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
 pub fn parse_market_usd_price(value: &str) -> Option<U256> {

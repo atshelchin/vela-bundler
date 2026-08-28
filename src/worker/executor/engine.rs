@@ -24,7 +24,7 @@ use crate::{
     },
     utils::{
         config::ExecutorConfig,
-        market::{binance_usdt_price, is_gnosis_chain},
+        market::binance_usdt_price,
         rpc as chain_directory, tempo,
         vault::{derive_pool_relayer_secret_key, derive_treasury_secret_key},
     },
@@ -655,144 +655,6 @@ impl ExecutorEngine {
         Ok(resolutions)
     }
 
-    /// Composite executor distinguishing a future keyed nonce (durable defer)
-    /// from a stale nonce (durable reject); behavior unchanged, outcomes
-    /// returned instead of written into a results slice.
-    async fn resolve_nonce_mismatch_items(
-        &self,
-        chain_id: u64,
-        entry_point: Address,
-        items: &[core_execution::NonceMismatchItem],
-        operations: &[RoutedUserOperation],
-    ) -> Vec<(usize, core_execution::ItemResolution)> {
-        use core_execution::ItemResolution;
-        let mut resolutions = Vec::new();
-        if items.is_empty() {
-            return resolutions;
-        }
-        let calls = items
-            .iter()
-            .map(|item| RpcBatchCall {
-                method: "eth_call",
-                params: json!([{
-                    "to": entry_point.to_string(),
-                    "data": format!(
-                        "0x{}",
-                        hex::encode(get_nonce_calldata(item.sender, item.nonce))
-                    ),
-                }, "latest"]),
-            })
-            .collect::<Vec<_>>();
-        let responses = match self.rpc.batch(chain_id, &calls).await {
-            Ok(responses) => responses,
-            Err(error) => {
-                tracing::warn!(
-                    chain_id,
-                    count = items.len(),
-                    %error,
-                    "could not resolve account nonce mismatches"
-                );
-                for item in items {
-                    resolutions.push((
-                        item.index,
-                        ItemResolution::Failed {
-                            reason: "account nonce lookup is temporarily unavailable".into(),
-                        },
-                    ));
-                }
-                return resolutions;
-            }
-        };
-
-        for (response_index, item) in items.iter().enumerate() {
-            let onchain_nonce =
-                match response_abi_u256(&responses, response_index, "EntryPoint getNonce") {
-                    Ok(nonce) => nonce,
-                    Err(error) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %item.hash,
-                            %error,
-                            "could not decode EntryPoint account nonce"
-                        );
-                        resolutions.push((
-                            item.index,
-                            ItemResolution::Failed {
-                                reason: "account nonce lookup is temporarily unavailable".into(),
-                            },
-                        ));
-                        continue;
-                    }
-                };
-            if item.nonce > onchain_nonce {
-                let delayed = delayed_operation_from_routed(&operations[item.index]);
-                match self
-                    .store
-                    .defer_user_operation(&delayed, self.delayed_payload_ttl())
-                    .await
-                {
-                    Ok(attempt) => {
-                        tracing::info!(
-                            chain_id,
-                            user_operation_hash = %item.hash,
-                            user_nonce = %item.nonce,
-                            onchain_nonce = %onchain_nonce,
-                            attempt,
-                            "future account nonce moved to durable delayed inbox"
-                        );
-                        // Redis now owns a complete immutable copy. A durable
-                        // item result lets Iggy advance past this nonce
-                        // without losing at-least-once execution.
-                        resolutions.push((item.index, ItemResolution::Durable));
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %item.hash,
-                            %error,
-                            "could not persist future nonce in delayed inbox"
-                        );
-                        resolutions.push((
-                            item.index,
-                            ItemResolution::Failed {
-                                reason: "could not persist future UserOperation".into(),
-                            },
-                        ));
-                    }
-                }
-                continue;
-            }
-
-            match self.store.mark_rejected(&item.hash).await {
-                Ok(_) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %item.hash,
-                        user_nonce = %item.nonce,
-                        onchain_nonce = %onchain_nonce,
-                        "stale account nonce rejected UserOperation"
-                    );
-                    resolutions.push((item.index, ItemResolution::Durable));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %item.hash,
-                        %error,
-                        "could not persist stale nonce rejection"
-                    );
-                    resolutions.push((
-                        item.index,
-                        ItemResolution::Failed {
-                            reason: "could not persist stale nonce rejection".into(),
-                        },
-                    ));
-                }
-            }
-        }
-        resolutions
-    }
-
     /// Best-effort retry diagnostic (store write only; the Telegram decision
     /// lives in the core's program).
     async fn record_deferred_diagnostic(
@@ -1119,18 +981,17 @@ impl ExecutorEngine {
                     .ok_or_else(|| {
                         ExecutorItemError("eth_gasPrice returned an invalid quantity".into())
                     })?;
-                gas_price.checked_sub(base_fee).ok_or_else(|| {
-                    ExecutorItemError("gas price is below the latest base fee".into())
-                })?
+                vela_relay_core::gas_math::tip_from_legacy_gas_price(gas_price, base_fee)
+                    .ok_or_else(|| {
+                        ExecutorItemError("gas price is below the latest base fee".into())
+                    })?
             }
         };
         let base_fee = u128::try_from(base_fee)
             .map_err(|_| ExecutorItemError("base fee exceeds uint128".into()))?;
         let tip = u128::try_from(tip)
             .map_err(|_| ExecutorItemError("priority fee exceeds uint128".into()))?;
-        let max_fee_per_gas = base_fee
-            .checked_mul(2)
-            .and_then(|fee| fee.checked_add(tip))
+        let max_fee_per_gas = vela_relay_core::gas_math::quoted_outer_fee(base_fee, tip)
             .ok_or_else(|| ExecutorItemError("EIP-1559 fee overflow".into()))?;
         let nonce = u64::try_from(response_quantity(&responses, 3, "eth_getTransactionCount")?)
             .map_err(|_| ExecutorItemError("relayer nonce exceeds uint64".into()))?;
@@ -1148,14 +1009,12 @@ impl ExecutorEngine {
 
     async fn market_usd_price(
         &self,
-        chain_id: u64,
+        _chain_id: u64,
         symbol: &str,
     ) -> Result<U256, ExecutorItemError> {
-        // xDAI is the native Gnosis gas asset and is defined to be USD-pegged. This also keeps
-        // Gnosis stablecoin settlement and relayer funding independent of Binance availability.
-        if is_gnosis_chain(chain_id) {
-            return Ok(U256::from(USD_PRICE_SCALE));
-        }
+        // The Gnosis xDAI peg is decided in the core program
+        // (`settlement::pegged_native_usd_price`); this executor is only asked
+        // for genuinely market-priced chains.
         let symbol = symbol.trim().to_ascii_uppercase();
         if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
             return Err(ExecutorItemError(
@@ -2447,12 +2306,34 @@ impl BatchShell<'_> {
                                 "single-operation simulation rejected UserOperation"
                             );
                         }
+                        core_execution::RejectionCause::StaleNonce {
+                            user_nonce,
+                            onchain_nonce,
+                        } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                user_nonce = %user_nonce,
+                                onchain_nonce = %onchain_nonce,
+                                "stale account nonce rejected UserOperation"
+                            );
+                        }
                     }
                     Out::Done
                 }
-                Err(error) => Out::Failed {
-                    message: error.to_string(),
-                },
+                Err(error) => {
+                    if let core_execution::RejectionCause::StaleNonce { .. } = cause {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            %error,
+                            "could not persist stale nonce rejection"
+                        );
+                    }
+                    Out::Failed {
+                        message: error.to_string(),
+                    }
+                }
             },
             Op::MarkRejectedWithReason {
                 hash,
@@ -2479,7 +2360,7 @@ impl BatchShell<'_> {
                     },
                 }
             }
-            Op::DeferOperation { index } => {
+            Op::DeferOperation { index, cause } => {
                 let delayed = delayed_operation_from_routed(&self.operations[*index]);
                 match engine
                     .store
@@ -2487,21 +2368,50 @@ impl BatchShell<'_> {
                     .await
                 {
                     Ok(attempt) => {
-                        tracing::info!(
-                            chain_id,
-                            user_operation_hash = %delayed.user_operation_hash,
-                            attempt,
-                            "holding UserOperation until the market fits its signed reimbursement"
-                        );
+                        match cause {
+                            core_execution::DeferCause::AffordableMarketHold => {
+                                tracing::info!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    attempt,
+                                    "holding UserOperation until the market fits its signed reimbursement"
+                                );
+                            }
+                            core_execution::DeferCause::FutureNonce {
+                                user_nonce,
+                                onchain_nonce,
+                            } => {
+                                tracing::info!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    user_nonce = %user_nonce,
+                                    onchain_nonce = %onchain_nonce,
+                                    attempt,
+                                    "future account nonce moved to durable delayed inbox"
+                                );
+                            }
+                        }
                         Out::Deferred { attempt }
                     }
                     Err(error) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %delayed.user_operation_hash,
-                            %error,
-                            "could not hold UserOperation for a cheaper market"
-                        );
+                        match cause {
+                            core_execution::DeferCause::AffordableMarketHold => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    %error,
+                                    "could not hold UserOperation for a cheaper market"
+                                );
+                            }
+                            core_execution::DeferCause::FutureNonce { .. } => {
+                                tracing::warn!(
+                                    chain_id,
+                                    user_operation_hash = %delayed.user_operation_hash,
+                                    %error,
+                                    "could not persist future nonce in delayed inbox"
+                                );
+                            }
+                        }
                         Out::Failed {
                             message: error.to_string(),
                         }
@@ -2627,11 +2537,52 @@ impl BatchShell<'_> {
                         .collect(),
                 }
             }
-            Op::ResolveNonceMismatches { entry_point, items } => Out::MismatchResolutions {
-                resolutions: engine
-                    .resolve_nonce_mismatch_items(chain_id, *entry_point, items, self.operations)
-                    .await,
-            },
+            Op::FetchAccountNonces {
+                entry_point,
+                probes,
+            } => {
+                let calls = probes
+                    .iter()
+                    .map(|(sender, nonce)| RpcBatchCall {
+                        method: "eth_call",
+                        params: json!([{
+                            "to": entry_point.to_string(),
+                            "data": format!(
+                                "0x{}",
+                                hex::encode(get_nonce_calldata(*sender, *nonce))
+                            ),
+                        }, "latest"]),
+                    })
+                    .collect::<Vec<_>>();
+                match engine.rpc.batch(chain_id, &calls).await {
+                    Ok(responses) => Out::AccountNonces {
+                        nonces: (0..probes.len())
+                            .map(|index| {
+                                response_abi_u256(&responses, index, "EntryPoint getNonce")
+                                    .map_err(|error| {
+                                        tracing::warn!(
+                                            chain_id,
+                                            %error,
+                                            "could not decode EntryPoint account nonce"
+                                        );
+                                    })
+                                    .ok()
+                            })
+                            .collect(),
+                    },
+                    Err(error) => {
+                        tracing::warn!(
+                            chain_id,
+                            count = probes.len(),
+                            %error,
+                            "could not resolve account nonce mismatches"
+                        );
+                        Out::Failed {
+                            message: error.to_string(),
+                        }
+                    }
+                }
+            }
             Op::SimulateBundle {
                 entry_point,
                 operations,
@@ -2805,14 +2756,84 @@ impl BatchShell<'_> {
                     },
                 }
             }
-            Op::BroadcastBundle { intent } => match engine.broadcast_bundle_intent(intent).await {
-                Ok(disposition) => Out::Broadcast {
-                    confirmed: disposition == BundleBroadcastDisposition::Confirmed,
+            Op::CheckBroadcastSeen { transaction_hash } => Out::Seen {
+                seen: engine.recently_confirmed_broadcast(transaction_hash).await,
+            },
+            Op::BroadcastRaw {
+                raw_transaction,
+                transaction_hash: _,
+            } => match engine
+                .rpc
+                .broadcast_raw_transaction(chain_id, raw_transaction)
+                .await
+            {
+                Ok(outcome) => Out::Sent {
+                    reply: match outcome {
+                        BroadcastOutcome::Accepted(hash) => {
+                            core_execution::BroadcastReply::Accepted {
+                                transaction_hash: hash,
+                            }
+                        }
+                        BroadcastOutcome::Ambiguous(reason) => {
+                            core_execution::BroadcastReply::Ambiguous { reason }
+                        }
+                        BroadcastOutcome::Rejected(reason) => {
+                            core_execution::BroadcastReply::Rejected { reason }
+                        }
+                    },
                 },
                 Err(error) => Out::Failed {
                     message: error.to_string(),
                 },
             },
+            Op::RememberBroadcast { transaction_hash } => {
+                engine.remember_confirmed_broadcast(transaction_hash).await;
+                Out::Done
+            }
+            Op::ForgetBroadcast { transaction_hash } => {
+                engine.broadcast_seen.lock().await.remove(transaction_hash);
+                Out::Done
+            }
+            Op::ProbeTransactionKnown { transaction_hash } => Out::Known {
+                known: engine
+                    .transaction_is_known(chain_id, transaction_hash)
+                    .await,
+            },
+            Op::ProbeStaleNonce { intent } => Out::Stale {
+                stale: engine.bundle_nonce_is_stale(intent).await,
+            },
+            Op::ClearStaleIntent { intent, reason } => {
+                match engine.clear_stale_bundle_intent(intent, reason).await {
+                    Ok(()) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::RecordUnprovenBroadcast {
+                transaction_hash,
+                ambiguous,
+                reason,
+            } => {
+                if *ambiguous {
+                    tracing::warn!(
+                        chain_id,
+                        lane = self.lane,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "ambiguous handleOps broadcast is not yet observable"
+                    );
+                } else {
+                    tracing::warn!(
+                        chain_id,
+                        lane = self.lane,
+                        transaction_hash = %transaction_hash,
+                        reason,
+                        "rejected broadcast is unproven; retaining exact handleOps outbox"
+                    );
+                }
+                Out::Done
+            }
             Op::MarkBundleSubmitted { intent, gas_limit } => {
                 match engine
                     .store
@@ -3047,9 +3068,7 @@ use vela_relay_core::execution as core_execution;
 use vela_relay_core::funding::{
     TOP_UP_GAS_LIMIT, native_top_up_reserve, plan_native_top_up, treasury_affordable_top_up,
 };
-use vela_relay_core::settlement::{
-    USD_PRICE_SCALE, parse_market_usd_price, settlement_rejection_reason,
-};
+use vela_relay_core::settlement::{parse_market_usd_price, settlement_rejection_reason};
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {
     (0..count).map(|_| item_error(message)).collect()
