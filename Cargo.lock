@@ -5685,6 +5685,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "axum",
+ "crux_core",
  "dotenvy",
  "hex",
  "hkdf",

@@ -167,6 +167,7 @@ pub enum ExecutionOperation {
     },
     MarkRejected {
         hash: String,
+        cause: RejectionCause,
     },
     MarkRejectedWithReason {
         hash: String,
@@ -200,13 +201,16 @@ pub enum ExecutionOperation {
     },
     // --- simulation ---
     SimulateIndividually {
+        entry_point: Address,
         operations: Vec<(B256, PackedOperation)>,
     },
     /// Composite: batch getNonce probe + defer/reject per mismatch (T034).
     ResolveNonceMismatches {
+        entry_point: Address,
         items: Vec<NonceMismatchItem>,
     },
     SimulateBundle {
+        entry_point: Address,
         operations: Vec<(B256, PackedOperation)>,
     },
     // --- outer transaction ---
@@ -235,16 +239,24 @@ pub enum ExecutionOperation {
         intent: PreparedBundleIntent,
     },
     MarkBundleSubmitted {
-        transaction_hash: String,
-        hashes: Vec<String>,
+        intent: PreparedBundleIntent,
+        gas_limit: u64,
     },
     /// Composite: the whole Tempo `0x76` tail (context, settlement gate,
     /// funding, sign, broadcast) exactly as today.
     ExecuteTempoBundle {
         entry_point: Address,
-        survivors: Vec<usize>,
+        survivors: Vec<(usize, PackedOperation)>,
         simulation: BundleSimulationData,
     },
+}
+
+/// Why a triaged or simulated operation is being rejected — carried on the
+/// operation so the shell can emit its historical diagnostics.
+#[derive(Debug, PartialEq)]
+pub enum RejectionCause {
+    InvalidQueuedPayload { reason: &'static str },
+    SimulationRejected { reason: String },
 }
 
 #[derive(Debug, PartialEq)]
@@ -311,7 +323,7 @@ pub enum ExecutionOutcome {
         context: TransactionContext,
     },
     Price {
-        price: Option<U256>,
+        price: U256,
     },
     Funding {
         ready: bool,
@@ -797,11 +809,12 @@ async fn drive_batch(ctx: &Ctx, start: StartBatch) -> Vec<ItemResolution> {
         }
         match candidate_from_record(index, routed, &record, policy.pool_width) {
             Ok(candidate) => candidates.push(candidate),
-            Err(_reason) => {
+            Err(reason) => {
                 match request(
                     ctx,
                     ExecutionOperation::MarkRejected {
                         hash: routed.user_operation_hash.clone(),
+                        cause: RejectionCause::InvalidQueuedPayload { reason },
                     },
                 )
                 .await
@@ -906,6 +919,7 @@ async fn execute_with_lane_lease(
     let verdicts = match request(
         ctx,
         ExecutionOperation::SimulateIndividually {
+            entry_point,
             operations: candidates
                 .iter()
                 .map(|candidate| (candidate.hash, candidate.packed.clone()))
@@ -933,6 +947,9 @@ async fn execute_with_lane_lease(
                     ctx,
                     ExecutionOperation::MarkRejected {
                         hash: candidate.hash_string.clone(),
+                        cause: RejectionCause::SimulationRejected {
+                            reason: reason.clone(),
+                        },
                     },
                 )
                 .await
@@ -975,7 +992,12 @@ async fn execute_with_lane_lease(
                 nonce: candidate.packed.packed.nonce,
             })
             .collect();
-        match request(ctx, ExecutionOperation::ResolveNonceMismatches { items }).await {
+        match request(
+            ctx,
+            ExecutionOperation::ResolveNonceMismatches { entry_point, items },
+        )
+        .await
+        {
             ExecutionOutcome::MismatchResolutions { resolutions } => {
                 for (index, resolution) in resolutions {
                     match resolution {
@@ -1002,14 +1024,14 @@ async fn execute_with_lane_lease(
     // If a multi-op bundle has a state interaction that does not exist in
     // isolated simulation, fall back to the first op. Later ops stay queued
     // instead of poisoning the whole handleOps transaction.
-    let mut bundle_verdict = simulate_bundle(ctx, &survivors).await?;
+    let mut bundle_verdict = simulate_bundle(ctx, entry_point, &survivors).await?;
     if matches!(
         bundle_verdict,
         BundleSimVerdict::Rejected { .. } | BundleSimVerdict::NonceMismatch
     ) && survivors.len() > 1
     {
         survivors.truncate(1);
-        bundle_verdict = simulate_bundle(ctx, &survivors).await?;
+        bundle_verdict = simulate_bundle(ctx, entry_point, &survivors).await?;
     }
     let bundle_simulation = match bundle_verdict {
         BundleSimVerdict::Success(simulation) => simulation,
@@ -1042,7 +1064,7 @@ async fn execute_with_lane_lease(
                 entry_point,
                 survivors: survivors
                     .iter()
-                    .map(|candidate| candidate.result_index)
+                    .map(|candidate| (candidate.result_index, candidate.packed.clone()))
                     .collect(),
                 simulation: bundle_simulation,
             },
@@ -1099,10 +1121,8 @@ async fn execute_with_lane_lease(
     let treasury = start_treasury(start);
     let native_usd_price = if has_stablecoin_payment(treasury, &chain_assets.assets, &call_datas) {
         match request(ctx, ExecutionOperation::FetchMarketPrice).await {
-            ExecutionOutcome::Price { price: Some(price) } => Some(price),
-            ExecutionOutcome::Price { price: None } | ExecutionOutcome::Failed { .. } => {
-                return Err("Binance native USD price request failed".to_owned());
-            }
+            ExecutionOutcome::Price { price } => Some(price),
+            ExecutionOutcome::Failed { message } => return Err(message),
             _ => return Err("unexpected shell response".to_owned()),
         }
     } else {
@@ -1227,7 +1247,7 @@ async fn execute_with_lane_lease(
     // Per-transfer top-up cap: USD-denominated when a market price exists,
     // otherwise the static wei cap (fail-open on price unavailability).
     let top_up_max = match request(ctx, ExecutionOperation::FetchMarketPrice).await {
-        ExecutionOutcome::Price { price: Some(price) } => native_amount_for_usd_cap(
+        ExecutionOutcome::Price { price } => native_amount_for_usd_cap(
             chain_assets.assets.native_decimals,
             price,
             NATIVE_TOP_UP_USD_CAP,
@@ -1360,8 +1380,8 @@ async fn execute_with_lane_lease(
     let indexed = match request(
         ctx,
         ExecutionOperation::MarkBundleSubmitted {
-            transaction_hash: intent.transaction_hash.clone(),
-            hashes: intent.user_operation_hashes.clone(),
+            intent: intent.clone(),
+            gas_limit,
         },
     )
     .await
@@ -1388,10 +1408,15 @@ async fn ensure_lane_lease(ctx: &Ctx) -> Result<(), String> {
     }
 }
 
-async fn simulate_bundle(ctx: &Ctx, survivors: &[Candidate]) -> Result<BundleSimVerdict, String> {
+async fn simulate_bundle(
+    ctx: &Ctx,
+    entry_point: Address,
+    survivors: &[Candidate],
+) -> Result<BundleSimVerdict, String> {
     match request(
         ctx,
         ExecutionOperation::SimulateBundle {
+            entry_point,
             operations: survivors
                 .iter()
                 .map(|candidate| (candidate.hash, candidate.packed.clone()))
@@ -1689,6 +1714,7 @@ mod tests {
         );
         driver.step(
             ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
                 operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
             },
             ExecutionOutcome::OperationVerdicts {
@@ -1701,6 +1727,7 @@ mod tests {
         );
         driver.step(
             ExecutionOperation::SimulateBundle {
+                entry_point: ENTRY_POINT.parse().unwrap(),
                 operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
             },
             ExecutionOutcome::BundleVerdict {
@@ -1723,7 +1750,9 @@ mod tests {
         );
         driver.step(
             ExecutionOperation::FetchMarketPrice,
-            ExecutionOutcome::Price { price: None },
+            ExecutionOutcome::Failed {
+                message: "Binance native USD price request failed".into(),
+            },
         );
         driver.step(
             ExecutionOperation::EnsureLaneLease,
@@ -1775,8 +1804,8 @@ mod tests {
         );
         driver.step(
             ExecutionOperation::MarkBundleSubmitted {
-                transaction_hash: "0xdeadbeef".into(),
-                hashes: vec![fixture.hash_string.clone()],
+                intent,
+                gas_limit: 100,
             },
             ExecutionOutcome::Indexed { indexed: 1 },
         );
@@ -1902,6 +1931,7 @@ mod tests {
         );
         driver.step(
             ExecutionOperation::SimulateIndividually {
+                entry_point: ENTRY_POINT.parse().unwrap(),
                 operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
             },
             ExecutionOutcome::OperationVerdicts {
@@ -1914,6 +1944,7 @@ mod tests {
         );
         driver.step(
             ExecutionOperation::SimulateBundle {
+                entry_point: ENTRY_POINT.parse().unwrap(),
                 operations: vec![(fixture.hash_string.parse().unwrap(), fixture.packed.clone())],
             },
             ExecutionOutcome::BundleVerdict {
@@ -1960,5 +1991,27 @@ mod tests {
             ExecutionOutcome::Done,
         );
         driver.assert_settled(&[ItemResolution::Durable]);
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::{AdmissionAction, admission_action, should_notify_executor_deferred};
+
+    #[test]
+    fn recovers_only_a_matching_unadmitted_queue_record() {
+        assert_eq!(admission_action(true, true), AdmissionAction::Execute);
+        assert_eq!(admission_action(false, true), AdmissionAction::Recover);
+        assert_eq!(admission_action(true, false), AdmissionAction::DeadLetter);
+        assert_eq!(admission_action(false, false), AdmissionAction::DeadLetter);
+    }
+
+    #[test]
+    fn alerts_only_for_executor_failures_not_expected_handoffs() {
+        assert!(should_notify_executor_deferred("execution"));
+        assert!(should_notify_executor_deferred("simulation"));
+        assert!(!should_notify_executor_deferred("lease"));
+        assert!(!should_notify_executor_deferred("funding"));
+        assert!(!should_notify_executor_deferred("simulation_deployment"));
     }
 }

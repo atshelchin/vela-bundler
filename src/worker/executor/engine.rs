@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     fmt::{Display, Formatter},
     future::Future,
     str::FromStr,
@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, Bytes, U256};
 use reqwest::Client;
 use serde_json::{Value, json};
 use tokio::{sync::Mutex, task::JoinSet};
@@ -19,17 +19,14 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     app::{
         ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent,
-        PreparedFundingIntent, QueuedUserOperation, StoredUserOperation,
-        USER_OPERATION_QUEUE_RETENTION, UserOperationStatusStore,
-        rpc::types::{UserOperation, UserOperationStatusKind},
+        PreparedFundingIntent, USER_OPERATION_QUEUE_RETENTION, UserOperationStatusStore,
+        rpc::types::UserOperationStatusKind,
     },
     utils::{
         config::ExecutorConfig,
         market::{binance_usdt_price, is_gnosis_chain},
         rpc as chain_directory, tempo,
-        vault::{
-            derive_pool_relayer_secret_key, derive_treasury_secret_key, relayer_index_for_sender,
-        },
+        vault::{derive_pool_relayer_secret_key, derive_treasury_secret_key},
     },
     worker::consumer::{
         MalformedUserOperation, MalformedUserOperationHandlerFuture, RoutedUserOperation,
@@ -39,18 +36,17 @@ use crate::{
 };
 
 use super::{
-    abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata, user_operation_hash},
+    abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata},
     alert::TelegramAlertNotifier,
     cost::allocate_bundle_gas,
     deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
     settlement::{
-        ChainAssetConfig, FeeContext, SettlementDecision, SettlementEvaluation, SettlementLog,
-        StablecoinConfig, decide_settlement, has_stablecoin_payment, parse_reimbursement,
+        ChainAssetConfig, SettlementLog, StablecoinConfig, parse_reimbursement,
         verify_stable_transfer_logs,
     },
-    simulation::{SimulationResult, SimulationVerdict, simulate_bundle, simulate_individually},
+    simulation::{SimulationVerdict, simulate_bundle, simulate_individually},
     transaction::{
         TempoTransactionPlan, TransactionPlan, sign_eip1559, sign_tempo, signer_address,
     },
@@ -92,16 +88,6 @@ struct ResolvedChainAssets {
 struct CachedMarketPrice {
     expires_at: Instant,
     price: U256,
-}
-
-#[derive(Debug)]
-struct Candidate {
-    result_index: usize,
-    hash: B256,
-    hash_string: String,
-    entry_point: Address,
-    packed: PackedOperation,
-    delayed_operation: DelayedUserOperation,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -148,13 +134,6 @@ enum BundleResumeDisposition {
     Confirmed,
     Unknown,
     Cleared,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AdmissionAction {
-    Execute,
-    Recover,
-    DeadLetter,
 }
 
 #[derive(Debug)]
@@ -373,269 +352,457 @@ impl ExecutorEngine {
         }
     }
 
+    /// Executes one consumed lane batch by driving the core's
+    /// `ExecutionApp` program: `Core::new()` per batch, one operation in
+    /// flight at a time, per-item resolutions mapped back onto the
+    /// `UserOperationHandler` results contract.
     async fn handle_lane_batch(
         &self,
         operations: Vec<RoutedUserOperation>,
     ) -> UserOperationBatchResults {
-        let mut results = std::iter::repeat_with(|| None)
-            .take(operations.len())
-            .collect::<Vec<Option<Result<(), UserOperationHandlerError>>>>();
         if operations.is_empty() {
             return Vec::new();
         }
         let chain_id = operations[0].chain_id;
         let lane = operations[0].lane;
-        if operations
-            .iter()
-            .any(|operation| operation.chain_id != chain_id || operation.lane != lane)
-        {
-            return failure_results(
-                operations.len(),
-                "consumer returned a mixed chain/lane batch",
-            );
-        }
-        if !self.rpc.supports_chain(chain_id).await {
-            tracing::warn!(
-                chain_id,
-                "Iggy stream discovered without a trusted executor RPC"
-            );
-            let reason = "chain has no trusted executor RPC";
-            self.record_routed_deferred(&operations, None, "rpc", reason)
-                .await;
-            return failure_results(operations.len(), reason);
-        }
-        let chain_assets = match if tempo::is_tempo_chain(chain_id) {
-            Ok(self.tempo_chain_assets())
-        } else {
-            self.chain_assets_for(chain_id).await
-        } {
-            Ok(chain_assets) => chain_assets,
-            Err(error) => {
-                tracing::warn!(chain_id, %error, "Iggy stream has no usable executor asset policy");
-                let reason = error.to_string();
-                self.record_routed_deferred(&operations, None, "assets", &reason)
-                    .await;
-                return failure_results(operations.len(), &reason);
-            }
+        let policy = core_execution::ExecutionPolicy {
+            pool_width: self.config.pool_width,
+            max_bundle_operations: self.config.max_bundle_operations,
+            gas_buffer_bps: self.config.gas_buffer_bps,
+            fixed_gas_buffer: self.config.fixed_gas_buffer,
+            settlement_inclusion_floor_bps: self.config.settlement_inclusion_floor_bps,
+            settlement_hold_max_attempts: self.config.settlement_hold_max_attempts,
+            top_up_max_wei: self.config.top_up_max_wei,
+            is_tempo: tempo::is_tempo_chain(chain_id),
+            treasury: self.treasury_address,
         };
-
-        let hashes = operations
-            .iter()
-            .map(|operation| operation.user_operation_hash.clone())
-            .collect::<Vec<_>>();
-        let records = match self.store.get_many(&hashes).await {
-            Ok(records) => records,
-            Err(error) => return failure_results(operations.len(), &error.to_string()),
-        };
-
-        let mut candidates = Vec::new();
-        for (index, (routed, record)) in operations.iter().zip(records).enumerate() {
-            let mut record = match record {
-                Some(record) => record,
-                None => {
-                    let queued = match queued_operation_from_routed(routed, self.config.pool_width)
-                    {
-                        Ok(queued) => queued,
-                        Err(reason) => {
-                            if self.dead_letter_routed(routed, reason).await.is_ok() {
-                                results[index] = Some(Ok(()));
-                            } else {
-                                results[index] =
-                                    Some(item_error("could not persist invalid queue message"));
-                            }
-                            continue;
-                        }
-                    };
-                    if let Err(error) = self.store.restore_queued_from_durable_payload(queued).await
-                    {
-                        results[index] = Some(item_error(&error.to_string()));
-                        continue;
-                    }
-                    match self.store.get(&routed.user_operation_hash).await {
-                        Ok(Some(record)) => {
-                            tracing::info!(
-                                chain_id,
-                                user_operation_hash = %routed.user_operation_hash,
-                                "rebuilt expired UserOperation status from durable queue payload"
-                            );
-                            record
-                        }
-                        Ok(None) => {
-                            results[index] = Some(item_error(
-                                "rebuilt UserOperation status disappeared before execution",
-                            ));
-                            continue;
-                        }
-                        Err(error) => {
-                            results[index] = Some(item_error(&error.to_string()));
-                            continue;
-                        }
-                    }
-                }
-            };
-            if is_durable_status(record.status) {
-                results[index] = Some(Ok(()));
-                continue;
-            }
-            match admission_action(record.admitted, queue_record_matches(routed, &record)) {
-                AdmissionAction::DeadLetter => {
-                    if self
-                        .dead_letter_routed(routed, "Iggy envelope does not match Redis admission")
-                        .await
-                        .is_ok()
-                    {
-                        results[index] = Some(Ok(()));
-                    } else {
-                        results[index] =
-                            Some(item_error("could not persist mismatched queue message"));
-                    }
-                    continue;
-                }
-                AdmissionAction::Recover => {
-                    match self.store.mark_admitted(&routed.user_operation_hash).await {
-                        Ok(true) => {
-                            record.admitted = true;
-                            tracing::warn!(
-                                chain_id,
-                                user_operation_hash = %routed.user_operation_hash,
-                                "recovered Redis admission after Iggy producer crash window"
-                            );
-                        }
-                        Ok(false) => {
-                            results[index] = Some(item_error(
-                                "could not recover expired UserOperation admission",
-                            ));
-                            continue;
-                        }
-                        Err(error) => {
-                            results[index] = Some(item_error(&error.to_string()));
-                            continue;
-                        }
-                    }
-                }
-                AdmissionAction::Execute => {}
-            }
-            match candidate_from_record(index, routed, record, self.config.pool_width) {
-                Ok(candidate) => candidates.push(candidate),
-                Err(reason) => match self.store.mark_rejected(&routed.user_operation_hash).await {
-                    Ok(_) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %routed.user_operation_hash,
-                            reason,
-                            "rejected invalid queued UserOperation"
-                        );
-                        results[index] = Some(Ok(()));
-                    }
-                    Err(error) => results[index] = Some(item_error(&error.to_string())),
-                },
-            }
-        }
-        if candidates.is_empty() {
-            return finish_results(results, "no durable executor outcome");
-        }
-
-        // Never put two nonces from the same sender into one outer transaction. The later item
-        // stays queued and will be retried after the first transaction is reconciled.
-        let mut unique_hashes = HashSet::new();
-        candidates.retain(|candidate| unique_hashes.insert(candidate.hash));
-        let mut senders = HashSet::new();
-        candidates.retain(|candidate| {
-            senders.insert(candidate.packed.sender) && candidate.result_index < operations.len()
-        });
-        candidates.truncate(self.config.max_bundle_operations);
-
-        let lease_scope = format!("executor:{chain_id}:{lane}");
         let lease_token = unique_token("lane");
-        let acquired = self
-            .store
-            .acquire_lease(&lease_scope, &lease_token, self.config.lease_ttl)
-            .await
-            .unwrap_or(false);
-        if !acquired {
-            self.record_routed_deferred(
-                &operations,
-                Some(&results),
-                "lease",
-                "relayer lane is currently owned by another worker",
-            )
-            .await;
-            return finish_results(results, "relayer lane is owned by another worker");
-        }
+        let mut shell = BatchShell {
+            engine: self,
+            operations: &operations,
+            chain_id,
+            lane,
+            lease_scope: format!("executor:{chain_id}:{lane}"),
+            lease_token: lease_token.clone(),
+            assets: None,
+            heartbeat: None,
+            lease_acquired: false,
+        };
 
-        let outcome = self
-            .run_with_lease_heartbeat(
-                &lease_scope,
-                &lease_token,
-                self.execute_with_lane_lease(
-                    chain_id,
-                    lane,
-                    &chain_assets.assets,
-                    &chain_assets.native_symbol,
-                    candidates,
-                    &mut results,
-                    &lease_scope,
-                    &lease_token,
-                ),
-            )
-            .await;
-        if let Err(error) = self.store.release_lease(&lease_scope, &lease_token).await {
-            tracing::warn!(chain_id, lane, %error, "could not release relayer lane lease");
-        }
-        if let Err(error) = outcome {
-            let reason = error.to_string();
-            self.record_routed_deferred(&operations, Some(&results), "execution", &reason)
-                .await;
-            tracing::warn!(chain_id, lane, %error, "UserOperation lane execution deferred");
-        }
-
-        finish_results(results, "UserOperation execution was deferred")
-    }
-
-    /// Persists the concrete retry reason next to the UserOperation. Iggy deliberately retains
-    /// the message until this work reaches a durable outcome; without this record, callers can
-    /// only see a permanent-looking `queued` state while an executor retry is failing.
-    async fn record_routed_deferred(
-        &self,
-        operations: &[RoutedUserOperation],
-        results: Option<&[Option<Result<(), UserOperationHandlerError>>]>,
-        stage: &str,
-        reason: &str,
-    ) {
-        for (index, operation) in operations.iter().enumerate() {
-            if results.is_some_and(|results| results[index].is_some()) {
-                continue;
+        let core: crux_core::Core<core_execution::ExecutionApp> = crux_core::Core::new();
+        let mut effects: VecDeque<core_execution::ExecutionEffect> = core
+            .process_event(core_execution::ExecutionEvent::Start(Box::new(
+                core_execution::StartBatch {
+                    operations: operations.clone(),
+                    policy,
+                    lease_token,
+                },
+            )))
+            .into_iter()
+            .collect();
+        while let Some(core_execution::ExecutionEffect::Work(mut request)) = effects.pop_front() {
+            let outcome = shell.execute(&request.operation).await;
+            match core.resolve(&mut request, outcome) {
+                Ok(next) => effects.extend(next),
+                Err(_) => {
+                    shell.finish().await;
+                    return failure_results(operations.len(), "could not resolve execution effect");
+                }
             }
-            self.record_executor_deferred(
-                operation.chain_id,
-                &operation.user_operation_hash,
-                stage,
-                reason,
-            )
-            .await;
+        }
+        shell.finish().await;
+
+        match core.view().outcome {
+            Some(resolutions) => resolutions
+                .into_iter()
+                .map(|resolution| match resolution {
+                    core_execution::ItemResolution::Durable => Ok(()),
+                    core_execution::ItemResolution::Failed { reason } => {
+                        Err(Box::new(ExecutorItemError(reason)) as UserOperationHandlerError)
+                    }
+                })
+                .collect(),
+            None => failure_results(operations.len(), "lane batch never settled"),
         }
     }
 
-    async fn record_candidates_deferred(
+    /// Composite executor for the Tempo `0x76` tail, unchanged in behavior;
+    /// per-item outcomes are returned instead of written into a results slice.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_tempo_bundle_composite(
         &self,
         chain_id: u64,
-        candidates: &[Candidate],
-        stage: &str,
-        reason: &str,
-    ) {
-        for candidate in candidates {
-            self.record_executor_deferred(chain_id, &candidate.hash_string, stage, reason)
-                .await;
+        lane: u8,
+        entry_point: Address,
+        relayer: Address,
+        survivors: &[(usize, PackedOperation)],
+        hash_strings: &[String],
+        simulation: &core_execution::BundleSimulationData,
+        lease_scope: &str,
+        lease_token: &str,
+    ) -> Result<Vec<(usize, core_execution::ItemResolution)>, ExecutorItemError> {
+        let mut resolutions = Vec::new();
+        // A generic token here would make the treasury's pathUSD float unable
+        // to replenish the relayer. Accept the wallet extension only when it
+        // agrees with the protocol default; omitted `feeToken` canonically
+        // means pathUSD.
+        if let Some(((index, packed), hash_string)) =
+            survivors.iter().zip(hash_strings).find(|((_, packed), _)| {
+                packed
+                    .fee_token
+                    .is_some_and(|fee_token| fee_token != tempo::PATH_USD)
+            })
+        {
+            self.store
+                .mark_rejected(hash_string)
+                .await
+                .map_err(store_item_error)?;
+            resolutions.push((*index, core_execution::ItemResolution::Durable));
+            tracing::warn!(
+                chain_id,
+                user_operation_hash = %hash_string,
+                fee_token = ?packed.fee_token,
+                "Tempo UserOperation requested an unsupported fee token"
+            );
+            return Ok(resolutions);
         }
+
+        let calldata = handle_ops_calldata(
+            &survivors
+                .iter()
+                .map(|(_, packed)| packed.packed.clone())
+                .collect::<Vec<_>>(),
+            self.treasury_address,
+        );
+        let context = self.tempo_transaction_context(chain_id, relayer).await?;
+        let allocations = allocate_bundle_gas(
+            simulation.gas_used,
+            simulation.gas_used,
+            &simulation.operation_gas_used,
+            0,
+            tempo::TEMPO_COST_BUFFER_GAS,
+        )
+        .ok_or_else(|| ExecutorItemError("Tempo bundle gas allocation overflow".into()))?;
+        let costs = allocations
+            .iter()
+            .map(|gas| tempo_cost_in_path_usd(*gas, context.base_fee_atto))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut rejected_any = false;
+        let allowlist = BTreeSet::from([tempo::PATH_USD]);
+        for (((index, packed), hash_string), cost) in survivors.iter().zip(hash_strings).zip(&costs)
+        {
+            let reimbursement =
+                parse_reimbursement(packed.call_data.as_ref(), self.treasury_address, &allowlist);
+            let (paid, stable_logs_valid) = match reimbursement {
+                Ok(reimbursement) => (
+                    reimbursement
+                        .stablecoins
+                        .get(&tempo::PATH_USD)
+                        .copied()
+                        .unwrap_or_default(),
+                    verify_stable_transfer_logs(
+                        &reimbursement,
+                        packed.sender,
+                        self.treasury_address,
+                        &simulation.logs,
+                    ),
+                ),
+                Err(_) => (U256::ZERO, false),
+            };
+            let required = marked_tempo_cost(*cost, self.config.settlement_markup_bps)?;
+            if paid < required || !stable_logs_valid {
+                let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
+                self.store
+                    .mark_rejected_with_executor_reason(hash_string, "in_band_settlement", &reason)
+                    .await
+                    .map_err(store_item_error)?;
+                resolutions.push((*index, core_execution::ItemResolution::Durable));
+                rejected_any = true;
+                tracing::warn!(
+                    chain_id,
+                    user_operation_hash = %hash_string,
+                    paid = %paid,
+                    required = %required,
+                    stable_logs_valid,
+                    "Tempo pathUSD in-band settlement rejected UserOperation"
+                );
+                self.notify_executor_issue(chain_id, "in_band_settlement", hash_string, &reason);
+            }
+        }
+        if rejected_any {
+            return Ok(resolutions);
+        }
+
+        let gas_limit = tempo_handle_ops_gas_limit_packed(
+            &survivors
+                .iter()
+                .map(|(_, packed)| packed)
+                .collect::<Vec<_>>(),
+        )?;
+        let outer_max_fee = context
+            .base_fee_atto
+            .checked_add(context.base_fee_atto / U256::from(2u8))
+            .ok_or_else(|| ExecutorItemError("Tempo outer fee overflow".into()))?;
+        let outer_max_fee = u128::try_from(outer_max_fee)
+            .map_err(|_| ExecutorItemError("Tempo outer fee exceeds uint128".into()))?;
+        let required_prefund =
+            tempo_cost_in_path_usd(U256::from(gas_limit), U256::from(outer_max_fee))?;
+        if self
+            .ensure_tempo_relayer_funded(
+                chain_id,
+                relayer,
+                context.relayer_path_usd_balance,
+                required_prefund,
+                outer_max_fee,
+            )
+            .await?
+            == FundingReadiness::Pending
+        {
+            for hash_string in hash_strings {
+                self.record_deferred_diagnostic(
+                    chain_id,
+                    hash_string,
+                    "funding",
+                    "waiting for relayer pathUSD funding transaction confirmation",
+                )
+                .await;
+            }
+            return Ok(resolutions);
+        }
+        self.ensure_lease(lease_scope, lease_token).await?;
+
+        let signed = sign_tempo(
+            &self.relayer_keys[lane as usize],
+            TempoTransactionPlan {
+                chain_id,
+                nonce: context.nonce,
+                gas_limit,
+                max_fee_per_gas: outer_max_fee,
+                max_priority_fee_per_gas: 0,
+                fee_token: tempo::PATH_USD,
+                to: entry_point,
+                input: calldata,
+            },
+        )
+        .map_err(|error| ExecutorItemError(error.to_string()))?;
+        let intent = PreparedBundleIntent {
+            chain_id,
+            lane,
+            entry_point: entry_point.to_string(),
+            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
+            transaction_hash: signed.transaction_hash.clone(),
+            nonce: signed.nonce,
+            user_operation_hashes: hash_strings.to_vec(),
+        };
+        self.ensure_lease(lease_scope, lease_token).await?;
+        if !self
+            .store
+            .save_prepared_bundle_intent(&intent)
+            .await
+            .map_err(store_item_error)?
+        {
+            let existing = self
+                .store
+                .get_prepared_bundle_intent(chain_id, lane)
+                .await
+                .map_err(store_item_error)?
+                .ok_or_else(|| {
+                    ExecutorItemError("prepared Tempo bundle raced and disappeared".into())
+                })?;
+            self.resume_bundle_intent(&existing).await?;
+            return Ok(resolutions);
+        }
+        if self.broadcast_bundle_intent(&intent).await? == BundleBroadcastDisposition::Unknown {
+            for hash_string in hash_strings {
+                self.record_deferred_diagnostic(
+                    chain_id,
+                    hash_string,
+                    "broadcast",
+                    "signed Tempo handleOps transaction awaits broadcast confirmation",
+                )
+                .await;
+            }
+            return Ok(resolutions);
+        }
+        let indexed = self
+            .store
+            .mark_bundle_submitted(
+                chain_id,
+                &intent.transaction_hash,
+                &intent.user_operation_hashes,
+            )
+            .await
+            .map_err(store_item_error)?;
+        if indexed != intent.user_operation_hashes.len() {
+            return Err(ExecutorItemError(
+                "not every signed Tempo UserOperation entered submitted state".into(),
+            ));
+        }
+        for (index, _) in survivors {
+            resolutions.push((*index, core_execution::ItemResolution::Durable));
+        }
+        tracing::info!(
+            chain_id,
+            lane,
+            relayer = %relayer,
+            transaction_hash = %intent.transaction_hash,
+            nonce = intent.nonce,
+            operations = intent.user_operation_hashes.len(),
+            gas_limit,
+            fee_token = %tempo::PATH_USD,
+            "submitted Tempo 0x76 handleOps transaction"
+        );
+        Ok(resolutions)
     }
 
-    async fn record_executor_deferred(
+    /// Composite executor distinguishing a future keyed nonce (durable defer)
+    /// from a stale nonce (durable reject); behavior unchanged, outcomes
+    /// returned instead of written into a results slice.
+    async fn resolve_nonce_mismatch_items(
+        &self,
+        chain_id: u64,
+        entry_point: Address,
+        items: &[core_execution::NonceMismatchItem],
+        operations: &[RoutedUserOperation],
+    ) -> Vec<(usize, core_execution::ItemResolution)> {
+        use core_execution::ItemResolution;
+        let mut resolutions = Vec::new();
+        if items.is_empty() {
+            return resolutions;
+        }
+        let calls = items
+            .iter()
+            .map(|item| RpcBatchCall {
+                method: "eth_call",
+                params: json!([{
+                    "to": entry_point.to_string(),
+                    "data": format!(
+                        "0x{}",
+                        hex::encode(get_nonce_calldata(item.sender, item.nonce))
+                    ),
+                }, "latest"]),
+            })
+            .collect::<Vec<_>>();
+        let responses = match self.rpc.batch(chain_id, &calls).await {
+            Ok(responses) => responses,
+            Err(error) => {
+                tracing::warn!(
+                    chain_id,
+                    count = items.len(),
+                    %error,
+                    "could not resolve account nonce mismatches"
+                );
+                for item in items {
+                    resolutions.push((
+                        item.index,
+                        ItemResolution::Failed {
+                            reason: "account nonce lookup is temporarily unavailable".into(),
+                        },
+                    ));
+                }
+                return resolutions;
+            }
+        };
+
+        for (response_index, item) in items.iter().enumerate() {
+            let onchain_nonce =
+                match response_abi_u256(&responses, response_index, "EntryPoint getNonce") {
+                    Ok(nonce) => nonce,
+                    Err(error) => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %item.hash,
+                            %error,
+                            "could not decode EntryPoint account nonce"
+                        );
+                        resolutions.push((
+                            item.index,
+                            ItemResolution::Failed {
+                                reason: "account nonce lookup is temporarily unavailable".into(),
+                            },
+                        ));
+                        continue;
+                    }
+                };
+            if item.nonce > onchain_nonce {
+                let delayed = delayed_operation_from_routed(&operations[item.index]);
+                match self
+                    .store
+                    .defer_user_operation(&delayed, self.delayed_payload_ttl())
+                    .await
+                {
+                    Ok(attempt) => {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %item.hash,
+                            user_nonce = %item.nonce,
+                            onchain_nonce = %onchain_nonce,
+                            attempt,
+                            "future account nonce moved to durable delayed inbox"
+                        );
+                        // Redis now owns a complete immutable copy. A durable
+                        // item result lets Iggy advance past this nonce
+                        // without losing at-least-once execution.
+                        resolutions.push((item.index, ItemResolution::Durable));
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %item.hash,
+                            %error,
+                            "could not persist future nonce in delayed inbox"
+                        );
+                        resolutions.push((
+                            item.index,
+                            ItemResolution::Failed {
+                                reason: "could not persist future UserOperation".into(),
+                            },
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            match self.store.mark_rejected(&item.hash).await {
+                Ok(_) => {
+                    tracing::warn!(
+                        chain_id,
+                        user_operation_hash = %item.hash,
+                        user_nonce = %item.nonce,
+                        onchain_nonce = %onchain_nonce,
+                        "stale account nonce rejected UserOperation"
+                    );
+                    resolutions.push((item.index, ItemResolution::Durable));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        chain_id,
+                        user_operation_hash = %item.hash,
+                        %error,
+                        "could not persist stale nonce rejection"
+                    );
+                    resolutions.push((
+                        item.index,
+                        ItemResolution::Failed {
+                            reason: "could not persist stale nonce rejection".into(),
+                        },
+                    ));
+                }
+            }
+        }
+        resolutions
+    }
+
+    /// Best-effort retry diagnostic (store write only; the Telegram decision
+    /// lives in the core's program).
+    async fn record_deferred_diagnostic(
         &self,
         chain_id: u64,
         user_operation_hash: &str,
         stage: &str,
         reason: &str,
     ) {
+        let _ = chain_id;
         if let Err(error) = self
             .store
             .record_executor_deferred(user_operation_hash, stage, reason)
@@ -647,12 +814,6 @@ impl ExecutorEngine {
                 %error,
                 "could not persist executor retry diagnostic"
             );
-        }
-        // A lease held by another worker and a freshly submitted funding/deployment transaction
-        // are expected hand-offs, not operator-actionable failures. Their durable diagnostics are
-        // still recorded, but Telegram is reserved for work that is actually blocked.
-        if should_notify_executor_deferred(stage) {
-            self.notify_executor_issue(chain_id, stage, user_operation_hash, reason);
         }
     }
 
@@ -782,708 +943,6 @@ impl ExecutorEngine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_with_lane_lease(
-        &self,
-        chain_id: u64,
-        lane: u8,
-        chain_assets: &ChainAssetConfig,
-        native_symbol: &str,
-        mut candidates: Vec<Candidate>,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<(), ExecutorItemError> {
-        if let Some(intent) = self
-            .store
-            .get_prepared_bundle_intent(chain_id, lane)
-            .await
-            .map_err(store_item_error)?
-        {
-            let disposition = self.resume_bundle_intent(&intent).await?;
-            if disposition != BundleResumeDisposition::Unknown {
-                for candidate in candidates {
-                    if intent
-                        .user_operation_hashes
-                        .iter()
-                        .any(|hash| hash.eq_ignore_ascii_case(&candidate.hash_string))
-                    {
-                        results[candidate.result_index] = Some(Ok(()));
-                    }
-                }
-            }
-            return Ok(());
-        }
-
-        let entry_point = candidates[0].entry_point;
-        if candidates
-            .iter()
-            .any(|candidate| candidate.entry_point != entry_point)
-        {
-            return Err(ExecutorItemError(
-                "one lane batch contains multiple EntryPoints".into(),
-            ));
-        }
-        let relayer = self.relayer_addresses[lane as usize];
-        let hashes = candidates
-            .iter()
-            .map(|candidate| candidate.hash)
-            .collect::<Vec<_>>();
-        let verdicts = simulate_individually(
-            &self.rpc,
-            chain_id,
-            entry_point,
-            relayer,
-            self.treasury_address,
-            &self.simulation_deployer,
-            &candidates
-                .iter()
-                .map(|candidate| &candidate.packed)
-                .cloned()
-                .collect::<Vec<_>>(),
-            &hashes,
-        )
-        .await;
-
-        let mut survivors = Vec::new();
-        let mut nonce_mismatches = Vec::new();
-        for (candidate, verdict) in candidates.drain(..).zip(verdicts) {
-            match verdict {
-                SimulationVerdict::Success(_) => survivors.push(candidate),
-                SimulationVerdict::NonceMismatch => nonce_mismatches.push(candidate),
-                SimulationVerdict::Rejected(reason) => {
-                    self.store
-                        .mark_rejected(&candidate.hash_string)
-                        .await
-                        .map_err(store_item_error)?;
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        reason,
-                        "single-operation simulation rejected UserOperation"
-                    );
-                    self.notify_executor_issue(
-                        chain_id,
-                        "simulation",
-                        &candidate.hash_string,
-                        reason,
-                    );
-                    results[candidate.result_index] = Some(Ok(()));
-                }
-                SimulationVerdict::Pending(reason) => {
-                    self.record_executor_deferred(
-                        chain_id,
-                        &candidate.hash_string,
-                        "simulation_deployment",
-                        reason,
-                    )
-                    .await;
-                    tracing::info!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        reason,
-                        "single-operation simulation is waiting for automatic contract deployment"
-                    );
-                }
-                SimulationVerdict::Transient(reason) => {
-                    self.record_executor_deferred(
-                        chain_id,
-                        &candidate.hash_string,
-                        "simulation",
-                        reason,
-                    )
-                    .await;
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        reason,
-                        "single-operation simulation unavailable"
-                    );
-                }
-            }
-        }
-        self.resolve_nonce_mismatches(chain_id, entry_point, nonce_mismatches, results)
-            .await;
-        if survivors.is_empty() {
-            return Ok(());
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        // If a multi-op bundle has a state interaction that does not exist in isolated
-        // simulation, fall back to the first op. Later ops stay queued instead of poisoning the
-        // whole handleOps transaction.
-        let mut bundle_simulation = simulate_bundle(
-            &self.rpc,
-            chain_id,
-            entry_point,
-            relayer,
-            self.treasury_address,
-            &self.simulation_deployer,
-            &survivors
-                .iter()
-                .map(|candidate| &candidate.packed)
-                .cloned()
-                .collect::<Vec<_>>(),
-            &survivors
-                .iter()
-                .map(|candidate| candidate.hash)
-                .collect::<Vec<_>>(),
-        )
-        .await;
-        if matches!(
-            bundle_simulation,
-            SimulationVerdict::Rejected(_) | SimulationVerdict::NonceMismatch
-        ) && survivors.len() > 1
-        {
-            survivors.truncate(1);
-            bundle_simulation = simulate_bundle(
-                &self.rpc,
-                chain_id,
-                entry_point,
-                relayer,
-                self.treasury_address,
-                &self.simulation_deployer,
-                &[survivors[0].packed.clone()],
-                &[survivors[0].hash],
-            )
-            .await;
-        }
-        let bundle_simulation = match bundle_simulation {
-            SimulationVerdict::Success(simulation) => simulation,
-            SimulationVerdict::Rejected(reason) => {
-                self.record_candidates_deferred(chain_id, &survivors, "bundle_simulation", reason)
-                    .await;
-                tracing::warn!(
-                    chain_id,
-                    lane,
-                    reason,
-                    "final handleOps simulation rejected bundle"
-                );
-                return Ok(());
-            }
-            SimulationVerdict::NonceMismatch => {
-                self.record_candidates_deferred(
-                    chain_id,
-                    &survivors,
-                    "bundle_simulation",
-                    "final handleOps simulation reported an account nonce mismatch",
-                )
-                .await;
-                tracing::warn!(
-                    chain_id,
-                    lane,
-                    "final handleOps simulation reported an account nonce mismatch"
-                );
-                return Ok(());
-            }
-            SimulationVerdict::Pending(reason) => {
-                self.record_candidates_deferred(
-                    chain_id,
-                    &survivors,
-                    "simulation_deployment",
-                    reason,
-                )
-                .await;
-                tracing::info!(
-                    chain_id,
-                    lane,
-                    reason,
-                    "final handleOps simulation is waiting for automatic contract deployment"
-                );
-                return Ok(());
-            }
-            SimulationVerdict::Transient(reason) => {
-                return Err(ExecutorItemError(reason.into()));
-            }
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        if tempo::is_tempo_chain(chain_id) {
-            return self
-                .execute_tempo_bundle(
-                    chain_id,
-                    lane,
-                    entry_point,
-                    relayer,
-                    survivors,
-                    bundle_simulation,
-                    results,
-                    lease_scope,
-                    lease_token,
-                )
-                .await;
-        }
-
-        let calldata = handle_ops_calldata(
-            &survivors
-                .iter()
-                .map(|candidate| candidate.packed.packed.clone())
-                .collect::<Vec<_>>(),
-            self.treasury_address,
-        );
-        let mut context = self
-            .transaction_context(chain_id, relayer, entry_point, &calldata)
-            .await?;
-        let allocations = allocate_bundle_gas(
-            bundle_simulation.gas_used,
-            context.estimated_gas,
-            &bundle_simulation
-                .events
-                .iter()
-                .map(|event| event.actual_gas_used)
-                .collect::<Vec<_>>(),
-            self.config.gas_buffer_bps,
-            self.config.fixed_gas_buffer,
-        )
-        .ok_or_else(|| ExecutorItemError("bundle gas allocation overflow".into()))?;
-        let settlement = self
-            .settle_at_affordable_fee(
-                chain_id,
-                chain_assets,
-                native_symbol,
-                &survivors,
-                &allocations,
-                &mut context,
-            )
-            .await?;
-        // Settlement evidence must come from the exact final handleOps simulation. Individual
-        // simulations run against a different pre-state; a prior operation in this bundle can
-        // change balances or allowances and make a later transfer disappear. Token address plus
-        // indexed sender/treasury topics attributes each ERC-20 payment to its own UserOperation.
-        let bundle_logs = bundle_simulation
-            .logs
-            .iter()
-            .map(|log| SettlementLog {
-                address: log.address,
-                topics: log.topics.clone(),
-                data: log.data.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut rejected_any = false;
-        for (candidate, evaluation) in survivors.iter().zip(&settlement.operations) {
-            let stable_logs_valid = verify_stable_transfer_logs(
-                &evaluation.reimbursement,
-                candidate.packed.sender,
-                self.treasury_address,
-                &bundle_logs,
-            );
-            if evaluation.accepted() && stable_logs_valid {
-                continue;
-            }
-            // A shortfall that survived repricing means the market is momentarily above what this
-            // payer signed for. Gas prices come back down; a signature the user already gave
-            // should wait for that rather than be thrown away. Holding moves the operation to the
-            // durable delayed inbox, which retries with backoff and — unlike leaving it on the
-            // Iggy offset — does not stall every other payer queued behind it.
-            if evaluation.is_shortfall()
-                && stable_logs_valid
-                && self
-                    .hold_for_affordable_market(chain_id, candidate, evaluation, results)
-                    .await?
-            {
-                rejected_any = true;
-                continue;
-            }
-            let reason = settlement_rejection_reason(
-                evaluation.paid_amount,
-                evaluation.required_amount,
-                stable_logs_valid,
-            );
-            self.store
-                .mark_rejected_with_executor_reason(
-                    &candidate.hash_string,
-                    "in_band_settlement",
-                    &reason,
-                )
-                .await
-                .map_err(store_item_error)?;
-            results[candidate.result_index] = Some(Ok(()));
-            rejected_any = true;
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %candidate.hash_string,
-                payment_asset = ?evaluation.payment_asset,
-                paid = %evaluation.paid_amount,
-                required = %evaluation.required_amount,
-                stable_logs_valid,
-                "in-band settlement rejected UserOperation"
-            );
-            self.notify_executor_issue(
-                chain_id,
-                "in_band_settlement",
-                &candidate.hash_string,
-                &reason,
-            );
-        }
-        if rejected_any {
-            // Reassemble on the next queue delivery so the cost allocation and aggregate estimate
-            // never include a rejected payer.
-            return Ok(());
-        }
-
-        let gas_limit = allocations
-            .iter()
-            .try_fold(U256::ZERO, |sum, gas| sum.checked_add(*gas))
-            .ok_or_else(|| ExecutorItemError("bundle gas limit overflow".into()))?;
-        let gas_limit = u64::try_from(gas_limit)
-            .map_err(|_| ExecutorItemError("bundle gas limit exceeds uint64".into()))?;
-        let prefund = U256::from(gas_limit)
-            .checked_mul(U256::from(context.max_fee_per_gas))
-            .ok_or_else(|| ExecutorItemError("bundle prefund overflow".into()))?;
-        let top_up_max = self
-            .native_top_up_cap(chain_id, native_symbol, chain_assets.native_decimals)
-            .await;
-        if self
-            .ensure_relayer_funded(
-                chain_id,
-                relayer,
-                context.relayer_balance,
-                prefund,
-                context.max_fee_per_gas,
-                context.max_priority_fee_per_gas,
-                top_up_max,
-            )
-            .await?
-            == FundingReadiness::Pending
-        {
-            self.record_candidates_deferred(
-                chain_id,
-                &survivors,
-                "funding",
-                "waiting for relayer funding transaction confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        let signed = sign_eip1559(
-            &self.relayer_keys[lane as usize],
-            TransactionPlan {
-                chain_id,
-                nonce: context.nonce,
-                gas_limit,
-                max_fee_per_gas: context.max_fee_per_gas,
-                max_priority_fee_per_gas: context.max_priority_fee_per_gas,
-                to: entry_point,
-                value: U256::ZERO,
-                input: calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedBundleIntent {
-            chain_id,
-            lane,
-            entry_point: entry_point.to_string(),
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash.clone(),
-            nonce: signed.nonce,
-            user_operation_hashes: survivors
-                .iter()
-                .map(|candidate| candidate.hash_string.clone())
-                .collect(),
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_bundle_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            let existing = self
-                .store
-                .get_prepared_bundle_intent(chain_id, lane)
-                .await
-                .map_err(store_item_error)?
-                .ok_or_else(|| ExecutorItemError("prepared bundle raced and disappeared".into()))?;
-            self.resume_bundle_intent(&existing).await?;
-            return Ok(());
-        }
-        match self.broadcast_bundle_intent(&intent).await? {
-            BundleBroadcastDisposition::Unknown => {
-                self.record_candidates_deferred(
-                    chain_id,
-                    &survivors,
-                    "broadcast",
-                    "signed handleOps transaction awaits broadcast confirmation",
-                )
-                .await;
-                return Ok(());
-            }
-            BundleBroadcastDisposition::Confirmed => {}
-        }
-        let indexed = self
-            .store
-            .mark_bundle_submitted(
-                chain_id,
-                &intent.transaction_hash,
-                &intent.user_operation_hashes,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if indexed != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "not every signed UserOperation entered submitted state".into(),
-            ));
-        }
-        for candidate in survivors {
-            results[candidate.result_index] = Some(Ok(()));
-        }
-        tracing::info!(
-            chain_id,
-            lane,
-            relayer = %relayer,
-            transaction_hash = %intent.transaction_hash,
-            nonce = intent.nonce,
-            operations = intent.user_operation_hashes.len(),
-            gas_limit,
-            "submitted handleOps transaction"
-        );
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_tempo_bundle(
-        &self,
-        chain_id: u64,
-        lane: u8,
-        entry_point: Address,
-        relayer: Address,
-        survivors: Vec<Candidate>,
-        bundle_simulation: SimulationResult,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-        lease_scope: &str,
-        lease_token: &str,
-    ) -> Result<(), ExecutorItemError> {
-        // A generic token here would make the treasury's pathUSD float unable to replenish the
-        // relayer. Accept the wallet extension only when it agrees with the protocol default;
-        // omitted `feeToken` canonically means pathUSD.
-        if let Some(candidate) = survivors.iter().find(|candidate| {
-            candidate
-                .packed
-                .fee_token
-                .is_some_and(|fee_token| fee_token != tempo::PATH_USD)
-        }) {
-            self.store
-                .mark_rejected(&candidate.hash_string)
-                .await
-                .map_err(store_item_error)?;
-            results[candidate.result_index] = Some(Ok(()));
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %candidate.hash_string,
-                fee_token = ?candidate.packed.fee_token,
-                "Tempo UserOperation requested an unsupported fee token"
-            );
-            return Ok(());
-        }
-
-        let calldata = handle_ops_calldata(
-            &survivors
-                .iter()
-                .map(|candidate| candidate.packed.packed.clone())
-                .collect::<Vec<_>>(),
-            self.treasury_address,
-        );
-        let context = self.tempo_transaction_context(chain_id, relayer).await?;
-        let allocations = allocate_bundle_gas(
-            bundle_simulation.gas_used,
-            bundle_simulation.gas_used,
-            &bundle_simulation
-                .events
-                .iter()
-                .map(|event| event.actual_gas_used)
-                .collect::<Vec<_>>(),
-            0,
-            tempo::TEMPO_COST_BUFFER_GAS,
-        )
-        .ok_or_else(|| ExecutorItemError("Tempo bundle gas allocation overflow".into()))?;
-        let costs = allocations
-            .iter()
-            .map(|gas| tempo_cost_in_path_usd(*gas, context.base_fee_atto))
-            .collect::<Result<Vec<_>, _>>()?;
-        let bundle_logs = bundle_simulation
-            .logs
-            .iter()
-            .map(|log| SettlementLog {
-                address: log.address,
-                topics: log.topics.clone(),
-                data: log.data.clone(),
-            })
-            .collect::<Vec<_>>();
-        let mut rejected_any = false;
-        let allowlist = BTreeSet::from([tempo::PATH_USD]);
-        for (candidate, cost) in survivors.iter().zip(&costs) {
-            let reimbursement = parse_reimbursement(
-                candidate.packed.call_data.as_ref(),
-                self.treasury_address,
-                &allowlist,
-            );
-            let (paid, stable_logs_valid) = match reimbursement {
-                Ok(reimbursement) => (
-                    reimbursement
-                        .stablecoins
-                        .get(&tempo::PATH_USD)
-                        .copied()
-                        .unwrap_or_default(),
-                    verify_stable_transfer_logs(
-                        &reimbursement,
-                        candidate.packed.sender,
-                        self.treasury_address,
-                        &bundle_logs,
-                    ),
-                ),
-                Err(_) => (U256::ZERO, false),
-            };
-            let required = marked_tempo_cost(*cost, self.config.settlement_markup_bps)?;
-            if paid < required || !stable_logs_valid {
-                let reason = settlement_rejection_reason(paid, required, stable_logs_valid);
-                self.store
-                    .mark_rejected_with_executor_reason(
-                        &candidate.hash_string,
-                        "in_band_settlement",
-                        &reason,
-                    )
-                    .await
-                    .map_err(store_item_error)?;
-                results[candidate.result_index] = Some(Ok(()));
-                rejected_any = true;
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    paid = %paid,
-                    required = %required,
-                    stable_logs_valid,
-                    "Tempo pathUSD in-band settlement rejected UserOperation"
-                );
-                self.notify_executor_issue(
-                    chain_id,
-                    "in_band_settlement",
-                    &candidate.hash_string,
-                    &reason,
-                );
-            }
-        }
-        if rejected_any {
-            return Ok(());
-        }
-
-        let gas_limit = tempo_handle_ops_gas_limit(&survivors)?;
-        let outer_max_fee = context
-            .base_fee_atto
-            .checked_add(context.base_fee_atto / U256::from(2u8))
-            .ok_or_else(|| ExecutorItemError("Tempo outer fee overflow".into()))?;
-        let outer_max_fee = u128::try_from(outer_max_fee)
-            .map_err(|_| ExecutorItemError("Tempo outer fee exceeds uint128".into()))?;
-        let required_prefund =
-            tempo_cost_in_path_usd(U256::from(gas_limit), U256::from(outer_max_fee))?;
-        if self
-            .ensure_tempo_relayer_funded(
-                chain_id,
-                relayer,
-                context.relayer_path_usd_balance,
-                required_prefund,
-                outer_max_fee,
-            )
-            .await?
-            == FundingReadiness::Pending
-        {
-            self.record_candidates_deferred(
-                chain_id,
-                &survivors,
-                "funding",
-                "waiting for relayer pathUSD funding transaction confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        self.ensure_lease(lease_scope, lease_token).await?;
-
-        let signed = sign_tempo(
-            &self.relayer_keys[lane as usize],
-            TempoTransactionPlan {
-                chain_id,
-                nonce: context.nonce,
-                gas_limit,
-                max_fee_per_gas: outer_max_fee,
-                max_priority_fee_per_gas: 0,
-                fee_token: tempo::PATH_USD,
-                to: entry_point,
-                input: calldata,
-            },
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        let intent = PreparedBundleIntent {
-            chain_id,
-            lane,
-            entry_point: entry_point.to_string(),
-            raw_transaction: format!("0x{}", hex::encode(&signed.raw_transaction)),
-            transaction_hash: signed.transaction_hash.clone(),
-            nonce: signed.nonce,
-            user_operation_hashes: survivors
-                .iter()
-                .map(|candidate| candidate.hash_string.clone())
-                .collect(),
-        };
-        self.ensure_lease(lease_scope, lease_token).await?;
-        if !self
-            .store
-            .save_prepared_bundle_intent(&intent)
-            .await
-            .map_err(store_item_error)?
-        {
-            let existing = self
-                .store
-                .get_prepared_bundle_intent(chain_id, lane)
-                .await
-                .map_err(store_item_error)?
-                .ok_or_else(|| {
-                    ExecutorItemError("prepared Tempo bundle raced and disappeared".into())
-                })?;
-            self.resume_bundle_intent(&existing).await?;
-            return Ok(());
-        }
-        if self.broadcast_bundle_intent(&intent).await? == BundleBroadcastDisposition::Unknown {
-            self.record_candidates_deferred(
-                chain_id,
-                &survivors,
-                "broadcast",
-                "signed Tempo handleOps transaction awaits broadcast confirmation",
-            )
-            .await;
-            return Ok(());
-        }
-        let indexed = self
-            .store
-            .mark_bundle_submitted(
-                chain_id,
-                &intent.transaction_hash,
-                &intent.user_operation_hashes,
-            )
-            .await
-            .map_err(store_item_error)?;
-        if indexed != intent.user_operation_hashes.len() {
-            return Err(ExecutorItemError(
-                "not every signed Tempo UserOperation entered submitted state".into(),
-            ));
-        }
-        for candidate in survivors {
-            results[candidate.result_index] = Some(Ok(()));
-        }
-        tracing::info!(
-            chain_id,
-            lane,
-            relayer = %relayer,
-            transaction_hash = %intent.transaction_hash,
-            nonce = intent.nonce,
-            operations = intent.user_operation_hashes.len(),
-            gas_limit,
-            fee_token = %tempo::PATH_USD,
-            "submitted Tempo 0x76 handleOps transaction"
-        );
-        Ok(())
-    }
-
     async fn tempo_transaction_context(
         &self,
         chain_id: u64,
@@ -1529,128 +988,6 @@ impl ExecutorEngine {
             nonce,
             relayer_path_usd_balance,
         })
-    }
-
-    /// Distinguishes a future keyed nonce (retry later) from a stale nonce (durably reject).
-    /// This is called only for explicit AA25/invalid-account-nonce simulation failures, keeping
-    /// the common path free of extra chain reads.
-    async fn resolve_nonce_mismatches(
-        &self,
-        chain_id: u64,
-        entry_point: Address,
-        candidates: Vec<Candidate>,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-    ) {
-        if candidates.is_empty() {
-            return;
-        }
-        let calls = candidates
-            .iter()
-            .map(|candidate| RpcBatchCall {
-                method: "eth_call",
-                params: json!([{
-                    "to": entry_point.to_string(),
-                    "data": format!(
-                        "0x{}",
-                        hex::encode(get_nonce_calldata(
-                            candidate.packed.sender,
-                            candidate.packed.packed.nonce,
-                        ))
-                    ),
-                }, "latest"]),
-            })
-            .collect::<Vec<_>>();
-        let responses = match self.rpc.batch(chain_id, &calls).await {
-            Ok(responses) => responses,
-            Err(error) => {
-                tracing::warn!(
-                    chain_id,
-                    count = candidates.len(),
-                    %error,
-                    "could not resolve account nonce mismatches"
-                );
-                for candidate in candidates {
-                    results[candidate.result_index] = Some(item_error(
-                        "account nonce lookup is temporarily unavailable",
-                    ));
-                }
-                return;
-            }
-        };
-
-        for (index, candidate) in candidates.into_iter().enumerate() {
-            let onchain_nonce = match response_abi_u256(&responses, index, "EntryPoint getNonce") {
-                Ok(nonce) => nonce,
-                Err(error) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        %error,
-                        "could not decode EntryPoint account nonce"
-                    );
-                    results[candidate.result_index] = Some(item_error(
-                        "account nonce lookup is temporarily unavailable",
-                    ));
-                    continue;
-                }
-            };
-            let user_nonce = candidate.packed.packed.nonce;
-            if user_nonce > onchain_nonce {
-                match self
-                    .store
-                    .defer_user_operation(&candidate.delayed_operation, self.delayed_payload_ttl())
-                    .await
-                {
-                    Ok(attempt) => {
-                        tracing::info!(
-                            chain_id,
-                            user_operation_hash = %candidate.hash_string,
-                            user_nonce = %user_nonce,
-                            onchain_nonce = %onchain_nonce,
-                            attempt,
-                            "future account nonce moved to durable delayed inbox"
-                        );
-                        // Redis now owns a complete immutable copy. A successful item result lets
-                        // Iggy advance past this nonce without losing at-least-once execution.
-                        results[candidate.result_index] = Some(Ok(()));
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            chain_id,
-                            user_operation_hash = %candidate.hash_string,
-                            %error,
-                            "could not persist future nonce in delayed inbox"
-                        );
-                        results[candidate.result_index] =
-                            Some(item_error("could not persist future UserOperation"));
-                    }
-                }
-                continue;
-            }
-
-            match self.store.mark_rejected(&candidate.hash_string).await {
-                Ok(_) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        user_nonce = %user_nonce,
-                        onchain_nonce = %onchain_nonce,
-                        "stale account nonce rejected UserOperation"
-                    );
-                    results[candidate.result_index] = Some(Ok(()));
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        chain_id,
-                        user_operation_hash = %candidate.hash_string,
-                        %error,
-                        "could not persist stale nonce rejection"
-                    );
-                    results[candidate.result_index] =
-                        Some(item_error("could not persist stale nonce rejection"));
-                }
-            }
-        }
     }
 
     fn delayed_payload_ttl(&self) -> Duration {
@@ -1809,150 +1146,6 @@ impl ExecutorEngine {
         })
     }
 
-    /// Parks a UserOperation whose signed reimbursement the current market has priced out.
-    ///
-    /// Returns `true` when the operation is now owned by the delayed inbox and the caller should
-    /// drop it from this bundle, `false` when its waiting budget is spent and it must be rejected
-    /// so the wallet can tell the user to resend at today's prices. A hold that exceeds the budget
-    /// leaves one scheduled delayed entry behind; the next claim sees a durable `rejected` status,
-    /// acks, and removes it.
-    async fn hold_for_affordable_market(
-        &self,
-        chain_id: u64,
-        candidate: &Candidate,
-        evaluation: &SettlementEvaluation,
-        results: &mut [Option<Result<(), UserOperationHandlerError>>],
-    ) -> Result<bool, ExecutorItemError> {
-        let attempt = match self
-            .store
-            .defer_user_operation(&candidate.delayed_operation, self.delayed_payload_ttl())
-            .await
-        {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    %error,
-                    "could not hold UserOperation for a cheaper market"
-                );
-                return Ok(false);
-            }
-        };
-        let reason = match vela_relay_core::hold::decide_hold(
-            attempt,
-            self.config.settlement_hold_max_attempts,
-            evaluation.paid_amount,
-            evaluation.required_amount,
-        ) {
-            vela_relay_core::hold::HoldDecision::RejectBudgetExhausted => {
-                tracing::warn!(
-                    chain_id,
-                    user_operation_hash = %candidate.hash_string,
-                    attempt,
-                    paid = %evaluation.paid_amount,
-                    required = %evaluation.required_amount,
-                    "in-band reimbursement stayed unaffordable for the whole hold budget"
-                );
-                return Ok(false);
-            }
-            vela_relay_core::hold::HoldDecision::Hold { reason } => reason,
-        };
-        self.record_executor_deferred(
-            chain_id,
-            &candidate.hash_string,
-            "in_band_settlement_hold",
-            &reason,
-        )
-        .await;
-        // Redis owns a complete copy now, so letting Iggy advance keeps at-least-once execution
-        // while unblocking every operation queued behind this one.
-        results[candidate.result_index] = Some(Ok(()));
-        tracing::info!(
-            chain_id,
-            user_operation_hash = %candidate.hash_string,
-            attempt,
-            paid = %evaluation.paid_amount,
-            required = %evaluation.required_amount,
-            "holding UserOperation until the market fits its signed reimbursement"
-        );
-        Ok(true)
-    }
-
-    /// Settles the bundle at a fee the payers can actually fund. The verdict —
-    /// accept at the quote, reprice down to the signed budget, or keep the
-    /// quote for the hold/reject gate — is decided by
-    /// `vela_relay_core::settlement::decide_settlement`; this method only
-    /// pre-fetches the market price the decision needs and applies the result.
-    async fn settle_at_affordable_fee(
-        &self,
-        chain_id: u64,
-        chain_assets: &ChainAssetConfig,
-        native_symbol: &str,
-        candidates: &[Candidate],
-        allocations: &[U256],
-        context: &mut TransactionContext,
-    ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
-        let call_datas = candidates
-            .iter()
-            .map(|candidate| candidate.packed.call_data.as_ref())
-            .collect::<Vec<&[u8]>>();
-        let native_usd_price =
-            if has_stablecoin_payment(self.treasury_address, chain_assets, &call_datas) {
-                Some(self.market_usd_price(chain_id, native_symbol).await?)
-            } else {
-                None
-            };
-        let fees = FeeContext {
-            quoted_fee_per_gas: context.max_fee_per_gas,
-            base_fee_per_gas: context.base_fee_per_gas,
-            max_priority_fee_per_gas: context.max_priority_fee_per_gas,
-            inclusion_floor_bps: self.config.settlement_inclusion_floor_bps,
-        };
-        let decision = decide_settlement(
-            self.treasury_address,
-            chain_assets,
-            &call_datas,
-            allocations,
-            native_usd_price,
-            &fees,
-        )
-        .map_err(|error| ExecutorItemError(error.to_string()))?;
-        match decision {
-            SettlementDecision::KeepQuote { evaluation } => Ok(evaluation),
-            SettlementDecision::FloorUnfundable {
-                evaluation,
-                affordable,
-                floor,
-            } => {
-                tracing::info!(
-                    chain_id,
-                    quoted_fee = fees.quoted_fee_per_gas,
-                    affordable,
-                    floor,
-                    base_fee = context.base_fee_per_gas,
-                    "in-band reimbursement cannot fund an includable outer fee"
-                );
-                Ok(evaluation)
-            }
-            SettlementDecision::Reprice {
-                fee_per_gas,
-                evaluation,
-            } => {
-                tracing::info!(
-                    chain_id,
-                    quoted_fee = fees.quoted_fee_per_gas,
-                    repriced_fee = fee_per_gas,
-                    base_fee = context.base_fee_per_gas,
-                    tip = context.max_priority_fee_per_gas,
-                    "repriced the outer transaction to the signed in-band budget"
-                );
-                context.max_fee_per_gas = fee_per_gas;
-                Ok(evaluation)
-            }
-        }
-    }
-
     async fn market_usd_price(
         &self,
         chain_id: u64,
@@ -1988,37 +1181,6 @@ impl ExecutorEngine {
             },
         );
         Ok(price)
-    }
-
-    /// Cap one native-token relayer top-up at 20 USD when Binance has a fresh quote. A network
-    /// with no usable market price intentionally keeps the operator's static wei-denominated
-    /// safety cap instead of blocking execution on the price service.
-    async fn native_top_up_cap(
-        &self,
-        chain_id: u64,
-        native_symbol: &str,
-        native_decimals: u32,
-    ) -> U256 {
-        let fallback = U256::from(self.config.top_up_max_wei);
-        let Ok(price) = self.market_usd_price(chain_id, native_symbol).await else {
-            return fallback;
-        };
-        let Some(cap) = native_amount_for_usd_cap(native_decimals, price, NATIVE_TOP_UP_USD_CAP)
-        else {
-            tracing::warn!(
-                native_symbol,
-                native_decimals,
-                "could not convert USD relayer top-up cap to native units; using static cap"
-            );
-            return fallback;
-        };
-        tracing::debug!(
-            native_symbol,
-            native_decimals,
-            native_units = %cap,
-            "using USD-denominated relayer top-up cap"
-        );
-        cap
     }
 
     async fn resume_bundle_intent(
@@ -3099,13 +2261,6 @@ impl ExecutorEngine {
     }
 }
 
-fn should_notify_executor_deferred(stage: &str) -> bool {
-    matches!(
-        stage,
-        "rpc" | "assets" | "simulation" | "bundle_simulation" | "broadcast" | "execution"
-    )
-}
-
 impl UserOperationHandler for ExecutorEngine {
     fn handle_batch(&self, operations: Vec<RoutedUserOperation>) -> UserOperationHandlerFuture<'_> {
         Box::pin(async move { self.handle_lane_batch(operations).await })
@@ -3136,15 +2291,17 @@ impl UserOperationHandler for ExecutorEngine {
 /// Tempo's outer `0x76` gas limit deliberately comes from the UserOperations' declared limits,
 /// rather than `eth_estimateGas`: EntryPoint catches an inner OOG and an estimate can therefore
 /// succeed while a user's actual execution runs out of gas.
-fn tempo_handle_ops_gas_limit(candidates: &[Candidate]) -> Result<u64, ExecutorItemError> {
-    let declared = candidates.iter().try_fold(U256::ZERO, |total, candidate| {
-        let limits = candidate.packed.packed.accountGasLimits.as_slice();
+fn tempo_handle_ops_gas_limit_packed(
+    operations: &[&PackedOperation],
+) -> Result<u64, ExecutorItemError> {
+    let declared = operations.iter().try_fold(U256::ZERO, |total, packed| {
+        let limits = packed.packed.accountGasLimits.as_slice();
         let verification = U256::from_be_slice(&limits[..16]);
         let call = U256::from_be_slice(&limits[16..]);
         total
             .checked_add(verification)?
             .checked_add(call)?
-            .checked_add(candidate.packed.packed.preVerificationGas)
+            .checked_add(packed.packed.preVerificationGas)
     });
     let declared =
         declared.ok_or_else(|| ExecutorItemError("Tempo declared gas overflow".into()))?;
@@ -3152,11 +2309,615 @@ fn tempo_handle_ops_gas_limit(candidates: &[Candidate]) -> Result<u64, ExecutorI
         .checked_mul(U256::from(64u8))
         .map(|value| value / U256::from(63u8))
         .and_then(|value| {
-            value.checked_add(U256::from(candidates.len()).checked_mul(U256::from(50_000u64))?)
+            value.checked_add(U256::from(operations.len()).checked_mul(U256::from(50_000u64))?)
         })
         .and_then(|value| value.checked_add(U256::from(60_000u64)))
         .ok_or_else(|| ExecutorItemError("Tempo outer gas limit overflow".into()))?;
     u64::try_from(gas).map_err(|_| ExecutorItemError("Tempo outer gas limit exceeds uint64".into()))
+}
+
+/// The shell side of one lane-batch program: executes the core's requested
+/// operations against real infrastructure. Failures fold into result data —
+/// the core decides what they mean.
+struct BatchShell<'a> {
+    engine: &'a ExecutorEngine,
+    operations: &'a [RoutedUserOperation],
+    chain_id: u64,
+    lane: u8,
+    lease_scope: String,
+    lease_token: String,
+    assets: Option<ResolvedChainAssets>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+    lease_acquired: bool,
+}
+
+impl BatchShell<'_> {
+    async fn execute(
+        &mut self,
+        operation: &core_execution::ExecutionOperation,
+    ) -> core_execution::ExecutionOutcome {
+        use core_execution::{ExecutionOperation as Op, ExecutionOutcome as Out};
+        let engine = self.engine;
+        let chain_id = self.chain_id;
+        match operation {
+            Op::CheckChainSupported => {
+                let supported = engine.rpc.supports_chain(chain_id).await;
+                if !supported {
+                    tracing::warn!(
+                        chain_id,
+                        "Iggy stream discovered without a trusted executor RPC"
+                    );
+                }
+                Out::Supported { supported }
+            }
+            Op::LoadChainAssets => {
+                let resolved = if tempo::is_tempo_chain(chain_id) {
+                    Ok(engine.tempo_chain_assets())
+                } else {
+                    engine.chain_assets_for(chain_id).await
+                };
+                match resolved {
+                    Ok(resolved) => {
+                        self.assets = Some(resolved.clone());
+                        Out::Assets {
+                            resolved: core_execution::ResolvedChainAssets {
+                                assets: resolved.assets,
+                                native_symbol: resolved.native_symbol,
+                            },
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(chain_id, %error, "Iggy stream has no usable executor asset policy");
+                        Out::AssetsUnavailable {
+                            reason: error.to_string(),
+                        }
+                    }
+                }
+            }
+            Op::LoadRecords { hashes } => match engine.store.get_many(hashes).await {
+                Ok(records) => Out::Records { records },
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::DeadLetterRouted { index, reason } => Out::Persisted {
+                persisted: engine
+                    .dead_letter_routed(&self.operations[*index], reason)
+                    .await
+                    .is_ok(),
+            },
+            Op::RestoreQueued { queued, .. } => {
+                match engine
+                    .store
+                    .restore_queued_from_durable_payload(queued.clone())
+                    .await
+                {
+                    Ok(_) => Out::Done,
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ReloadRecord { hash } => match engine.store.get(hash).await {
+                Ok(record) => {
+                    if record.is_some() {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            "rebuilt expired UserOperation status from durable queue payload"
+                        );
+                    }
+                    Out::Record { record }
+                }
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::MarkAdmitted { hash } => match engine.store.mark_admitted(hash).await {
+                Ok(marked) => {
+                    if marked {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            "recovered Redis admission after Iggy producer crash window"
+                        );
+                    }
+                    Out::Marked { marked }
+                }
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::MarkRejected { hash, cause } => match engine.store.mark_rejected(hash).await {
+                Ok(_) => {
+                    match cause {
+                        core_execution::RejectionCause::InvalidQueuedPayload { reason } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                reason,
+                                "rejected invalid queued UserOperation"
+                            );
+                        }
+                        core_execution::RejectionCause::SimulationRejected { reason } => {
+                            tracing::warn!(
+                                chain_id,
+                                user_operation_hash = %hash,
+                                reason,
+                                "single-operation simulation rejected UserOperation"
+                            );
+                        }
+                    }
+                    Out::Done
+                }
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::MarkRejectedWithReason {
+                hash,
+                stage,
+                reason,
+            } => {
+                match engine
+                    .store
+                    .mark_rejected_with_executor_reason(hash, stage, reason)
+                    .await
+                {
+                    Ok(_) => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %hash,
+                            stage,
+                            reason,
+                            "in-band settlement rejected UserOperation"
+                        );
+                        Out::Done
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::DeferOperation { index } => {
+                let delayed = delayed_operation_from_routed(&self.operations[*index]);
+                match engine
+                    .store
+                    .defer_user_operation(&delayed, engine.delayed_payload_ttl())
+                    .await
+                {
+                    Ok(attempt) => {
+                        tracing::info!(
+                            chain_id,
+                            user_operation_hash = %delayed.user_operation_hash,
+                            attempt,
+                            "holding UserOperation until the market fits its signed reimbursement"
+                        );
+                        Out::Deferred { attempt }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            chain_id,
+                            user_operation_hash = %delayed.user_operation_hash,
+                            %error,
+                            "could not hold UserOperation for a cheaper market"
+                        );
+                        Out::Failed {
+                            message: error.to_string(),
+                        }
+                    }
+                }
+            }
+            Op::RecordDeferred {
+                hash,
+                stage,
+                reason,
+            } => {
+                engine
+                    .record_deferred_diagnostic(chain_id, hash, stage, reason)
+                    .await;
+                Out::Done
+            }
+            Op::NotifyIssue {
+                hash,
+                stage,
+                reason,
+            } => {
+                engine.notify_executor_issue(chain_id, stage, hash, reason);
+                Out::Done
+            }
+            Op::AcquireLaneLease => {
+                let acquired = engine
+                    .store
+                    .acquire_lease(
+                        &self.lease_scope,
+                        &self.lease_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if acquired {
+                    self.lease_acquired = true;
+                    self.start_heartbeat();
+                }
+                Out::LeaseAcquired { acquired }
+            }
+            Op::EnsureLaneLease => {
+                match engine
+                    .store
+                    .renew_lease(
+                        &self.lease_scope,
+                        &self.lease_token,
+                        engine.config.lease_ttl,
+                    )
+                    .await
+                {
+                    Ok(held) => Out::LeaseHeld { held },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::LoadPreparedBundle => {
+                match engine
+                    .store
+                    .get_prepared_bundle_intent(chain_id, self.lane)
+                    .await
+                {
+                    Ok(intent) => Out::Intent { intent },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ResumeBundleIntent { intent } => match engine.resume_bundle_intent(intent).await {
+                Ok(disposition) => Out::Resumed {
+                    known_outcome: disposition != BundleResumeDisposition::Unknown,
+                },
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::SimulateIndividually {
+                entry_point,
+                operations,
+            } => {
+                let packed = operations
+                    .iter()
+                    .map(|(_, packed)| packed.clone())
+                    .collect::<Vec<_>>();
+                let hashes = operations.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let verdicts = simulate_individually(
+                    &engine.rpc,
+                    chain_id,
+                    *entry_point,
+                    engine.relayer_addresses[self.lane as usize],
+                    engine.treasury_address,
+                    &engine.simulation_deployer,
+                    &packed,
+                    &hashes,
+                )
+                .await;
+                Out::OperationVerdicts {
+                    verdicts: verdicts
+                        .into_iter()
+                        .map(|verdict| match verdict {
+                            SimulationVerdict::Success(_) => {
+                                core_execution::OperationSimVerdict::Success
+                            }
+                            SimulationVerdict::NonceMismatch => {
+                                core_execution::OperationSimVerdict::NonceMismatch
+                            }
+                            SimulationVerdict::Rejected(reason) => {
+                                core_execution::OperationSimVerdict::Rejected {
+                                    reason: reason.to_string(),
+                                }
+                            }
+                            SimulationVerdict::Pending(reason) => {
+                                core_execution::OperationSimVerdict::Pending {
+                                    reason: reason.to_string(),
+                                }
+                            }
+                            SimulationVerdict::Transient(reason) => {
+                                core_execution::OperationSimVerdict::Transient {
+                                    reason: reason.to_string(),
+                                }
+                            }
+                        })
+                        .collect(),
+                }
+            }
+            Op::ResolveNonceMismatches { entry_point, items } => Out::MismatchResolutions {
+                resolutions: engine
+                    .resolve_nonce_mismatch_items(chain_id, *entry_point, items, self.operations)
+                    .await,
+            },
+            Op::SimulateBundle {
+                entry_point,
+                operations,
+            } => {
+                let packed = operations
+                    .iter()
+                    .map(|(_, packed)| packed.clone())
+                    .collect::<Vec<_>>();
+                let hashes = operations.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let verdict = simulate_bundle(
+                    &engine.rpc,
+                    chain_id,
+                    *entry_point,
+                    engine.relayer_addresses[self.lane as usize],
+                    engine.treasury_address,
+                    &engine.simulation_deployer,
+                    &packed,
+                    &hashes,
+                )
+                .await;
+                Out::BundleVerdict {
+                    verdict: match verdict {
+                        SimulationVerdict::Success(simulation) => {
+                            core_execution::BundleSimVerdict::Success(
+                                core_execution::BundleSimulationData {
+                                    gas_used: simulation.gas_used,
+                                    operation_gas_used: simulation
+                                        .events
+                                        .iter()
+                                        .map(|event| event.actual_gas_used)
+                                        .collect(),
+                                    logs: simulation
+                                        .logs
+                                        .iter()
+                                        .map(|log| SettlementLog {
+                                            address: log.address,
+                                            topics: log.topics.clone(),
+                                            data: log.data.clone(),
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        }
+                        SimulationVerdict::NonceMismatch => {
+                            core_execution::BundleSimVerdict::NonceMismatch
+                        }
+                        SimulationVerdict::Rejected(reason) => {
+                            core_execution::BundleSimVerdict::Rejected {
+                                reason: reason.to_string(),
+                            }
+                        }
+                        SimulationVerdict::Pending(reason) => {
+                            core_execution::BundleSimVerdict::Pending {
+                                reason: reason.to_string(),
+                            }
+                        }
+                        SimulationVerdict::Transient(reason) => {
+                            core_execution::BundleSimVerdict::Transient {
+                                reason: reason.to_string(),
+                            }
+                        }
+                    },
+                }
+            }
+            Op::FetchTransactionContext {
+                entry_point,
+                calldata,
+            } => {
+                let calldata: Bytes = calldata.clone().into();
+                match engine
+                    .transaction_context(
+                        chain_id,
+                        engine.relayer_addresses[self.lane as usize],
+                        *entry_point,
+                        &calldata,
+                    )
+                    .await
+                {
+                    Ok(context) => Out::Context {
+                        context: core_execution::TransactionContext {
+                            estimated_gas: context.estimated_gas,
+                            base_fee_per_gas: context.base_fee_per_gas,
+                            max_fee_per_gas: context.max_fee_per_gas,
+                            max_priority_fee_per_gas: context.max_priority_fee_per_gas,
+                            nonce: context.nonce,
+                            relayer_balance: context.relayer_balance,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::FetchMarketPrice => {
+                let Some(assets) = &self.assets else {
+                    return Out::Failed {
+                        message: "chain assets were not resolved".into(),
+                    };
+                };
+                match engine
+                    .market_usd_price(chain_id, &assets.native_symbol)
+                    .await
+                {
+                    Ok(price) => Out::Price { price },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::EnsureRelayerFunded {
+                relayer_balance,
+                required_prefund,
+                max_fee_per_gas,
+                max_priority_fee_per_gas,
+                top_up_max,
+            } => {
+                match engine
+                    .ensure_relayer_funded(
+                        chain_id,
+                        engine.relayer_addresses[self.lane as usize],
+                        *relayer_balance,
+                        *required_prefund,
+                        *max_fee_per_gas,
+                        *max_priority_fee_per_gas,
+                        *top_up_max,
+                    )
+                    .await
+                {
+                    Ok(readiness) => Out::Funding {
+                        ready: readiness == FundingReadiness::Ready,
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignBundle { request } => {
+                match sign_eip1559(
+                    &engine.relayer_keys[self.lane as usize],
+                    TransactionPlan {
+                        chain_id,
+                        nonce: request.nonce,
+                        gas_limit: request.gas_limit,
+                        max_fee_per_gas: request.max_fee_per_gas,
+                        max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+                        to: request.entry_point,
+                        value: U256::ZERO,
+                        input: request.calldata.clone().into(),
+                    },
+                ) {
+                    Ok(signed) => Out::Signed {
+                        signed: core_execution::SignedBundle {
+                            raw_transaction_hex: format!(
+                                "0x{}",
+                                hex::encode(&signed.raw_transaction)
+                            ),
+                            transaction_hash: signed.transaction_hash,
+                            nonce: signed.nonce,
+                        },
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SavePreparedBundle { intent } => {
+                match engine.store.save_prepared_bundle_intent(intent).await {
+                    Ok(saved) => Out::Saved { saved },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::BroadcastBundle { intent } => match engine.broadcast_bundle_intent(intent).await {
+                Ok(disposition) => Out::Broadcast {
+                    confirmed: disposition == BundleBroadcastDisposition::Confirmed,
+                },
+                Err(error) => Out::Failed {
+                    message: error.to_string(),
+                },
+            },
+            Op::MarkBundleSubmitted { intent, gas_limit } => {
+                match engine
+                    .store
+                    .mark_bundle_submitted(
+                        chain_id,
+                        &intent.transaction_hash,
+                        &intent.user_operation_hashes,
+                    )
+                    .await
+                {
+                    Ok(indexed) => {
+                        if indexed == intent.user_operation_hashes.len() {
+                            tracing::info!(
+                                chain_id,
+                                lane = self.lane,
+                                relayer = %engine.relayer_addresses[self.lane as usize],
+                                transaction_hash = %intent.transaction_hash,
+                                nonce = intent.nonce,
+                                operations = intent.user_operation_hashes.len(),
+                                gas_limit,
+                                "submitted handleOps transaction"
+                            );
+                        }
+                        Out::Indexed { indexed }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ExecuteTempoBundle {
+                entry_point,
+                survivors,
+                simulation,
+            } => {
+                let hash_strings = survivors
+                    .iter()
+                    .map(|(index, _)| {
+                        self.operations[*index]
+                            .user_operation_hash
+                            .to_ascii_lowercase()
+                    })
+                    .collect::<Vec<_>>();
+                match engine
+                    .execute_tempo_bundle_composite(
+                        chain_id,
+                        self.lane,
+                        *entry_point,
+                        engine.relayer_addresses[self.lane as usize],
+                        survivors,
+                        &hash_strings,
+                        simulation,
+                        &self.lease_scope,
+                        &self.lease_token,
+                    )
+                    .await
+                {
+                    Ok(resolutions) => Out::TempoOutcome { resolutions },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+        }
+    }
+
+    fn start_heartbeat(&mut self) {
+        let engine = self.engine.clone();
+        let scope = self.lease_scope.clone();
+        let token = self.lease_token.clone();
+        let ttl = engine.config.lease_ttl;
+        self.heartbeat = Some(tokio::spawn(async move {
+            let period = (ttl / 3).max(Duration::from_millis(1));
+            let start = tokio::time::Instant::now() + period;
+            let mut heartbeat = tokio::time::interval_at(start, period);
+            heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                heartbeat.tick().await;
+                if let Err(error) = engine.ensure_lease(&scope, &token).await {
+                    tracing::warn!(%error, "lane lease heartbeat stopped");
+                    return;
+                }
+            }
+        }));
+    }
+
+    async fn finish(&mut self) {
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+        }
+        if self.lease_acquired
+            && let Err(error) = self
+                .engine
+                .store
+                .release_lease(&self.lease_scope, &self.lease_token)
+                .await
+        {
+            tracing::warn!(
+                chain_id = self.chain_id,
+                lane = self.lane,
+                %error,
+                "could not release relayer lane lease"
+            );
+        }
+    }
 }
 
 /// Converts Tempo's `attodollars/gas` price to micro-pathUSD, always rounding up so the relay
@@ -3177,83 +2938,6 @@ fn validate_raw_transaction(
 ) -> Result<Vec<u8>, ExecutorItemError> {
     vela_relay_core::broadcast::validate_raw_transaction(raw_transaction, transaction_hash)
         .map_err(|error| ExecutorItemError(error.to_string()))
-}
-
-fn candidate_from_record(
-    result_index: usize,
-    routed: &RoutedUserOperation,
-    record: StoredUserOperation,
-    pool_width: usize,
-) -> Result<Candidate, &'static str> {
-    let hash = B256::from_str(&routed.user_operation_hash)
-        .map_err(|_| "queue UserOperation hash is invalid")?;
-    let entry_point = Address::from_str(&routed.entry_point)
-        .map_err(|_| "queue EntryPoint address is invalid")?;
-    if relayer_index_for_sender(&routed.sender, pool_width) != routed.lane as usize {
-        return Err("sender route does not match relayer lane");
-    }
-    let packed = PackedOperation::try_from(&record.user_operation)
-        .map_err(|_| "could not pack queued UserOperation")?;
-    if packed.has_eip7702_authorization {
-        return Err("EIP-7702 UserOperations are not enabled in the executor");
-    }
-    if !packed
-        .sender
-        .to_string()
-        .eq_ignore_ascii_case(&routed.sender)
-    {
-        return Err("queue sender does not match UserOperation sender");
-    }
-    if user_operation_hash(&packed, entry_point, routed.chain_id) != hash {
-        return Err("queue UserOperation hash does not match immutable payload");
-    }
-    Ok(Candidate {
-        result_index,
-        hash,
-        hash_string: routed.user_operation_hash.to_ascii_lowercase(),
-        entry_point,
-        packed,
-        delayed_operation: delayed_operation_from_routed(routed),
-    })
-}
-
-fn queued_operation_from_routed(
-    routed: &RoutedUserOperation,
-    pool_width: usize,
-) -> Result<QueuedUserOperation, &'static str> {
-    let operation = serde_json::from_value::<UserOperation>(routed.user_operation.clone())
-        .map_err(|_| "queue UserOperation payload is not canonical v0.7 JSON")?;
-    if serde_json::to_value(&operation).ok().as_ref() != Some(&routed.user_operation) {
-        return Err("queue UserOperation payload is not canonical JSON");
-    }
-    let entry_point = Address::from_str(&routed.entry_point)
-        .map_err(|_| "queue EntryPoint address is invalid")?;
-    let hash = B256::from_str(&routed.user_operation_hash)
-        .map_err(|_| "queue UserOperation hash is invalid")?;
-    let packed =
-        PackedOperation::try_from(&operation).map_err(|_| "could not pack queue UserOperation")?;
-    if packed.has_eip7702_authorization {
-        return Err("EIP-7702 UserOperations are not enabled in the executor");
-    }
-    if !packed
-        .sender
-        .to_string()
-        .eq_ignore_ascii_case(&routed.sender)
-    {
-        return Err("queue sender does not match UserOperation sender");
-    }
-    if relayer_index_for_sender(&routed.sender, pool_width) != routed.lane as usize {
-        return Err("sender route does not match relayer lane");
-    }
-    if user_operation_hash(&packed, entry_point, routed.chain_id) != hash {
-        return Err("queue UserOperation hash does not match immutable payload");
-    }
-    Ok(QueuedUserOperation {
-        user_operation_hash: routed.user_operation_hash.to_ascii_lowercase(),
-        chain_id: routed.chain_id,
-        entry_point: routed.entry_point.clone(),
-        user_operation: operation,
-    })
 }
 
 fn delayed_operation_from_routed(routed: &RoutedUserOperation) -> DelayedUserOperation {
@@ -3284,25 +2968,6 @@ fn routed_operation_from_delayed(operation: &DelayedUserOperation) -> RoutedUser
         partition_id: operation.partition_id,
         offset: operation.offset,
     }
-}
-
-fn queue_record_matches(routed: &RoutedUserOperation, record: &StoredUserOperation) -> bool {
-    record.chain_id == routed.chain_id
-        && record.entry_point.eq_ignore_ascii_case(&routed.entry_point)
-        && serde_json::to_value(&record.user_operation).ok().as_ref()
-            == Some(&routed.user_operation)
-}
-
-fn admission_action(admitted: bool, envelope_matches: bool) -> AdmissionAction {
-    match (admitted, envelope_matches) {
-        (_, false) => AdmissionAction::DeadLetter,
-        (false, true) => AdmissionAction::Recover,
-        (true, true) => AdmissionAction::Execute,
-    }
-}
-
-fn is_durable_status(status: UserOperationStatusKind) -> bool {
-    status.is_durable()
 }
 
 fn item_error(message: &str) -> Result<(), UserOperationHandlerError> {
@@ -3378,9 +3043,9 @@ fn parse_quantity(value: &str) -> Option<U256> {
 // ladder and budget in `vela_relay_core::hold`; broadcast judgement and
 // funding policy in their core modules.
 use vela_relay_core::broadcast::{nonce_too_low, parse_hex_bytes};
+use vela_relay_core::execution as core_execution;
 use vela_relay_core::funding::{
-    NATIVE_TOP_UP_USD_CAP, TOP_UP_GAS_LIMIT, native_amount_for_usd_cap, native_top_up_reserve,
-    plan_native_top_up, treasury_affordable_top_up,
+    TOP_UP_GAS_LIMIT, native_top_up_reserve, plan_native_top_up, treasury_affordable_top_up,
 };
 use vela_relay_core::settlement::{
     USD_PRICE_SCALE, parse_market_usd_price, settlement_rejection_reason,
@@ -3388,16 +3053,6 @@ use vela_relay_core::settlement::{
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {
     (0..count).map(|_| item_error(message)).collect()
-}
-
-fn finish_results(
-    results: Vec<Option<Result<(), UserOperationHandlerError>>>,
-    default_error: &str,
-) -> UserOperationBatchResults {
-    results
-        .into_iter()
-        .map(|result| result.unwrap_or_else(|| item_error(default_error)))
-        .collect()
 }
 
 fn unique_token(prefix: &str) -> String {
@@ -3414,10 +3069,7 @@ mod tests {
     use alloy::primitives::U256;
     use serde_json::json;
 
-    use super::{
-        AdmissionAction, ExecutorItemError, RpcError, admission_action, parse_quantity,
-        response_quantity, should_notify_executor_deferred,
-    };
+    use super::{ExecutorItemError, RpcError, parse_quantity, response_quantity};
 
     #[test]
     fn parses_canonical_rpc_quantities_only() {
@@ -3452,22 +3104,5 @@ mod tests {
     fn executor_item_error_is_sendable() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<ExecutorItemError>();
-    }
-
-    #[test]
-    fn recovers_only_a_matching_unadmitted_queue_record() {
-        assert_eq!(admission_action(true, true), AdmissionAction::Execute);
-        assert_eq!(admission_action(false, true), AdmissionAction::Recover);
-        assert_eq!(admission_action(true, false), AdmissionAction::DeadLetter);
-        assert_eq!(admission_action(false, false), AdmissionAction::DeadLetter);
-    }
-
-    #[test]
-    fn alerts_only_for_executor_failures_not_expected_handoffs() {
-        assert!(should_notify_executor_deferred("execution"));
-        assert!(should_notify_executor_deferred("simulation"));
-        assert!(!should_notify_executor_deferred("lease"));
-        assert!(!should_notify_executor_deferred("funding"));
-        assert!(!should_notify_executor_deferred("simulation_deployment"));
     }
 }
