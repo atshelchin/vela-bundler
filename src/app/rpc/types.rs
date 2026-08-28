@@ -535,17 +535,9 @@ pub struct GasPriceTier {
     pub max_priority_fee_per_gas: Quantity,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UserOperationStatusKind {
-    NotFound,
-    Queued,
-    NotSubmitted,
-    Submitted,
-    Rejected,
-    Included,
-    Failed,
-}
+/// The status vocabulary is owned by the decision core; the shell re-exports
+/// it under its historical name so wire shapes and call sites are unchanged.
+pub use vela_relay_core::task::UserOperationStatus as UserOperationStatusKind;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct UserOperationStatus {

@@ -1,12 +1,20 @@
+//! String-facing adapter over the decision core's in-band settlement parsing.
+//!
+//! The RPC handlers speak hex strings and `u128`; the core speaks
+//! `Address`/`U256`. Everything business — MultiSend decoding, the trusted
+//! MultiSend gate, leg crediting, minimum amounts — lives in
+//! `vela_relay_core::settlement`; this module only converts representations.
+//! Amounts above `u128::MAX` saturate, preserving the RPC layer's historical
+//! wire behavior.
+
 use std::collections::{BTreeMap, BTreeSet};
 
-const EXECUTE_USER_OP_SELECTOR: [u8; 4] = [0x7b, 0xb3, 0x74, 0x28];
-const MULTISEND_SELECTOR: [u8; 4] = [0x8d, 0x80, 0xff, 0x0a];
-const ERC20_TRANSFER_SELECTOR: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
-const TRUSTED_MULTISEND: &str = "0x38869bf66a61cf6bdb996a6ae40d5853fd43b526";
+use alloy::primitives::{Address, U256};
+use vela_relay_core::settlement::{
+    MIN_NATIVE_FRACTION_DECIMALS, MIN_STABLE_FRACTION_DECIMALS, minimum_amount,
+};
 
-pub const MIN_NATIVE_FRACTION_DECIMALS: u32 = 5;
-pub const MIN_STABLE_FRACTION_DECIMALS: u32 = 2;
+pub use vela_relay_core::tempo::is_tempo_chain;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct InBandReimbursement {
@@ -18,7 +26,9 @@ pub struct InBandReimbursement {
 ///
 /// A transfer counts only when it is inside a `DELEGATECALL` to the canonical Safe
 /// MultiSend contract. This prevents a caller from presenting transfer-shaped bytes
-/// that do not actually execute against the Safe's balance.
+/// that do not actually execute against the Safe's balance. Malformed calldata,
+/// unknown recipients, and overflowing reimbursements all read as "nothing paid",
+/// exactly as the executor's evaluation treats them.
 pub fn parse_reimbursement(
     call_data: &str,
     recipient: &str,
@@ -32,61 +42,42 @@ pub fn parse_reimbursement(
     let Ok(recipient) = parse_address(recipient) else {
         return empty;
     };
-    let trusted_multisend = parse_address(TRUSTED_MULTISEND).expect("trusted MultiSend is valid");
     let stablecoin_allowlist = stablecoin_allowlist
         .into_iter()
         .filter_map(|address| parse_address(&address).ok())
+        .map(Address::from)
         .collect::<BTreeSet<_>>();
     let Ok(call_data) = decode_hex(call_data) else {
         return empty;
     };
-    let Some(entries) = decode_multisend_entries(&call_data, trusted_multisend) else {
-        return empty;
-    };
 
-    let mut reimbursement = empty;
-    for entry in entries {
-        if entry.operation != 0 {
-            continue;
-        }
-
-        if entry.to == recipient && entry.value > 0 {
-            reimbursement.native = reimbursement.native.saturating_add(entry.value);
-        }
-
-        if !stablecoin_allowlist.contains(&entry.to) {
-            continue;
-        }
-
-        let Some((transfer_recipient, amount)) = decode_erc20_transfer(&entry.data) else {
-            continue;
-        };
-        if transfer_recipient != recipient {
-            continue;
-        }
-
-        let address = format_address(entry.to);
-        let total = reimbursement.stablecoins.entry(address).or_default();
-        *total = total.saturating_add(amount);
+    match vela_relay_core::settlement::parse_reimbursement(
+        &call_data,
+        Address::from(recipient),
+        &stablecoin_allowlist,
+    ) {
+        Ok(reimbursement) => InBandReimbursement {
+            native: saturate_u128(reimbursement.native),
+            stablecoins: reimbursement
+                .stablecoins
+                .into_iter()
+                .map(|(token, amount)| (format_address(token.into()), saturate_u128(amount)))
+                .collect(),
+        },
+        Err(_) => empty,
     }
-
-    reimbursement
 }
 
 pub fn minimum_native_amount(native_decimals: u32) -> Option<u128> {
-    native_decimals
-        .checked_sub(MIN_NATIVE_FRACTION_DECIMALS)
-        .and_then(pow10)
+    minimum_amount(native_decimals, MIN_NATIVE_FRACTION_DECIMALS)
+        .ok()
+        .and_then(|value| u128::try_from(value).ok())
 }
 
 pub fn minimum_stablecoin_amount(token_decimals: u32) -> Option<u128> {
-    token_decimals
-        .checked_sub(MIN_STABLE_FRACTION_DECIMALS)
-        .and_then(pow10)
-}
-
-pub fn is_tempo_chain(chain_id: u64) -> bool {
-    matches!(chain_id, 4_217 | 42_431)
+    minimum_amount(token_decimals, MIN_STABLE_FRACTION_DECIMALS)
+        .ok()
+        .and_then(|value| u128::try_from(value).ok())
 }
 
 pub fn parse_address(value: &str) -> Result<[u8; 20], ()> {
@@ -108,105 +99,12 @@ pub fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
     hex::decode(value).map_err(|_| ())
 }
 
-fn decode_multisend_entries(
-    call_data: &[u8],
-    trusted_multisend: [u8; 20],
-) -> Option<Vec<MultiSendEntry>> {
-    let args = call_data.get(4..)?;
-    if call_data.get(..4)? != EXECUTE_USER_OP_SELECTOR {
-        return None;
-    }
-
-    let target = read_address_word(args, 0)?;
-    let data_offset = read_usize_word(args, 64)?;
-    let operation = read_u128_word(args, 96)?;
-    if target != trusted_multisend || operation != 1 {
-        return None;
-    }
-
-    let inner_data = read_dynamic_bytes(args, data_offset)?;
-    if inner_data.get(..4)? != MULTISEND_SELECTOR {
-        return None;
-    }
-
-    let inner_args = inner_data.get(4..)?;
-    let transaction_offset = read_usize_word(inner_args, 0)?;
-    let transactions = read_dynamic_bytes(inner_args, transaction_offset)?;
-
-    let mut entries = Vec::new();
-    let mut offset = 0;
-    while offset < transactions.len() {
-        let operation = *transactions.get(offset)?;
-        let to = transactions.get(offset + 1..offset + 21)?.try_into().ok()?;
-        let value = read_u128_word(transactions, offset + 21)?;
-        let data_length = read_usize_word(transactions, offset + 53)?;
-        let data_start = offset.checked_add(85)?;
-        let data_end = data_start.checked_add(data_length)?;
-        let data = transactions.get(data_start..data_end)?.to_vec();
-        entries.push(MultiSendEntry {
-            operation,
-            to,
-            value,
-            data,
-        });
-        offset = data_end;
-    }
-
-    Some(entries)
-}
-
-fn decode_erc20_transfer(data: &[u8]) -> Option<([u8; 20], u128)> {
-    if data.len() != 68 || data.get(..4)? != ERC20_TRANSFER_SELECTOR {
-        return None;
-    }
-
-    Some((read_address_word(data, 4)?, read_u128_word(data, 36)?))
-}
-
-fn read_dynamic_bytes(data: &[u8], offset: usize) -> Option<&[u8]> {
-    let length = read_usize_word(data, offset)?;
-    let start = offset.checked_add(32)?;
-    let end = start.checked_add(length)?;
-    data.get(start..end)
-}
-
-fn read_address_word(data: &[u8], offset: usize) -> Option<[u8; 20]> {
-    data.get(offset + 12..offset + 32)?.try_into().ok()
-}
-
-fn read_u128_word(data: &[u8], offset: usize) -> Option<u128> {
-    let word = data.get(offset..offset + 32)?;
-    let upper = word.get(..16)?;
-    if upper.iter().any(|byte| *byte != 0) {
-        return Some(u128::MAX);
-    }
-
-    Some(u128::from_be_bytes(word.get(16..32)?.try_into().ok()?))
-}
-
-fn read_usize_word(data: &[u8], offset: usize) -> Option<usize> {
-    let word = data.get(offset..offset + 32)?;
-    if word.get(..24)?.iter().any(|byte| *byte != 0) {
-        return None;
-    }
-
-    let value = u64::from_be_bytes(word.get(24..32)?.try_into().ok()?);
-    value.try_into().ok()
+fn saturate_u128(value: U256) -> u128 {
+    u128::try_from(value).unwrap_or(u128::MAX)
 }
 
 fn format_address(address: [u8; 20]) -> String {
     format!("0x{}", hex::encode(address))
-}
-
-fn pow10(exponent: u32) -> Option<u128> {
-    10u128.checked_pow(exponent)
-}
-
-struct MultiSendEntry {
-    operation: u8,
-    to: [u8; 20],
-    value: u128,
-    data: Vec<u8>,
 }
 
 mod hex {
@@ -246,10 +144,9 @@ mod hex {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TRUSTED_MULTISEND, minimum_native_amount, minimum_stablecoin_amount, parse_reimbursement,
-    };
+    use super::{minimum_native_amount, minimum_stablecoin_amount, parse_reimbursement};
 
+    const TRUSTED_MULTISEND: &str = "0x38869bf66a61cf6bdb996a6ae40d5853fd43b526";
     const RECIPIENT: &str = "0x1111111111111111111111111111111111111111";
     const STABLECOIN: &str = "0x2222222222222222222222222222222222222222";
 
@@ -346,7 +243,7 @@ mod tests {
     }
 
     fn address(value: &str) -> Vec<u8> {
-        decode_hex(value).unwrap()
+        super::decode_hex(value).unwrap()
     }
 
     fn word_address(value: &str) -> Vec<u8> {
@@ -363,10 +260,6 @@ mod tests {
 
     fn pad_to_word(data: &mut [u8]) {
         let _ = data;
-    }
-
-    fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
-        super::decode_hex(value)
     }
 
     fn encode_hex(value: &[u8]) -> String {

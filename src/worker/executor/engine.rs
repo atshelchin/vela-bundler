@@ -41,13 +41,13 @@ use crate::{
 use super::{
     abi::{PackedOperation, get_nonce_calldata, handle_ops_calldata, user_operation_hash},
     alert::TelegramAlertNotifier,
-    cost::{allocate_bundle_gas, native_cost},
+    cost::allocate_bundle_gas,
     deployment::SimulationContractDeployer,
     receipt::{receipt_succeeded, user_operation_events},
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
     settlement::{
-        ChainAssetConfig, SettlementEvaluation, SettlementInput, SettlementLog, StablecoinConfig,
-        USD_PRICE_DECIMALS, affordable_fee_per_gas, evaluate_batch, inclusion_floor_fee_per_gas,
+        ChainAssetConfig, FeeContext, SettlementDecision, SettlementEvaluation, SettlementLog,
+        StablecoinConfig, USD_PRICE_DECIMALS, decide_settlement, has_stablecoin_payment,
         parse_reimbursement, verify_stable_transfer_logs,
     },
     simulation::{SimulationResult, SimulationVerdict, simulate_bundle, simulate_individually},
@@ -1843,23 +1843,25 @@ impl ExecutorEngine {
                 return Ok(false);
             }
         };
-        if attempt > self.config.settlement_hold_max_attempts {
-            tracing::warn!(
-                chain_id,
-                user_operation_hash = %candidate.hash_string,
-                attempt,
-                paid = %evaluation.paid_amount,
-                required = %evaluation.required_amount,
-                "in-band reimbursement stayed unaffordable for the whole hold budget"
-            );
-            return Ok(false);
-        }
-        let reason = settlement_hold_reason(
-            evaluation.paid_amount,
-            evaluation.required_amount,
+        let reason = match vela_relay_core::hold::decide_hold(
             attempt,
             self.config.settlement_hold_max_attempts,
-        );
+            evaluation.paid_amount,
+            evaluation.required_amount,
+        ) {
+            vela_relay_core::hold::HoldDecision::RejectBudgetExhausted => {
+                tracing::warn!(
+                    chain_id,
+                    user_operation_hash = %candidate.hash_string,
+                    attempt,
+                    paid = %evaluation.paid_amount,
+                    required = %evaluation.required_amount,
+                    "in-band reimbursement stayed unaffordable for the whole hold budget"
+                );
+                return Ok(false);
+            }
+            vela_relay_core::hold::HoldDecision::Hold { reason } => reason,
+        };
         self.record_executor_deferred(
             chain_id,
             &candidate.hash_string,
@@ -1881,20 +1883,11 @@ impl ExecutorEngine {
         Ok(true)
     }
 
-    /// Settles the bundle at a fee the payers can actually fund.
-    ///
-    /// The quoted cap is `2 × base fee + tip`. That multiple buys inclusion headroom, not cost —
-    /// the chain only ever charges `base fee + tip` — so a reimbursement that falls short of the
-    /// requirement at the quoted cap is usually still a perfectly good payment at a lower one.
-    /// Rather than refuse a signature the user already gave, the executor treats that signed
-    /// reimbursement as the budget and reprices the outer transaction down into it, provided the
-    /// result still clears the inclusion floor. The markup survives untouched: the requirement is
-    /// linear in the cap, so paying `markup × gas × new cap` still covers `markup ×` whatever the
-    /// chain charges, which can never exceed the new cap.
-    ///
-    /// Repricing only ever lowers the cap, so an operation accepted at the quoted fee stays
-    /// accepted. Anything still short after this is genuinely unaffordable at the current market
-    /// and is held, not rejected — see the settlement gate in `execute_bundle`.
+    /// Settles the bundle at a fee the payers can actually fund. The verdict —
+    /// accept at the quote, reprice down to the signed budget, or keep the
+    /// quote for the hold/reject gate — is decided by
+    /// `vela_relay_core::settlement::decide_settlement`; this method only
+    /// pre-fetches the market price the decision needs and applies the result.
     async fn settle_at_affordable_fee(
         &self,
         chain_id: u64,
@@ -1904,112 +1897,64 @@ impl ExecutorEngine {
         allocations: &[U256],
         context: &mut TransactionContext,
     ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
-        let costs_at = |fee: u128| -> Result<Vec<U256>, ExecutorItemError> {
-            allocations
-                .iter()
-                .map(|gas| {
-                    native_cost(*gas, fee)
-                        .ok_or_else(|| ExecutorItemError("bundle native cost overflow".into()))
-                })
-                .collect()
-        };
-
-        let quoted_fee = context.max_fee_per_gas;
-        let settlement = self
-            .evaluate_settlement(
-                chain_id,
-                chain_assets,
-                native_symbol,
-                candidates,
-                &costs_at(quoted_fee)?,
-            )
-            .await?;
-        // Nothing to renegotiate, or a rejection no price can cure (malformed calldata, an
-        // unsupported asset): leave the quote alone and let the gate speak.
-        if settlement.all_accepted()
-            || settlement
-                .operations
-                .iter()
-                .any(|evaluation| !evaluation.accepted() && !evaluation.is_shortfall())
-        {
-            return Ok(settlement);
-        }
-
-        let Some(affordable) = affordable_fee_per_gas(quoted_fee, &settlement.operations) else {
-            return Ok(settlement);
-        };
-        let Some(floor) = inclusion_floor_fee_per_gas(
-            context.base_fee_per_gas,
-            context.max_priority_fee_per_gas,
-            self.config.settlement_inclusion_floor_bps,
-        ) else {
-            return Ok(settlement);
-        };
-        if affordable < floor || affordable >= quoted_fee {
-            tracing::info!(
-                chain_id,
-                quoted_fee,
-                affordable,
-                floor,
-                base_fee = context.base_fee_per_gas,
-                "in-band reimbursement cannot fund an includable outer fee"
-            );
-            return Ok(settlement);
-        }
-
-        let repriced = self
-            .evaluate_settlement(
-                chain_id,
-                chain_assets,
-                native_symbol,
-                candidates,
-                &costs_at(affordable)?,
-            )
-            .await?;
-        if !repriced.all_accepted() {
-            return Ok(settlement);
-        }
-        tracing::info!(
-            chain_id,
-            quoted_fee,
-            repriced_fee = affordable,
-            base_fee = context.base_fee_per_gas,
-            tip = context.max_priority_fee_per_gas,
-            "repriced the outer transaction to the signed in-band budget"
-        );
-        context.max_fee_per_gas = affordable;
-        Ok(repriced)
-    }
-
-    async fn evaluate_settlement(
-        &self,
-        chain_id: u64,
-        chain_assets: &ChainAssetConfig,
-        native_symbol: &str,
-        candidates: &[Candidate],
-        costs: &[U256],
-    ) -> Result<super::settlement::BatchSettlementEvaluation, ExecutorItemError> {
-        let inputs = candidates
+        let call_datas = candidates
             .iter()
-            .zip(costs)
-            .map(|(candidate, cost)| SettlementInput {
-                call_data: candidate.packed.call_data.as_ref(),
-                gas_native_cost: *cost,
-            })
-            .collect::<Vec<_>>();
+            .map(|candidate| candidate.packed.call_data.as_ref())
+            .collect::<Vec<&[u8]>>();
         let native_usd_price =
-            if has_stablecoin_payment(self.treasury_address, chain_assets, &inputs) {
+            if has_stablecoin_payment(self.treasury_address, chain_assets, &call_datas) {
                 Some(self.market_usd_price(chain_id, native_symbol).await?)
             } else {
                 None
             };
-        evaluate_batch(
+        let fees = FeeContext {
+            quoted_fee_per_gas: context.max_fee_per_gas,
+            base_fee_per_gas: context.base_fee_per_gas,
+            max_priority_fee_per_gas: context.max_priority_fee_per_gas,
+            inclusion_floor_bps: self.config.settlement_inclusion_floor_bps,
+        };
+        let decision = decide_settlement(
             self.treasury_address,
             chain_assets,
-            &inputs,
+            &call_datas,
+            allocations,
             native_usd_price,
+            &fees,
         )
-        .map_err(|error| ExecutorItemError(error.to_string()))
+        .map_err(|error| ExecutorItemError(error.to_string()))?;
+        match decision {
+            SettlementDecision::KeepQuote { evaluation } => Ok(evaluation),
+            SettlementDecision::FloorUnfundable {
+                evaluation,
+                affordable,
+                floor,
+            } => {
+                tracing::info!(
+                    chain_id,
+                    quoted_fee = fees.quoted_fee_per_gas,
+                    affordable,
+                    floor,
+                    base_fee = context.base_fee_per_gas,
+                    "in-band reimbursement cannot fund an includable outer fee"
+                );
+                Ok(evaluation)
+            }
+            SettlementDecision::Reprice {
+                fee_per_gas,
+                evaluation,
+            } => {
+                tracing::info!(
+                    chain_id,
+                    quoted_fee = fees.quoted_fee_per_gas,
+                    repriced_fee = fee_per_gas,
+                    base_fee = context.base_fee_per_gas,
+                    tip = context.max_priority_fee_per_gas,
+                    "repriced the outer transaction to the signed in-band budget"
+                );
+                context.max_fee_per_gas = fee_per_gas;
+                Ok(evaluation)
+            }
+        }
     }
 
     async fn market_usd_price(
@@ -3204,22 +3149,6 @@ impl UserOperationHandler for ExecutorEngine {
     }
 }
 
-fn has_stablecoin_payment(
-    recipient: Address,
-    chain_assets: &ChainAssetConfig,
-    inputs: &[SettlementInput<'_>],
-) -> bool {
-    let allowlist = chain_assets
-        .stablecoins
-        .keys()
-        .copied()
-        .collect::<BTreeSet<_>>();
-    inputs.iter().any(|input| {
-        parse_reimbursement(input.call_data, recipient, &allowlist)
-            .is_ok_and(|reimbursement| !reimbursement.stablecoins.is_empty())
-    })
-}
-
 /// Tempo's outer `0x76` gas limit deliberately comes from the UserOperations' declared limits,
 /// rather than `eth_estimateGas`: EntryPoint catches an inner OOG and an estimate can therefore
 /// succeed while a user's actual execution runs out of gas.
@@ -3398,13 +3327,7 @@ fn admission_action(admitted: bool, envelope_matches: bool) -> AdmissionAction {
 }
 
 fn is_durable_status(status: UserOperationStatusKind) -> bool {
-    matches!(
-        status,
-        UserOperationStatusKind::Submitted
-            | UserOperationStatusKind::Rejected
-            | UserOperationStatusKind::Included
-            | UserOperationStatusKind::Failed
-    )
+    status.is_durable()
 }
 
 fn item_error(message: &str) -> Result<(), UserOperationHandlerError> {
@@ -3492,29 +3415,9 @@ fn treasury_affordable_top_up(
     (amount >= deficit).then_some(amount)
 }
 
-/// The diagnostic a held operation carries while it waits. Deliberately distinct from
-/// `settlement_rejection_reason` — a wallet polling the status endpoint must be able to tell
-/// "still going, waiting for gas to come down" from "this will never execute".
-fn settlement_hold_reason(paid: U256, required: U256, attempt: u32, max_attempts: u32) -> String {
-    format!(
-        "waiting for network fees to fit the signed in-band reimbursement: paid={paid}, required={required}, shortfall={}, attempt={attempt}/{max_attempts}",
-        required.saturating_sub(paid)
-    )
-}
-
-fn settlement_rejection_reason(paid: U256, required: U256, stable_logs_valid: bool) -> String {
-    if paid < required {
-        format!(
-            "in-band reimbursement is below the required amount: paid={paid}, required={required}, shortfall={}",
-            required.saturating_sub(paid)
-        )
-    } else if !stable_logs_valid {
-        "in-band reimbursement transfer logs do not prove payment to the settlement recipient"
-            .into()
-    } else {
-        "in-band reimbursement was rejected".into()
-    }
-}
+// Settlement reason strings live in `vela_relay_core::settlement`; the hold
+// ladder and budget in `vela_relay_core::hold`.
+use vela_relay_core::settlement::settlement_rejection_reason;
 
 /// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
 /// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
@@ -3637,9 +3540,8 @@ mod tests {
     use super::{
         AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
         marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
-        parse_market_usd_price, parse_quantity, response_quantity, settlement_rejection_reason,
-        should_notify_executor_deferred, tempo_cost_in_path_usd, treasury_affordable_top_up,
-        validate_raw_transaction,
+        parse_market_usd_price, parse_quantity, response_quantity, should_notify_executor_deferred,
+        tempo_cost_in_path_usd, treasury_affordable_top_up, validate_raw_transaction,
     };
     use crate::utils::tempo;
 
@@ -3741,17 +3643,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn explains_an_insufficient_in_band_reimbursement() {
-        assert_eq!(
-            settlement_rejection_reason(
-                U256::from(105_959_625_000_000_000u64),
-                U256::from(111_625_968_750_000_000u64),
-                true,
-            ),
-            "in-band reimbursement is below the required amount: paid=105959625000000000, required=111625968750000000, shortfall=5666343750000000"
-        );
-    }
+    // `explains_an_insufficient_in_band_reimbursement` moved to
+    // `vela_relay_core::settlement` with the reason builders.
 
     #[test]
     fn batch_quantity_helper_distinguishes_errors_and_invalid_values() {

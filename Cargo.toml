@@ -1,3 +1,9 @@
+[workspace]
+members = ["vela-relay-core"]
+
+# The root package is the Shell: it wires business decisions made in the
+# `vela-relay-core` crate to real infrastructure (Axum, Redis, Iggy, EVM RPC,
+# Binance, Telegram). Business policy does not live here.
 [package]
 name = "vela-relay"
 version = "0.1.0"
@@ -9,6 +15,7 @@ path = "src/bin/deploy_simulations.rs"
 
 [dependencies]
 alloy = { version = "2.2.0", features = ["essentials"] }
+vela-relay-core = { path = "vela-relay-core" }
 axum = "0.8.9"
 dotenvy = "0.15"
 hex = "0.4"
