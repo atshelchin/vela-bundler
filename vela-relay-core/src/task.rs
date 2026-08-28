@@ -136,7 +136,7 @@ pub struct RoutedUserOperation {
     pub offset: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct QueuedUserOperation {
     pub user_operation_hash: String,
     pub chain_id: u64,
@@ -174,6 +174,29 @@ pub struct StoredUserOperation {
     pub last_executor_error: Option<String>,
     #[serde(default)]
     pub last_executor_attempt_at_ms: Option<u64>,
+}
+
+/// The initial stored record for a freshly queued operation — the shape both
+/// shells' create-if-absent writes persist (docker Redis SETNX, RecordDO
+/// put-if-absent). Frozen alongside the record shape itself.
+pub fn queued_record(operation: QueuedUserOperation, admitted: bool) -> StoredUserOperation {
+    StoredUserOperation {
+        status: UserOperationStatus::Queued,
+        transaction_hash: None,
+        chain_id: operation.chain_id,
+        chain_id_text: operation.chain_id.to_string(),
+        entry_point: operation.entry_point,
+        user_operation: operation.user_operation,
+        admitted,
+        next_receipt_check_at_ms: 0,
+        block_hash: None,
+        block_number: None,
+        receipt: None,
+        event: None,
+        last_executor_stage: None,
+        last_executor_error: None,
+        last_executor_attempt_at_ms: None,
+    }
 }
 
 /// A fully signed outer transaction persisted before its first broadcast.

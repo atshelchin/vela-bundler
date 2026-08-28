@@ -17,7 +17,7 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-worker = "=0.8.5"
+worker = { version = "=0.8.5", features = ["queue"] }
 vela-relay-core = { path = "../vela-relay-core" }
 crux_core = "0.19"
 serde = { version = "1", features = ["derive"] }

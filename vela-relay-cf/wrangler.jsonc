@@ -15,32 +15,32 @@
   "kv_namespaces": [
     { "binding": "CACHE", "id": "REPLACE_WITH_KV_NAMESPACE_ID" }
   ],
-  // --- Enabled by US1 (T008): the record store ---
-  // "durable_objects": {
-  //   "bindings": [
-  //     { "name": "RECORDS", "class_name": "RecordDo" },
-  //     { "name": "LANES", "class_name": "LaneDo" },       // US2 (T013)
-  //     { "name": "TREASURY", "class_name": "TreasuryDo" } // US2 (T016)
-  //   ]
-  // },
-  // "migrations": [
-  //   { "tag": "v1", "new_sqlite_classes": ["RecordDo", "LaneDo", "TreasuryDo"] }
-  // ],
-  // --- Enabled by US1 (T010, producer) and US2 (T013, consumer) ---
-  // "queues": {
-  //   "producers": [
-  //     { "binding": "OPS_QUEUE", "queue": "vela-relay-ops" }
-  //   ],
-  //   "consumers": [
-  //     {
-  //       "queue": "vela-relay-ops",
-  //       "max_batch_size": 20,
-  //       "max_batch_timeout": 2,
-  //       "max_retries": 100,
-  //       "dead_letter_queue": "vela-relay-dlq"
-  //     }
-  //   ]
-  // },
+  "durable_objects": {
+    "bindings": [
+      { "name": "RECORDS", "class_name": "RecordDo" }
+      // { "name": "LANES", "class_name": "LaneDo" },       // US2 (T013)
+      // { "name": "TREASURY", "class_name": "TreasuryDo" } // US2 (T016)
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RecordDo"] }
+    // US2 appends { "tag": "v2", "new_sqlite_classes": ["LaneDo", "TreasuryDo"] }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OPS_QUEUE", "queue": "vela-relay-ops" }
+    ]
+    // US2 (T013) adds the consumer:
+    // "consumers": [
+    //   {
+    //     "queue": "vela-relay-ops",
+    //     "max_batch_size": 20,
+    //     "max_batch_timeout": 2,
+    //     "max_retries": 100,
+    //     "dead_letter_queue": "vela-relay-dlq"
+    //   }
+    // ]
+  },
   "vars": {
     // Same validated policy values as the docker shell; parsed by src/config.rs
     // and injected into the core as data (Constitution II).

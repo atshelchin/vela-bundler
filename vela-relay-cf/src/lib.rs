@@ -10,4 +10,16 @@
 //! The crate is wasm-only; see `Cargo.toml` for the target gating rationale.
 
 #[cfg(target_arch = "wasm32")]
+mod admission;
+#[cfg(target_arch = "wasm32")]
+mod arms;
+#[cfg(target_arch = "wasm32")]
+mod config;
+#[cfg(target_arch = "wasm32")]
+mod http;
+#[cfg(target_arch = "wasm32")]
+mod proto;
+#[cfg(target_arch = "wasm32")]
+mod record_do;
+#[cfg(target_arch = "wasm32")]
 mod shell;

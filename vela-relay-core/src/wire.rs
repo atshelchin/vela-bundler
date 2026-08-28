@@ -570,6 +570,86 @@ fn empty_params() -> Value {
     Value::Array(Vec::new())
 }
 
+/// The status read model: which stored fields the status RPC exposes.
+/// Executor diagnostics are shown only while the operation is still pending
+/// or locally rejected — never once it is on-chain.
+pub fn rpc_status(record: &crate::task::StoredUserOperation) -> UserOperationStatus {
+    let exposes_executor_diagnostic = matches!(
+        record.status,
+        UserOperationStatusKind::Queued
+            | UserOperationStatusKind::NotSubmitted
+            | UserOperationStatusKind::Rejected
+    );
+    UserOperationStatus {
+        status: record.status,
+        transaction_hash: record.transaction_hash.clone(),
+        last_executor_stage: exposes_executor_diagnostic
+            .then(|| record.last_executor_stage.clone())
+            .flatten(),
+        last_executor_error: exposes_executor_diagnostic
+            .then(|| record.last_executor_error.clone())
+            .flatten(),
+        last_executor_attempt_at_ms: exposes_executor_diagnostic
+            .then_some(record.last_executor_attempt_at_ms)
+            .flatten(),
+    }
+}
+
+/// The ERC-7769 receipt read model over a stored record: `Some` only for
+/// `included` operations and on-chain rejections whose event reports failure,
+/// both requiring the persisted event + outer receipt.
+pub fn receipt_response(
+    user_operation_hash: &str,
+    record: &crate::task::StoredUserOperation,
+) -> Option<Value> {
+    let event = record.event.as_ref()?;
+    let receipt = record.receipt.as_ref()?;
+    match record.status {
+        UserOperationStatusKind::Included => {}
+        UserOperationStatusKind::Rejected if !event.success => {}
+        _ => return None,
+    }
+    let (sender, nonce, paymaster) = match &record.user_operation {
+        UserOperation::V0_7(user_operation) => (
+            user_operation.sender.clone(),
+            user_operation.nonce.clone(),
+            user_operation.paymaster.clone(),
+        ),
+        UserOperation::V0_6(user_operation) => (
+            user_operation.sender.clone(),
+            user_operation.nonce.clone(),
+            paymaster_from_v06(&user_operation.paymaster_and_data),
+        ),
+    };
+    // ERC-7769 exposes the logs associated with the UserOperation. The persisted outer receipt is
+    // the authoritative chain snapshot; returning its logs matches the existing vela-bundler
+    // formatter and is strictly more useful than silently returning an empty list.
+    let logs = receipt
+        .get("logs")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    Some(serde_json::json!({
+        "userOpHash": user_operation_hash,
+        "entryPoint": record.entry_point,
+        "sender": sender,
+        "nonce": nonce,
+        "paymaster": paymaster,
+        "actualGasCost": event.actual_gas_cost,
+        "actualGasUsed": event.actual_gas_used,
+        "success": event.success,
+        "reason": "0x",
+        "logs": logs,
+        "receipt": receipt,
+    }))
+}
+
+fn paymaster_from_v06(paymaster_and_data: &str) -> Option<String> {
+    let value = paymaster_and_data.strip_prefix("0x")?;
+    (value.len() >= 40).then(|| format!("0x{}", &value[..40]))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Value, json};
