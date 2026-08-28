@@ -147,8 +147,9 @@ mod tests {
 
     use super::receipt_response;
     use crate::app::StoredUserOperation;
-    use crate::app::rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7};
+    use crate::app::rpc::types::{UserOperation, UserOperationStatusKind};
     use vela_relay_core::task::UserOperationEvent;
+    use vela_relay_core::task::UserOperationV0_7;
 
     fn stored_operation(
         status: UserOperationStatusKind,

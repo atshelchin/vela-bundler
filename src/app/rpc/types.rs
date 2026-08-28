@@ -313,7 +313,7 @@ pub struct InBandGasQuoteRequest {
     pub safe_address: Address,
 }
 
-pub use vela_relay_core::task::{UserOperation, UserOperationV0_7};
+pub use vela_relay_core::task::UserOperation;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]

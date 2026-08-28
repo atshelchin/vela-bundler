@@ -9,6 +9,8 @@
 //!
 //! - [`task`] — shared vocabulary: the user-operation record, its status
 //!   enumeration, and the queue envelope.
+//! - [`admission`] — the two-phase eth_sendUserOperation program: validation,
+//!   durable record, queue append, admitted mark.
 //! - [`lifecycle`] — the single authoritative status transition table and the
 //!   patch/bundle-submission decisions every durable status write flows
 //!   through.
@@ -37,6 +39,7 @@
 //! clock, randomness, or the environment.
 
 pub mod abi;
+pub mod admission;
 pub mod alchemy;
 pub mod broadcast;
 pub mod cost;
