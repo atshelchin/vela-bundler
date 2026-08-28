@@ -89,6 +89,13 @@ production-shaped traffic (the eight JSON-RPC methods, `contracts/external-api.m
 Expected: byte-identical HTTP responses; identical stored lifecycle records;
 identical on-chain calldata for identical inputs.
 
+Partially verified 2026-08-28 with [replay-harness/](replay-harness/): local
+old-vs-new builds byte-identical across the HTTP surface, admission (accept,
+idempotent duplicate, every validation refusal), and the stored Redis record;
+the production endpoint matches on every deterministic read-only surface. The
+executor money path remains covered by the core Driver suite; an on-chain
+staging replay is the remaining full-Gate-6 step.
+
 ## Story completion map
 
 | Story | Done when |
