@@ -1,0 +1,7 @@
+# Copy to .dev.vars for `wrangler dev` (gitignored). No production secrets.
+VELA_RELAY_SETTLEMENT_RECIPIENT=0x00000000000000000000000000000000000000fe
+VELA_RELAY_RELAYER_COUNT=10
+VELA_RELAY_EXECUTOR_ENABLED=false
+VELA_RELAY_EXECUTION_CHAINS=
+# OPERATOR_SECRET=<throwaway dev key — required only when execution is enabled>
+# ALCHEMY_API_KEY=

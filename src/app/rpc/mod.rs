@@ -4,7 +4,6 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, HeaderName, HeaderValue},
 };
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::app::AppState;
@@ -16,8 +15,8 @@ pub(crate) use handlers::supported_entry_points::SUPPORTED_ENTRY_POINTS;
 
 use types::{
     EstimateUserOperationGasParams, GetInBandGasQuoteParams, GetUserOperationByHashParams,
-    GetUserOperationReceiptParams, GetUserOperationStatusParams, RpcError, RpcMethod, RpcRequest,
-    RpcResponse, SendUserOperationParams,
+    GetUserOperationReceiptParams, GetUserOperationStatusParams, RpcError, RpcMethod, RpcResponse,
+    SendUserOperationParams,
 };
 
 pub const RPC_DOMAIN_RESPONSE_HEADER: &str = "x-vela-rpc-domain";
@@ -30,24 +29,15 @@ pub async fn handle(
     Path(chain_id): Path<u64>,
     body: Bytes,
 ) -> RpcHttpResponse {
-    let request = match serde_json::from_slice::<RpcRequest>(&body) {
+    // Envelope parsing, version check, and method/params validation are the
+    // core's wire vocabulary (spec 002): both shells share these bytes.
+    let request = match vela_relay_core::wire::parse_envelope(&body) {
         Ok(request) => request,
-        Err(error) => {
-            return response(RpcResponse::error(
-                Value::Null,
-                RpcError::parse_error(error.to_string()),
-            ));
-        }
+        Err(error_response) => return response(error_response),
     };
 
-    if request.jsonrpc != "2.0" {
-        return response(RpcResponse::error(
-            request.id,
-            RpcError::invalid_request("`jsonrpc` must be \"2.0\""),
-        ));
-    }
-
-    let method = match validate_call(&request.method, request.params.clone()) {
+    let method = match vela_relay_core::wire::validate_call(&request.method, request.params.clone())
+    {
         Ok(method) => method,
         Err(error) => return response(RpcResponse::error(request.id, error)),
     };
@@ -199,47 +189,6 @@ fn response_with_rpc_domain(
     (headers, Json(response_body))
 }
 
-fn validate_call(method: &str, params: Value) -> Result<RpcMethod, RpcError> {
-    let method = RpcMethod::parse(method)?;
-
-    match method {
-        RpcMethod::SendUserOperation => parse_params::<SendUserOperationParams>(params)?,
-        RpcMethod::EstimateUserOperationGas => {
-            parse_params::<EstimateUserOperationGasParams>(params)?;
-        }
-        RpcMethod::GetUserOperationReceipt => {
-            parse_params::<GetUserOperationReceiptParams>(params)?;
-        }
-        RpcMethod::GetUserOperationByHash => {
-            parse_params::<GetUserOperationByHashParams>(params)?;
-        }
-        RpcMethod::SupportedEntryPoints | RpcMethod::GetUserOperationGasPrice => {
-            validate_empty_params(params)?;
-        }
-        RpcMethod::GetUserOperationStatus => {
-            parse_params::<GetUserOperationStatusParams>(params)?;
-        }
-        RpcMethod::GetInBandGasQuote => {
-            parse_params::<GetInBandGasQuoteParams>(params)?;
-        }
-    }
-
-    Ok(method)
-}
-
-fn parse_params<T: DeserializeOwned>(params: Value) -> Result<(), RpcError> {
-    serde_json::from_value::<T>(params)
-        .map(|_| ())
-        .map_err(|error| RpcError::invalid_params(error.to_string()))
-}
-
-fn validate_empty_params(params: Value) -> Result<(), RpcError> {
-    match params {
-        Value::Array(values) if values.is_empty() => Ok(()),
-        _ => Err(RpcError::invalid_params("expected an empty parameter list")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use axum::{
@@ -251,10 +200,9 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use super::{
-        RPC_DOMAIN_RESPONSE_HEADER, RpcResponse, handle, response_with_rpc_domain, validate_call,
-    };
+    use super::{RPC_DOMAIN_RESPONSE_HEADER, RpcResponse, handle, response_with_rpc_domain};
     use crate::app::AppState;
+    use vela_relay_core::wire::validate_call;
 
     fn router() -> Router {
         Router::new()

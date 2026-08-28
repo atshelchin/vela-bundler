@@ -54,3 +54,4 @@ pub mod signing;
 pub mod task;
 pub mod tempo;
 pub mod vault;
+pub mod wire;
