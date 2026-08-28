@@ -146,8 +146,9 @@ mod tests {
     use serde_json::json;
 
     use super::receipt_response;
+    use crate::app::StoredUserOperation;
     use crate::app::rpc::types::{UserOperation, UserOperationStatusKind, UserOperationV0_7};
-    use crate::app::{StoredUserOperation, UserOperationEvent};
+    use vela_relay_core::task::UserOperationEvent;
 
     fn stored_operation(
         status: UserOperationStatusKind,

@@ -386,14 +386,7 @@ pub struct ClaimedDelayedUserOperation {
     pub operation: DelayedUserOperation,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct UserOperationEvent {
-    pub user_operation_hash: String,
-    pub success: bool,
-    pub actual_gas_cost: String,
-    pub actual_gas_used: String,
-}
+pub use vela_relay_core::task::UserOperationEvent;
 
 /// A fully signed outer transaction persisted before its first broadcast.
 ///

@@ -7,7 +7,17 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-alloy = { version = "2.2.0", default-features = false, features = ["sol-types"] }
+# Computation-only alloy features: ABI/sol types, transaction consensus
+# encoding, EIP structs, and local (in-process) signing math. No providers,
+# no transports.
+alloy = { version = "2.2.0", default-features = false, features = [
+    "consensus",
+    "eips",
+    "network",
+    "serde",
+    "signer-local",
+    "sol-types",
+] }
 anyhow = "1"
 crux_core = "0.19"
 hex = "0.4"

@@ -6,6 +6,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::{Display, Formatter},
+    str::FromStr,
 };
 
 use alloy::primitives::{Address, B256, Bytes, U256, address, aliases::U512, keccak256};
@@ -630,6 +631,61 @@ fn narrow_u512(value: U512) -> Result<U256, SettlementError> {
         return Err(SettlementError::ArithmeticOverflow);
     }
     Ok(U256::from_limbs([limbs[0], limbs[1], limbs[2], limbs[3]]))
+}
+
+/// One USD in the 8-decimal fixed-point representation used across settlement
+/// pricing (`10^USD_PRICE_DECIMALS`).
+pub const USD_PRICE_SCALE: u64 = 100_000_000;
+
+/// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
+/// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
+pub fn parse_market_usd_price(value: &str) -> Option<U256> {
+    let value = value.trim();
+    let mut parts = value.split('.');
+    let whole = parts.next()?;
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+
+    let scale = U256::from(USD_PRICE_SCALE);
+    let whole = U256::from_str(whole).ok()?.checked_mul(scale)?;
+    let kept = &fraction[..fraction.len().min(USD_PRICE_DECIMALS as usize)];
+    let fraction_value = if kept.is_empty() {
+        U256::ZERO
+    } else {
+        U256::from_str(kept)
+            .ok()?
+            .checked_mul(U256::from(10u8).pow(U256::from(USD_PRICE_DECIMALS - kept.len() as u32)))?
+    };
+    let mut price = whole.checked_add(fraction_value)?;
+    if value
+        .split_once('.')
+        .is_some_and(|(_, fraction)| fraction.len() > USD_PRICE_DECIMALS as usize)
+        && value.split_once('.').is_some_and(|(_, fraction)| {
+            fraction[USD_PRICE_DECIMALS as usize..]
+                .bytes()
+                .any(|byte| byte != b'0')
+        })
+    {
+        price = price.checked_add(U256::ONE)?;
+    }
+    (!price.is_zero()).then_some(price)
+}
+
+/// The Tempo in-band requirement: markup applied with ceiling rounding, then
+/// the same $0.01 minimum used by the generic stablecoin settlement path.
+/// `None` on overflow.
+pub fn marked_tempo_cost(cost: U256, markup_bps: u64) -> Option<U256> {
+    let numerator = cost.checked_mul(U256::from(markup_bps))?;
+    let denominator = U256::from(10_000u64);
+    let marked = (numerator / denominator)
+        .checked_add(U256::from(u8::from(!(numerator % denominator).is_zero())))?;
+    Some(marked.max(U256::from(10u128.pow(crate::tempo::PATH_USD_DECIMALS - 2))))
 }
 
 /// Whether any operation in the batch pays its reimbursement in an allowlisted
@@ -1422,6 +1478,47 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, SettlementDecisionError::CostOverflow);
         assert_eq!(error.to_string(), "bundle native cost overflow");
+    }
+
+    #[test]
+    fn parses_binance_native_usd_prices_with_bundler_favourable_rounding() {
+        use super::parse_market_usd_price;
+        assert_eq!(
+            parse_market_usd_price("3024.12"),
+            Some(U256::from(302_412_000_000u64))
+        );
+        assert_eq!(
+            parse_market_usd_price("1.0000000001"),
+            Some(U256::from(100_000_001u64))
+        );
+        for invalid in ["", "0", "-1", "1e3", "1.2.3"] {
+            assert_eq!(parse_market_usd_price(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn prices_tempo_path_usd_with_ceiling_and_the_default_one_point_four_x_gate() {
+        use super::marked_tempo_cost;
+        use crate::tempo;
+        // 100,000 gas at Tempo's 20e9 attodollar base fee is exactly 0.002 pathUSD.
+        assert_eq!(
+            tempo::tempo_cost_in_path_usd(
+                U256::from(100_000u64),
+                U256::from(tempo::TEMPO_BASE_FEE_ATTO),
+            )
+            .unwrap(),
+            U256::from(2_000u64)
+        );
+        // The normal in-band 1.4x markup still applies, then the common $0.01 floor protects
+        // micro-transactions from consuming a relayer float for a dust reimbursement.
+        assert_eq!(
+            marked_tempo_cost(U256::from(2_000u64), 14_000).unwrap(),
+            U256::from(10_000u64)
+        );
+        assert_eq!(
+            marked_tempo_cost(U256::from(20_000u64), 14_000).unwrap(),
+            U256::from(28_000u64)
+        );
     }
 
     #[test]

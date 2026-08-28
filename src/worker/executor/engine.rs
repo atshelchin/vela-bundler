@@ -47,8 +47,8 @@ use super::{
     rpc::{BroadcastOutcome, RpcBatchCall, RpcError, TrustedRpcClient},
     settlement::{
         ChainAssetConfig, FeeContext, SettlementDecision, SettlementEvaluation, SettlementLog,
-        StablecoinConfig, USD_PRICE_DECIMALS, decide_settlement, has_stablecoin_payment,
-        parse_reimbursement, verify_stable_transfer_logs,
+        StablecoinConfig, decide_settlement, has_stablecoin_payment, parse_reimbursement,
+        verify_stable_transfer_logs,
     },
     simulation::{SimulationResult, SimulationVerdict, simulate_bundle, simulate_individually},
     transaction::{
@@ -57,14 +57,10 @@ use super::{
 };
 
 const BROADCAST_RETRY_INTERVAL: Duration = Duration::from_secs(30);
-const TOP_UP_GAS_LIMIT: u64 = 21_000;
 const RECEIPT_RECONCILE_FAILURE_DELAY: Duration = Duration::from_secs(1);
 const DELAYED_CLAIM_BATCH_SIZE: usize = 100;
 const DELAYED_CLAIM_TTL_MIN: Duration = Duration::from_secs(2 * 60);
 const BINANCE_PRICE_TTL: Duration = Duration::from_secs(60);
-const USD_PRICE_SCALE: u64 = 100_000_000;
-const NATIVE_TOP_UP_USD_CAP: u64 = 20;
-const TEMPO_TOP_UP_GAS_BUFFER_BPS: u64 = 12_000;
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
 
 static LEASE_TOKEN_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -2628,13 +2624,12 @@ impl ExecutorEngine {
             return Ok(FundingReadiness::Pending);
         }
 
-        let target = required_prefund.max(U256::from(tempo::TEMPO_FLOAT_TARGET));
-        let amount = target
-            .checked_sub(relayer_balance)
-            .ok_or_else(|| ExecutorItemError("Tempo relayer funding amount underflow".into()))?;
-        if amount.is_zero() {
+        let Some(amount) =
+            vela_relay_core::funding::plan_tempo_top_up(relayer_balance, required_prefund)
+                .map_err(|_| ExecutorItemError("Tempo relayer funding amount underflow".into()))?
+        else {
             return Ok(FundingReadiness::Ready);
-        }
+        };
         let amount_u128 = u128::try_from(amount)
             .map_err(|_| ExecutorItemError("Tempo relayer top-up exceeds uint128".into()))?;
         let transfer_calldata = tempo::path_usd_transfer_calldata(relayer, amount);
@@ -2669,15 +2664,16 @@ impl ExecutorEngine {
         let nonce = u64::try_from(response_quantity(&responses, 0, "Tempo treasury nonce")?)
             .map_err(|_| ExecutorItemError("Tempo treasury nonce exceeds uint64".into()))?;
         let treasury_balance = response_abi_u256(&responses, 1, "Tempo treasury pathUSD balance")?;
-        let top_up_gas_limit = u64::try_from(response_quantity(
+        let estimated_gas = u64::try_from(response_quantity(
             &responses,
             2,
             "Tempo pathUSD top-up eth_estimateGas",
         )?)
-        .map_err(|_| ExecutorItemError("Tempo pathUSD top-up gas estimate exceeds uint64".into()))?
-        .checked_mul(TEMPO_TOP_UP_GAS_BUFFER_BPS)
-        .map(|value| value / 10_000)
-        .ok_or_else(|| ExecutorItemError("Tempo pathUSD top-up gas buffer overflow".into()))?;
+        .map_err(|_| {
+            ExecutorItemError("Tempo pathUSD top-up gas estimate exceeds uint64".into())
+        })?;
+        let top_up_gas_limit = tempo::buffered_top_up_gas_limit(estimated_gas)
+            .ok_or_else(|| ExecutorItemError("Tempo pathUSD top-up gas buffer overflow".into()))?;
         let top_up_gas_cost =
             tempo_cost_in_path_usd(U256::from(top_up_gas_limit), U256::from(max_fee_per_gas))?;
         let required_treasury = amount
@@ -2830,26 +2826,16 @@ impl ExecutorEngine {
             return Ok(FundingReadiness::Pending);
         }
 
-        let target_from_cost = required_prefund
-            .checked_mul(U256::from(self.config.relayer_float_cost_multiplier))
-            .ok_or_else(|| ExecutorItemError("relayer float target overflow".into()))?;
-        let target = target_from_cost
-            .max(U256::from(self.config.relayer_float_target_wei))
-            .max(U256::from(self.config.relayer_float_min_wei));
-        let desired_amount = target
-            .checked_sub(relayer_balance)
-            .ok_or_else(|| ExecutorItemError("relayer funding amount underflow".into()))?;
-        let deficit = required_prefund
-            .checked_sub(relayer_balance)
-            .ok_or_else(|| ExecutorItemError("relayer funding deficit underflow".into()))?;
-        if deficit > top_up_max {
-            return Err(ExecutorItemError(format!(
-                "current UserOperation prefund exceeds the per-transfer cap: deficit={deficit}, cap={top_up_max}"
-            )));
-        }
-        // A float target may be much larger than one bundle. Cap the discretionary part instead
-        // of deferring an otherwise fundable operation.
-        let capped_amount = desired_amount.min(top_up_max);
+        let plan = plan_native_top_up(
+            relayer_balance,
+            required_prefund,
+            self.config.relayer_float_cost_multiplier,
+            self.config.relayer_float_target_wei,
+            self.config.relayer_float_min_wei,
+            top_up_max,
+        )
+        .map_err(|error| ExecutorItemError(error.to_string()))?;
+        let (capped_amount, deficit) = (plan.amount_capped, plan.deficit);
 
         let calls = [
             RpcBatchCall {
@@ -2873,12 +2859,10 @@ impl ExecutorEngine {
         )?)
         .map_err(|_| ExecutorItemError("treasury nonce exceeds uint64".into()))?;
         let treasury_balance = response_quantity(&responses, 1, "treasury eth_getBalance")?;
-        let top_up_gas_cost = U256::from(TOP_UP_GAS_LIMIT)
-            .checked_mul(U256::from(max_fee_per_gas))
-            .ok_or_else(|| ExecutorItemError("top-up gas cost overflow".into()))?;
-        let protected_treasury = top_up_gas_cost
-            .checked_add(U256::from(self.config.treasury_floor_wei))
-            .ok_or_else(|| ExecutorItemError("treasury reserve requirement overflow".into()))?;
+        let protected_treasury =
+            native_top_up_reserve(max_fee_per_gas, self.config.treasury_floor_wei)
+                .map_err(|error| ExecutorItemError(error.to_string()))?;
+        let top_up_gas_cost = protected_treasury - U256::from(self.config.treasury_floor_wei);
         // If the treasury can satisfy this bundle but not the preferred float, make a partial
         // top-up. The next bundle will replenish the float when more treasury funds arrive.
         let Some(amount) = treasury_affordable_top_up(
@@ -3178,30 +3162,21 @@ fn tempo_handle_ops_gas_limit(candidates: &[Candidate]) -> Result<u64, ExecutorI
 /// Converts Tempo's `attodollars/gas` price to micro-pathUSD, always rounding up so the relay
 /// never accepts an in-band reimbursement below the cost it is about to front.
 fn tempo_cost_in_path_usd(gas: U256, price_atto: U256) -> Result<U256, ExecutorItemError> {
-    let numerator = gas
-        .checked_mul(price_atto)
-        .and_then(|value| {
-            value.checked_mul(U256::from(10u8).pow(U256::from(tempo::PATH_USD_DECIMALS)))
-        })
-        .ok_or_else(|| ExecutorItemError("Tempo pathUSD cost overflow".into()))?;
-    let denominator = U256::from(10u8).pow(U256::from(18u8));
-    let quotient = numerator / denominator;
-    let remainder = numerator % denominator;
-    quotient
-        .checked_add(U256::from(u8::from(!remainder.is_zero())))
+    tempo::tempo_cost_in_path_usd(gas, price_atto)
         .ok_or_else(|| ExecutorItemError("Tempo pathUSD cost overflow".into()))
 }
 
 fn marked_tempo_cost(cost: U256, markup_bps: u64) -> Result<U256, ExecutorItemError> {
-    let numerator = cost
-        .checked_mul(U256::from(markup_bps))
-        .ok_or_else(|| ExecutorItemError("Tempo settlement markup overflow".into()))?;
-    let denominator = U256::from(10_000u64);
-    let marked = (numerator / denominator)
-        .checked_add(U256::from(u8::from(!(numerator % denominator).is_zero())))
-        .ok_or_else(|| ExecutorItemError("Tempo settlement markup overflow".into()))?;
-    // Keep the same $0.01 minimum used by the generic stablecoin settlement path.
-    Ok(marked.max(U256::from(10u128.pow(tempo::PATH_USD_DECIMALS - 2))))
+    vela_relay_core::settlement::marked_tempo_cost(cost, markup_bps)
+        .ok_or_else(|| ExecutorItemError("Tempo settlement markup overflow".into()))
+}
+
+fn validate_raw_transaction(
+    raw_transaction: &str,
+    transaction_hash: &str,
+) -> Result<Vec<u8>, ExecutorItemError> {
+    vela_relay_core::broadcast::validate_raw_transaction(raw_transaction, transaction_hash)
+        .map_err(|error| ExecutorItemError(error.to_string()))
 }
 
 fn candidate_from_record(
@@ -3399,115 +3374,17 @@ fn parse_quantity(value: &str) -> Option<U256> {
     U256::from_str_radix(digits, 16).ok()
 }
 
-fn nonce_too_low(reason: &str) -> bool {
-    reason.to_ascii_lowercase().contains("nonce too low")
-}
-
-/// Returns a full or partial float top-up only when the treasury can still cover the immediate
-/// UserOperation prefund after reserving this transfer's gas and the configured floor.
-fn treasury_affordable_top_up(
-    capped_amount: U256,
-    deficit: U256,
-    treasury_balance: U256,
-    protected_treasury: U256,
-) -> Option<U256> {
-    let amount = capped_amount.min(treasury_balance.saturating_sub(protected_treasury));
-    (amount >= deficit).then_some(amount)
-}
-
 // Settlement reason strings live in `vela_relay_core::settlement`; the hold
-// ladder and budget in `vela_relay_core::hold`.
-use vela_relay_core::settlement::settlement_rejection_reason;
-
-/// Converts Binance's decimal `SYMBOLUSDT` quote into an 8-decimal USD fixed-point value.
-/// Extra precision rounds upward so a stablecoin reimbursement never undercharges the relay.
-fn parse_market_usd_price(value: &str) -> Option<U256> {
-    let value = value.trim();
-    let mut parts = value.split('.');
-    let whole = parts.next()?;
-    let fraction = parts.next().unwrap_or_default();
-    if parts.next().is_some()
-        || whole.is_empty()
-        || !whole.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let scale = U256::from(USD_PRICE_SCALE);
-    let whole = U256::from_str(whole).ok()?.checked_mul(scale)?;
-    let kept = &fraction[..fraction.len().min(USD_PRICE_DECIMALS as usize)];
-    let fraction = if kept.is_empty() {
-        U256::ZERO
-    } else {
-        U256::from_str(kept)
-            .ok()?
-            .checked_mul(U256::from(10u8).pow(U256::from(USD_PRICE_DECIMALS - kept.len() as u32)))?
-    };
-    let mut price = whole.checked_add(fraction)?;
-    if value
-        .split_once('.')
-        .is_some_and(|(_, fraction)| fraction.len() > USD_PRICE_DECIMALS as usize)
-        && value.split_once('.').is_some_and(|(_, fraction)| {
-            fraction[USD_PRICE_DECIMALS as usize..]
-                .bytes()
-                .any(|byte| byte != b'0')
-        })
-    {
-        price = price.checked_add(U256::ONE)?;
-    }
-    (!price.is_zero()).then_some(price)
-}
-
-/// Convert a USD-denominated relayer funding cap into a chain's smallest native unit,
-/// rounding up so a positive USD cap never becomes zero through integer division.
-fn native_amount_for_usd_cap(
-    native_decimals: u32,
-    native_usd_price: U256,
-    usd_cap: u64,
-) -> Option<U256> {
-    if native_usd_price.is_zero() || native_decimals > 38 {
-        return None;
-    }
-    let native_scale =
-        (0..native_decimals).try_fold(U256::ONE, |value, _| value.checked_mul(U256::from(10u8)))?;
-    let numerator = U256::from(usd_cap)
-        .checked_mul(U256::from(USD_PRICE_SCALE))?
-        .checked_mul(native_scale)?;
-    let quotient = numerator / native_usd_price;
-    let remainder = numerator % native_usd_price;
-    quotient.checked_add(U256::from(u8::from(!remainder.is_zero())))
-}
-
-fn parse_hex_bytes(value: &str) -> Option<Bytes> {
-    let digits = value.strip_prefix("0x")?;
-    if !digits.len().is_multiple_of(2) {
-        return None;
-    }
-    hex::decode(digits).ok().map(Into::into)
-}
-
-fn validate_raw_transaction(
-    raw_transaction: &str,
-    transaction_hash: &str,
-) -> Result<Vec<u8>, ExecutorItemError> {
-    let raw = parse_hex_bytes(raw_transaction)
-        .filter(|raw| !raw.is_empty())
-        .ok_or_else(|| ExecutorItemError("prepared raw transaction is invalid".into()))?;
-    if !matches!(raw.first(), Some(0x02 | 0x76)) {
-        return Err(ExecutorItemError(
-            "prepared transaction is not a supported type 0x02 or Tempo type 0x76".into(),
-        ));
-    }
-    let expected = B256::from_str(transaction_hash)
-        .map_err(|_| ExecutorItemError("prepared transaction hash is invalid".into()))?;
-    if alloy::primitives::keccak256(&raw) != expected {
-        return Err(ExecutorItemError(
-            "prepared transaction hash does not match raw bytes".into(),
-        ));
-    }
-    Ok(raw.to_vec())
-}
+// ladder and budget in `vela_relay_core::hold`; broadcast judgement and
+// funding policy in their core modules.
+use vela_relay_core::broadcast::{nonce_too_low, parse_hex_bytes};
+use vela_relay_core::funding::{
+    NATIVE_TOP_UP_USD_CAP, TOP_UP_GAS_LIMIT, native_amount_for_usd_cap, native_top_up_reserve,
+    plan_native_top_up, treasury_affordable_top_up,
+};
+use vela_relay_core::settlement::{
+    USD_PRICE_SCALE, parse_market_usd_price, settlement_rejection_reason,
+};
 
 fn failure_results(count: usize, message: &str) -> UserOperationBatchResults {
     (0..count).map(|_| item_error(message)).collect()
@@ -3534,16 +3411,13 @@ fn unique_token(prefix: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{B256, U256};
+    use alloy::primitives::U256;
     use serde_json::json;
 
     use super::{
-        AdmissionAction, ExecutorItemError, NATIVE_TOP_UP_USD_CAP, RpcError, admission_action,
-        marked_tempo_cost, native_amount_for_usd_cap, nonce_too_low, parse_hex_bytes,
-        parse_market_usd_price, parse_quantity, response_quantity, should_notify_executor_deferred,
-        tempo_cost_in_path_usd, treasury_affordable_top_up, validate_raw_transaction,
+        AdmissionAction, ExecutorItemError, RpcError, admission_action, parse_quantity,
+        response_quantity, should_notify_executor_deferred,
     };
-    use crate::utils::tempo;
 
     #[test]
     fn parses_canonical_rpc_quantities_only() {
@@ -3555,96 +3429,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parses_binance_native_usd_prices_with_bundler_favourable_rounding() {
-        assert_eq!(
-            parse_market_usd_price("3024.12"),
-            Some(U256::from(302_412_000_000u64))
-        );
-        assert_eq!(
-            parse_market_usd_price("1.0000000001"),
-            Some(U256::from(100_000_001u64))
-        );
-        for invalid in ["", "0", "-1", "1e3", "1.2.3"] {
-            assert_eq!(parse_market_usd_price(invalid), None, "{invalid}");
-        }
-    }
-
-    #[test]
-    fn converts_twenty_usd_top_up_cap_to_native_units_with_ceiling_rounding() {
-        // MATIC at $0.20: $20 is exactly 100 MATIC.
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(20_000_000u64), NATIVE_TOP_UP_USD_CAP),
-            Some(U256::from(100_000_000_000_000_000_000u128))
-        );
-        // ETH at $2,500: $20 is 0.008 ETH.
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(250_000_000_000u64), NATIVE_TOP_UP_USD_CAP,),
-            Some(U256::from(8_000_000_000_000_000u64))
-        );
-        // A non-integral conversion is rounded toward the relayer.
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::from(300_000_000u64), NATIVE_TOP_UP_USD_CAP),
-            Some(U256::from(6_666_666_666_666_666_667u128))
-        );
-        assert_eq!(
-            native_amount_for_usd_cap(18, U256::ZERO, NATIVE_TOP_UP_USD_CAP),
-            None
-        );
-        assert_eq!(
-            native_amount_for_usd_cap(39, U256::ONE, NATIVE_TOP_UP_USD_CAP),
-            None
-        );
-    }
-
-    #[test]
-    fn recognizes_a_nonce_too_low_broadcast_diagnostic() {
-        assert!(nonce_too_low(
-            "RPC code -32000: nonce too low: next nonce 1, tx nonce 0"
-        ));
-        assert!(nonce_too_low("NONCE TOO LOW"));
-        assert!(!nonce_too_low("replacement transaction underpriced"));
-    }
-
-    #[test]
-    fn funds_the_current_bundle_when_the_preferred_float_is_not_affordable() {
-        let protected = U256::from(100_231_000_000_000u64);
-        // 0.011971738426977855 ETH in the treasury can still pay the requested 0.002 ETH
-        // float after retaining the 0.0001 ETH floor and the transfer gas.
-        assert_eq!(
-            treasury_affordable_top_up(
-                U256::from(2_000_000_000_000_000u64),
-                U256::from(1_000_000_000_000_000u64),
-                U256::from(11_971_738_426_977_855u64),
-                protected,
-            ),
-            Some(U256::from(2_000_000_000_000_000u64))
-        );
-
-        // A tight treasury is allowed to provide a reduced float as long as this operation's
-        // exact deficit remains covered.
-        assert_eq!(
-            treasury_affordable_top_up(
-                U256::from(2_000u64),
-                U256::from(1_000u64),
-                U256::from(1_500u64),
-                U256::ZERO,
-            ),
-            Some(U256::from(1_500u64))
-        );
-        assert_eq!(
-            treasury_affordable_top_up(
-                U256::from(2_000u64),
-                U256::from(1_000u64),
-                U256::from(999u64),
-                U256::ZERO,
-            ),
-            None
-        );
-    }
-
-    // `explains_an_insufficient_in_band_reimbursement` moved to
-    // `vela_relay_core::settlement` with the reason builders.
+    // Money-math and broadcast-judgement tests moved to `vela_relay_core`
+    // (settlement, funding, broadcast) with their functions.
 
     #[test]
     fn batch_quantity_helper_distinguishes_errors_and_invalid_values() {
@@ -3660,39 +3446,6 @@ mod tests {
         assert!(response_quantity(&responses, 1, "eth_test").is_err());
         assert!(response_quantity(&responses, 2, "eth_test").is_err());
         assert!(response_quantity(&responses, 3, "eth_test").is_err());
-    }
-
-    #[test]
-    fn validates_raw_transaction_type_and_hash() {
-        let raw = [0x02, 0x01, 0x02, 0x03];
-        let hash = alloy::primitives::keccak256(raw).to_string();
-        assert_eq!(validate_raw_transaction("0x02010203", &hash).unwrap(), raw);
-        assert!(validate_raw_transaction("0x01010203", &hash).is_err());
-        assert!(validate_raw_transaction("0x02010203", &B256::ZERO.to_string()).is_err());
-        assert!(parse_hex_bytes("0x1").is_none());
-    }
-
-    #[test]
-    fn prices_tempo_path_usd_with_ceiling_and_the_default_one_point_four_x_gate() {
-        // 100,000 gas at Tempo's 20e9 attodollar base fee is exactly 0.002 pathUSD.
-        assert_eq!(
-            tempo_cost_in_path_usd(
-                U256::from(100_000u64),
-                U256::from(tempo::TEMPO_BASE_FEE_ATTO),
-            )
-            .unwrap(),
-            U256::from(2_000u64)
-        );
-        // The normal in-band 1.4x markup still applies, then the common $0.01 floor protects
-        // micro-transactions from consuming a relayer float for a dust reimbursement.
-        assert_eq!(
-            marked_tempo_cost(U256::from(2_000u64), 14_000).unwrap(),
-            U256::from(10_000u64)
-        );
-        assert_eq!(
-            marked_tempo_cost(U256::from(20_000u64), 14_000).unwrap(),
-            U256::from(28_000u64)
-        );
     }
 
     #[test]

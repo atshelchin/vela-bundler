@@ -24,7 +24,7 @@ pub use state::{AppState, Readiness};
 pub use user_operation_store::{
     ClaimedDelayedUserOperation, DelayedUserOperation, PreparedBundleIntent, PreparedFundingIntent,
     PreparedSimulationDeploymentIntent, QueuedUserOperation, StoredUserOperation,
-    UserOperationEvent, UserOperationStatusStore,
+    UserOperationStatusStore,
 };
 
 use crate::utils::config::HttpConfig;

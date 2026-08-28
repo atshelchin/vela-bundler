@@ -33,3 +33,26 @@ pub fn path_usd_balance_calldata(account: Address) -> alloy::primitives::Bytes {
 pub fn path_usd_transfer_calldata(to: Address, amount: U256) -> alloy::primitives::Bytes {
     IERC20Tempo::transferCall { to, amount }.abi_encode().into()
 }
+
+/// Buffer applied to a pathUSD top-up `eth_estimateGas` result.
+pub const TEMPO_TOP_UP_GAS_BUFFER_BPS: u64 = 12_000;
+
+/// Applies [`TEMPO_TOP_UP_GAS_BUFFER_BPS`] to a gas estimate; `None` on
+/// overflow.
+pub fn buffered_top_up_gas_limit(estimated_gas: u64) -> Option<u64> {
+    estimated_gas
+        .checked_mul(TEMPO_TOP_UP_GAS_BUFFER_BPS)
+        .map(|value| value / 10_000)
+}
+
+/// Converts a gas cost quoted in attodollars per gas into micro-pathUSD,
+/// rounding up. `None` on overflow.
+pub fn tempo_cost_in_path_usd(gas: U256, price_atto: U256) -> Option<U256> {
+    let numerator = gas
+        .checked_mul(price_atto)?
+        .checked_mul(U256::from(10u8).pow(U256::from(PATH_USD_DECIMALS)))?;
+    let denominator = U256::from(10u8).pow(U256::from(18u8));
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    quotient.checked_add(U256::from(u8::from(!remainder.is_zero())))
+}

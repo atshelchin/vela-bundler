@@ -20,6 +20,14 @@
 //! - [`settlement`] — in-band settlement: reimbursement parsing, evaluation,
 //!   repricing, and the accept/reprice/keep verdict.
 //! - [`cost`] — deterministic bundle gas allocation and native cost.
+//! - [`abi`] — ERC-4337 packing, userOpHash, handleOps/getNonce calldata.
+//! - [`receipt`] — receipt status and UserOperationEvent extraction.
+//! - [`signing`] — deterministic EIP-1559 / Tempo `0x76` transaction signing
+//!   (key bytes are injected per call; custody stays in the shell).
+//! - [`broadcast`] — raw-transaction validation and the judgement of
+//!   ambiguous/rejected broadcasts.
+//! - [`funding`] — relayer float targets, top-up caps, and treasury
+//!   affordability.
 //! - [`tempo`] — Tempo chain constants and pathUSD calldata builders.
 //! - [`alchemy`] — the static Alchemy network registry.
 //!
@@ -28,12 +36,17 @@
 //! operation result supplied by the shell; nothing in this crate observes a
 //! clock, randomness, or the environment.
 
+pub mod abi;
 pub mod alchemy;
+pub mod broadcast;
 pub mod cost;
+pub mod funding;
 pub mod gas_math;
 pub mod hold;
 pub mod lifecycle;
+pub mod receipt;
 pub mod settlement;
+pub mod signing;
 pub mod task;
 pub mod tempo;
 pub mod vault;
