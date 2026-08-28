@@ -195,12 +195,24 @@ lane state), so it must be chosen at provisioning time. Invisible to API
 consumers; no parity impact because the CF deployment holds its own keys
 (FR-010).
 
-## R10 — Execution ownership (FR-010)
+## R10 — Execution ownership (FR-010) and dynamic chains
 
-**Decision**: a per-deployment `EXECUTION_CHAINS` allowlist consulted by
-`CheckChainSupported`'s arm before any directory lookup; deploy checklist
-asserts global disjointness for any shared key material. The
-one-consumer-per-queue platform rule plus per-deployment queues/stores makes
-cross-deployment execution of one envelope structurally impossible; the
-allowlist closes the remaining risk (same chain configured with the same
-keys in both deployments' env).
+**Decision**: chain support stays DYNAMIC by default, matching the docker
+shell's posture — a new chain needs zero provisioning on this platform:
+admission resolves its metadata from the same controlled chain directory
+(KV-cached), the single queue carries any chainId, and RecordDO/LaneDO/
+TreasuryDO materialize on first use (`idFromName`, unlimited object count).
+This is strictly MORE dynamic than docker, which must create a `chain-{id}`
+Iggy stream per chain. `CheckChainSupported`'s arm resolves trusted RPCs
+exactly as today (env override → Alchemy → directory).
+
+The `EXECUTION_CHAINS` allowlist is OPTIONAL: absent/empty means
+directory-driven dynamic execution (docker parity). FR-010's unit is the
+(chain, relayer key set) pair — with each deployment holding its own
+`OPERATOR_SECRET` (the spec's default), both deployments may serve the same
+chain as independent relays with no interference. The allowlist becomes
+MANDATORY and mutually exclusive only in a shared-key topology (e.g. a
+migration where one key set moves between deployments); the deploy checklist
+asserts disjointness exactly then. Cross-deployment execution of one
+ENVELOPE remains structurally impossible regardless (per-deployment queues
+and stores; one consumer per queue).

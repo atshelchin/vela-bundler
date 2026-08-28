@@ -23,7 +23,7 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 
 | Operation | Executor | Guarantee source |
 |---|---|---|
-| `CheckChainSupported` | config allowlist + RPC directory | FR-010 ownership allowlist first |
+| `CheckChainSupported` | trusted-RPC resolution (env override → Alchemy → directory), dynamic per chain; optional `EXECUTION_CHAINS` restriction for shared-key topologies only | docker-parity dynamic chains (R10) |
 | `LoadChainAssets` | metadata fetch + KV cache | cache only |
 | `LoadRecords` / `ReloadRecord` | RDO reads (one subrequest per record) | read-your-write |
 | `DeadLetterRouted` | dead-letter queue send + RDO diagnostic | at-least-once |

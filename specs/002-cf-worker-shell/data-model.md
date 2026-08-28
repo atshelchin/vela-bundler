@@ -124,6 +124,9 @@ tests" path.
 Same validated policy values as the docker shell (markup bps, floors, budgets,
 pool width, hold attempts, top-up caps), parsed from Worker env vars/secrets in
 the CF shell's config module and injected as data (`ExecutionPolicy`, admission
-policy) — Constitution II. Execution ownership (FR-010): a per-deployment
-`EXECUTION_CHAINS` allowlist; the deploy workflow's review step asserts global
-disjointness across deployments for any shared key material.
+policy) — Constitution II. Chains are DYNAMIC by default (research.md R10):
+no per-chain provisioning exists on this platform — metadata comes from the
+chain directory, the queue is chain-agnostic, and DOs materialize on first
+use. The optional `EXECUTION_CHAINS` allowlist restricts execution only in
+shared-key topologies, where the deploy review asserts disjointness (FR-010's
+(chain, key set) unit).
