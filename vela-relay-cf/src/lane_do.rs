@@ -842,13 +842,51 @@ impl LaneDo {
                 }
                 Out::Done
             }
-            // --- Tempo (0x76 envelope): lands with T017 ---
-            Op::FetchTempoContext
-            | Op::SignTempoBundle { .. }
-            | Op::FetchTempoTreasuryContext { .. }
-            | Op::RecordTempoTreasuryShortfall { .. } => Out::Failed {
-                message: "Tempo transport lands with T017".into(),
-            },
+            // --- Tempo (0x76 envelope) ---
+            Op::FetchTempoContext => {
+                match tempo_transaction_context(context.trusted, chain_id, context.policy.relayer)
+                    .await
+                {
+                    Ok((base_fee_atto, nonce, relayer_path_usd_balance)) => Out::TempoContext {
+                        base_fee_atto,
+                        nonce,
+                        relayer_path_usd_balance,
+                    },
+                    Err(message) => Out::Failed { message },
+                }
+            }
+            Op::SignTempoBundle { request } => sign_tempo_bundle(context, chain_id, lane, request),
+            Op::FetchTempoTreasuryContext { transfer_amount } => {
+                match tempo_treasury_context(
+                    context.trusted,
+                    chain_id,
+                    context.policy.treasury,
+                    context.policy.relayer,
+                    *transfer_amount,
+                )
+                .await
+                {
+                    Ok((nonce, balance, raw_gas_estimate)) => Out::TempoTreasuryContext {
+                        nonce,
+                        balance,
+                        raw_gas_estimate,
+                    },
+                    Err(message) => Out::Failed { message },
+                }
+            }
+            Op::RecordTempoTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                top_up,
+                top_up_gas_limit,
+                top_up_gas_cost,
+            } => {
+                worker::console_warn!(
+                    "Tempo treasury cannot fund the pending relayer top-up: chain_id={chain_id} treasury_path_usd_balance={treasury_balance} required_path_usd={required_treasury} top_up_path_usd={top_up} top_up_gas_limit={top_up_gas_limit} top_up_gas_path_usd={top_up_gas_cost} reserve_path_usd={}",
+                    vela_relay_core::tempo::TEMPO_TREASURY_FLOOR
+                );
+                Out::Done
+            }
         }
     }
 
@@ -1773,6 +1811,156 @@ fn sign_bundle(
             max_priority_fee_per_gas: request.max_priority_fee_per_gas,
             to: request.entry_point,
             value: U256::ZERO,
+            input: request.calldata.clone().into(),
+        },
+    ) {
+        Ok(signed) => Out::Signed {
+            signed: core_execution::SignedBundle {
+                raw_transaction_hex: format!("0x{}", hex::encode(&signed.raw_transaction)),
+                transaction_hash: signed.transaction_hash,
+                nonce: signed.nonce,
+            },
+        },
+        Err(error) => Out::Failed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Docker engine `tempo_transaction_context`: one four-call batch (latest
+/// block, gas price, relayer nonce, relayer pathUSD balance); the base fee
+/// falls back from the block header to `eth_gasPrice` to the pinned Tempo
+/// constant, every error string byte-identical.
+async fn tempo_transaction_context(
+    trusted: &TrustedRpcClient<'_>,
+    chain_id: u64,
+    relayer: Address,
+) -> std::result::Result<(U256, u64, U256), String> {
+    use vela_relay_core::tempo;
+    let calls = [
+        RpcBatchCall {
+            method: "eth_getBlockByNumber",
+            params: json!(["latest", false]),
+        },
+        RpcBatchCall {
+            method: "eth_gasPrice",
+            params: json!([]),
+        },
+        RpcBatchCall {
+            method: "eth_getTransactionCount",
+            params: json!([relayer.to_string(), "pending"]),
+        },
+        RpcBatchCall {
+            method: "eth_call",
+            params: json!([{
+                "to": tempo::PATH_USD.to_string(),
+                "data": format!(
+                    "0x{}",
+                    hex::encode(tempo::path_usd_balance_calldata(relayer))
+                ),
+            }, "latest"]),
+        },
+    ];
+    let responses = trusted
+        .batch(chain_id, &calls)
+        .await
+        .map_err(|error| error.to_string())?;
+    let base_fee_atto = response_value(&responses, 0, "Tempo latest block")?
+        .get("baseFeePerGas")
+        .and_then(Value::as_str)
+        .and_then(parse_quantity)
+        .or_else(|| response_quantity_optional(&responses, 1))
+        .unwrap_or_else(|| U256::from(tempo::TEMPO_BASE_FEE_ATTO));
+    let nonce = u64::try_from(response_quantity(&responses, 2, "Tempo relayer nonce")?)
+        .map_err(|_| "Tempo relayer nonce exceeds uint64".to_owned())?;
+    let relayer_path_usd_balance = response_abi_u256(&responses, 3, "Tempo pathUSD balance")?;
+    Ok((base_fee_atto, nonce, relayer_path_usd_balance))
+}
+
+/// Docker engine `FetchTempoTreasuryContext` arm: treasury nonce, treasury
+/// pathUSD balance, and the raw gas estimate of the exact pathUSD transfer
+/// (the buffer is applied by the core).
+async fn tempo_treasury_context(
+    trusted: &TrustedRpcClient<'_>,
+    chain_id: u64,
+    treasury: Address,
+    relayer: Address,
+    transfer_amount: U256,
+) -> std::result::Result<(u64, U256, u64), String> {
+    use vela_relay_core::tempo;
+    let transfer_calldata = tempo::path_usd_transfer_calldata(relayer, transfer_amount);
+    let calls = [
+        RpcBatchCall {
+            method: "eth_getTransactionCount",
+            params: json!([treasury.to_string(), "pending"]),
+        },
+        RpcBatchCall {
+            method: "eth_call",
+            params: json!([{
+                "to": tempo::PATH_USD.to_string(),
+                "data": format!(
+                    "0x{}",
+                    hex::encode(tempo::path_usd_balance_calldata(treasury))
+                ),
+            }, "latest"]),
+        },
+        RpcBatchCall {
+            method: "eth_estimateGas",
+            params: json!([{
+                "from": treasury.to_string(),
+                "to": tempo::PATH_USD.to_string(),
+                "data": format!("0x{}", hex::encode(&transfer_calldata)),
+                "feeToken": tempo::PATH_USD.to_string(),
+            }, "latest"]),
+        },
+    ];
+    let responses = trusted
+        .batch(chain_id, &calls)
+        .await
+        .map_err(|error| error.to_string())?;
+    let nonce = u64::try_from(response_quantity(&responses, 0, "Tempo treasury nonce")?)
+        .map_err(|_| "Tempo treasury nonce exceeds uint64".to_owned())?;
+    let balance = response_abi_u256(&responses, 1, "Tempo treasury pathUSD balance")?;
+    let raw_gas_estimate = u64::try_from(response_quantity(
+        &responses,
+        2,
+        "Tempo pathUSD top-up eth_estimateGas",
+    )?)
+    .map_err(|_| "Tempo pathUSD top-up gas estimate exceeds uint64".to_owned())?;
+    Ok((nonce, balance, raw_gas_estimate))
+}
+
+/// Docker engine `SignTempoBundle` arm: the Tempo `0x76` handleOps envelope
+/// over the vault-derived per-lane key (fee token pathUSD, tip 0).
+fn sign_tempo_bundle(
+    context: &BatchContext<'_>,
+    chain_id: u64,
+    lane: u8,
+    request: &core_execution::TempoSignRequest,
+) -> Out {
+    let Some(secret) = context.config.operator_secret.as_deref() else {
+        return Out::Failed {
+            message: "OPERATOR_SECRET is required for execution".into(),
+        };
+    };
+    let key = match vault::derive_pool_relayer_secret_key(secret, lane as usize) {
+        Ok(key) => key,
+        Err(error) => {
+            return Out::Failed {
+                message: error.to_string(),
+            };
+        }
+    };
+    match vela_relay_core::signing::sign_tempo(
+        &key,
+        vela_relay_core::signing::TempoTransactionPlan {
+            chain_id,
+            nonce: request.nonce,
+            gas_limit: request.gas_limit,
+            max_fee_per_gas: request.max_fee_per_gas,
+            max_priority_fee_per_gas: 0,
+            fee_token: vela_relay_core::tempo::PATH_USD,
+            to: request.entry_point,
             input: request.calldata.clone().into(),
         },
     ) {
