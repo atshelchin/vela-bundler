@@ -127,7 +127,7 @@ async fn tempo_quote(
     let balance = result
         .value
         .as_str()
-        .and_then(|value| decode_hex(value))
+        .and_then(decode_hex)
         .as_deref()
         .and_then(bytes32_quantity)
         .ok_or_else(RpcError::in_band_gas_quote_unavailable)?;

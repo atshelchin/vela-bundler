@@ -53,6 +53,7 @@ pub mod quote;
 pub mod receipt;
 pub mod settlement;
 pub mod signing;
+pub mod simulation;
 pub mod task;
 pub mod tempo;
 pub mod vault;

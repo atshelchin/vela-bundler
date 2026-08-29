@@ -161,7 +161,7 @@ impl RpcError {
 /// Parse and version-check one request envelope. `Err` carries the exact
 /// error response the old shell rendered inline (parse error with a null id;
 /// version refusal echoing the request id).
-#[expect(
+#[allow(
     clippy::result_large_err,
     reason = "The Err IS the rendered refusal response; envelope handling happens once per request and the value is immediately serialized, so boxing would add noise for no measurable win."
 )]

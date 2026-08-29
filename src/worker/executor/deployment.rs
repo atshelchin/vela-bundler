@@ -553,7 +553,7 @@ mod tests {
     use alloy::primitives::keccak256;
 
     use super::{ENTRY_POINT_V07_ARTIFACT_JSON, PIMLICO_ARTIFACT_JSON, artifact_init_code};
-    use crate::worker::executor::simulation::{
+    use vela_relay_core::simulation::{
         ENTRY_POINT_SIMULATIONS_V07_INIT_CODE_HASH, PIMLICO_SIMULATIONS_INIT_CODE_HASH,
     };
 

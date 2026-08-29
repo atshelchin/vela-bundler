@@ -14,6 +14,11 @@ pub struct CfConfig {
     pub execution_chains: Vec<u64>,
     pub alchemy_api_key: Option<String>,
     pub operator_secret: Option<String>,
+    /// Explicit per-chain executor RPC endpoints (docker
+    /// `VELA_RELAY_EXECUTOR_RPC_URLS`), tried before Alchemy and the directory.
+    pub trusted_rpc_urls: std::collections::BTreeMap<u64, Vec<String>>,
+    /// Per-request executor RPC deadline (docker `rpc_timeout`, default 5 s).
+    pub rpc_timeout_ms: u64,
     // Executor policy values — same names, defaults, and bounds as the docker
     // parser; injected into the core as data.
     pub max_bundle_operations: usize,
@@ -169,6 +174,12 @@ impl CfConfig {
             execution_chains,
             alchemy_api_key: secret(env, "ALCHEMY_API_KEY").filter(|key| !key.trim().is_empty()),
             operator_secret,
+            trusted_rpc_urls: match var(env, "VELA_RELAY_EXECUTOR_RPC_URLS") {
+                Some(value) => parse_trusted_rpc_urls(&value)?,
+                None => std::collections::BTreeMap::new(),
+            },
+            rpc_timeout_ms: u64_var(env, "VELA_RELAY_EXECUTOR_RPC_TIMEOUT_SECS", 5)?
+                .saturating_mul(1_000),
             max_bundle_operations: usize_var(env, "VELA_RELAY_MAX_BUNDLE_OPERATIONS", 10)?,
             gas_buffer_bps: u64_var(env, "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,
             fixed_gas_buffer: u64_var(env, "VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER", 30_000)?,
@@ -198,6 +209,59 @@ impl CfConfig {
             )?,
         })
     }
+}
+
+/// The docker parser's `parse_trusted_rpc_urls`, error strings included:
+/// a JSON map of chain ID → URL or URL array, http/https only.
+fn parse_trusted_rpc_urls(
+    value: &str,
+) -> Result<std::collections::BTreeMap<u64, Vec<String>>, String> {
+    let values =
+        serde_json::from_str::<std::collections::BTreeMap<String, serde_json::Value>>(value)
+            .map_err(|error| format!("invalid VELA_RELAY_EXECUTOR_RPC_URLS: {error}"))?;
+    let mut result = std::collections::BTreeMap::new();
+
+    for (chain_id, urls) in values {
+        let chain_id = chain_id.parse::<u64>().map_err(|error| {
+            format!("invalid chain ID in VELA_RELAY_EXECUTOR_RPC_URLS: {error}")
+        })?;
+        let urls = match urls {
+            serde_json::Value::String(url) => vec![url],
+            serde_json::Value::Array(urls) => urls
+                .into_iter()
+                .map(|url| {
+                    url.as_str().map(str::to_owned).ok_or_else(|| {
+                        "VELA_RELAY_EXECUTOR_RPC_URLS values must be URLs or URL arrays".to_owned()
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(
+                    "VELA_RELAY_EXECUTOR_RPC_URLS values must be URLs or URL arrays".into(),
+                );
+            }
+        };
+        if urls.is_empty() {
+            return Err(format!(
+                "VELA_RELAY_EXECUTOR_RPC_URLS chain {chain_id} has no URL"
+            ));
+        }
+        for url in &urls {
+            let parsed = worker::Url::parse(url).map_err(|error| {
+                format!(
+                    "invalid RPC URL for chain {chain_id} in VELA_RELAY_EXECUTOR_RPC_URLS: {error}"
+                )
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                return Err(format!(
+                    "RPC URL for chain {chain_id} must use http or https"
+                ));
+            }
+        }
+        result.insert(chain_id, urls);
+    }
+
+    Ok(result)
 }
 
 fn u64_var(env: &Env, name: &str, default: u64) -> Result<u64, String> {

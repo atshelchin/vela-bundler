@@ -23,6 +23,97 @@ pub fn parse_hex_bytes(value: &str) -> Option<Bytes> {
     hex::decode(digits).ok().map(Into::into)
 }
 
+// --- Executor upstream-error classification -------------------------------
+//
+// The predicates the executor transport applies to a JSON-RPC error object
+// before failing over or classifying a broadcast. Distinct from the
+// admission-side `estimate::is_execution_revert` (which also accepts
+// "execution error"); both vocabularies are frozen independently.
+
+/// A JSON-RPC error that is genuine EVM execution output (code 3, an
+/// "execution reverted" message, or an EntryPoint `FailedOp`): definitive for
+/// the call, so the transport must not fail over past it.
+pub fn is_executor_revert(code: Option<i64>, message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    code == Some(3) || message.contains("execution reverted") || message.contains("failedop")
+}
+
+/// The node already holds these exact bytes: the broadcast is ambiguous, not
+/// rejected (the transaction may be mined or pending).
+pub fn is_broadcast_already_known(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("already known")
+        || message.contains("known transaction")
+        || message.contains("already imported")
+}
+
+/// Nonce-shaped rejections are ambiguous: the same transaction (or a
+/// successor) may already occupy the nonce.
+pub fn is_broadcast_nonce_ambiguous(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("nonce too low") || message.contains("replacement transaction underpriced")
+}
+
+/// Rejections that prove the node did not admit the transaction; only when
+/// every endpoint answers in this class may the broadcast be judged rejected.
+pub fn is_definitive_broadcast_rejection(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("insufficient funds")
+        || message.contains("intrinsic gas")
+        || message.contains("fee cap")
+        || message.contains("max fee per gas")
+        || message.contains("transaction type not supported")
+}
+
+/// The frozen upstream-error rendering ("RPC code {code}: {message…}") that
+/// flows into broadcast diagnostics and record fields.
+pub fn upstream_error_diagnostic(code: Option<i64>, message: Option<&str>) -> String {
+    let code = code
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let message = message.unwrap_or("upstream error");
+    format!("RPC code {code}: {}", truncate_rpc_diagnostic(message, 256))
+}
+
+/// Deduplicates per-endpoint diagnostics in arrival order and joins them into
+/// the single bounded string persisted with a broadcast outcome.
+pub fn join_broadcast_diagnostics(diagnostics: Vec<String>) -> String {
+    let mut unique = Vec::new();
+    for diagnostic in diagnostics {
+        if !unique.contains(&diagnostic) {
+            unique.push(diagnostic);
+        }
+    }
+    truncate_rpc_diagnostic(&unique.join("; "), 512)
+}
+
+/// The transport-side truncation (ellipsis suffix, char-boundary safe) —
+/// deliberately distinct from `task::truncate_diagnostic`'s "..." suffix.
+pub fn truncate_rpc_diagnostic(value: &str, maximum: usize) -> String {
+    if value.len() <= maximum {
+        return value.to_owned();
+    }
+    let mut end = maximum;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &value[..end])
+}
+
+/// Extracts the revert payload from a JSON-RPC error's `data` field, in the
+/// shapes trusted upstreams use (a bare string, or an object keyed by `data`,
+/// `result`, or `returnData`).
+pub fn revert_data(value: &Option<serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    match value.as_ref()? {
+        Value::String(value) => Some(value.clone()),
+        Value::Object(object) => ["data", "result", "returnData"]
+            .into_iter()
+            .find_map(|key| object.get(key).and_then(Value::as_str).map(str::to_owned)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RawTransactionError {
     InvalidBytes,
@@ -134,6 +225,38 @@ mod tests {
             Err(RawTransactionError::InvalidHash)
         );
         assert!(parse_hex_bytes("0x1").is_none());
+    }
+
+    #[test]
+    fn distinguishes_ambiguous_and_definitive_broadcast_errors() {
+        assert!(super::is_broadcast_nonce_ambiguous("nonce too low"));
+        assert!(!super::is_definitive_broadcast_rejection("nonce too low"));
+        assert!(super::is_definitive_broadcast_rejection(
+            "insufficient funds for gas * price + value"
+        ));
+    }
+
+    #[test]
+    fn renders_and_joins_upstream_diagnostics_with_bounded_length() {
+        assert_eq!(
+            super::upstream_error_diagnostic(Some(-32000), Some("nonce too low")),
+            "RPC code -32000: nonce too low"
+        );
+        assert_eq!(
+            super::upstream_error_diagnostic(None, None),
+            "RPC code unknown: upstream error"
+        );
+        assert_eq!(
+            super::join_broadcast_diagnostics(vec![
+                "first".into(),
+                "second".into(),
+                "first".into()
+            ]),
+            "first; second"
+        );
+        let truncated = super::truncate_rpc_diagnostic(&"é".repeat(200), 256);
+        assert!(truncated.ends_with('…'));
+        assert!(truncated.len() <= 256 + '…'.len_utf8());
     }
 
     #[test]

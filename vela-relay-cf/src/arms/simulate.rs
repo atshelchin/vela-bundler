@@ -1,48 +1,42 @@
-//! Simulation orchestration over the trusted RPC transport. The three-tier
-//! order (`eth_simulateV1` → deployed Pimlico `eth_call` → `debug_traceCall`)
-//! and every interpretation rule live in `vela_relay_core::simulation`; this
-//! module owns only the transport sequencing and the automatic contract
-//! deployment hook.
+//! Simulation orchestration over the trusted transport: the docker shell's
+//! three-tier order (`eth_simulateV1` → deployed Pimlico `eth_call` →
+//! `debug_traceCall`) with every interpretation rule taken from
+//! `vela_relay_core::simulation`.
+//!
+//! Declared delta (contracts/platform-bindings.md): this shell does not
+//! auto-deploy the Pimlico simulation pair — deployment is the docker
+//! treasury's job, and the CREATE2 addresses are a pure function of the shared
+//! treasury, so contracts deployed there are found `Ready` here. A `Missing`
+//! pair falls through to `debug_traceCall`; the `Pending` verdict (and its
+//! deployment-wait diagnostics) is never produced on this shell.
 
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::primitives::{Address, B256, U256};
 use serde_json::{Value, json};
-
-pub(super) use vela_relay_core::simulation::{
-    DETERMINISTIC_DEPLOYER, PimlicoSimulationContracts, SimulatedUserOperation, SimulationResult,
-    SimulationVerdict,
+use vela_relay_core::abi::{
+    PackedOperation, handle_ops_calldata, pimlico_simulate_handle_op_calldata,
 };
 use vela_relay_core::simulation::{
+    PimlicoSimulationContracts, SimulatedUserOperation, SimulationResult, SimulationVerdict,
     debug_trace_params, parse_simulation, parse_trace_simulation, parse_u256,
     pimlico_contracts_for_treasury, revert_reports_nonce_mismatch, simulate_params,
 };
 
-use super::{
-    abi::{PackedOperation, handle_ops_calldata, pimlico_simulate_handle_op_calldata},
-    deployment::{SimulationContractDeployer, SimulationDeploymentState},
-    rpc::{RpcBatchCall, RpcError, TrustedRpcClient},
-};
+use super::trusted::{RpcBatchCall, RpcError, TrustedRpcClient};
 
 enum PimlicoContractAvailability {
     Ready(PimlicoSimulationContracts),
-    Missing(PimlicoSimulationContracts),
+    Missing,
     Unavailable,
 }
 
-/// Runs every candidate in isolation in one JSON-RPC HTTP batch. Each simulation executes a
-/// one-operation `handleOps`, which proves both EntryPoint validation and the account call. A
-/// top-level `eth_simulateV1` error is a provider capability failure, never an op verdict.
-///
-/// When `eth_simulateV1` is unavailable, a deployed Alto simulation pair is the preferred
-/// fallback because it works through ordinary `eth_call`. If the pair is absent, the treasury
-/// deploys it durably through the canonical CREATE2 deployer and this batch waits for its receipt.
-/// `debug_traceCall` remains a fallback when automatic deployment is unavailable.
-pub(super) async fn simulate_individually(
-    rpc: &TrustedRpcClient,
+/// Runs every candidate in isolation in one JSON-RPC HTTP batch (docker
+/// `simulate_individually` minus the deployment hook).
+pub async fn simulate_individually(
+    rpc: &TrustedRpcClient<'_>,
     chain_id: u64,
     entry_point: Address,
     relayer: Address,
     beneficiary: Address,
-    deployer: &SimulationContractDeployer,
     operations: &[PackedOperation],
     hashes: &[B256],
 ) -> Vec<SimulationVerdict<SimulationResult>> {
@@ -93,21 +87,7 @@ pub(super) async fn simulate_individually(
     }
     let pimlico_contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
         PimlicoContractAvailability::Ready(contracts) => Some(contracts),
-        PimlicoContractAvailability::Missing(contracts) => {
-            match deployer.ensure(chain_id, contracts).await {
-                SimulationDeploymentState::Ready => Some(contracts),
-                SimulationDeploymentState::Pending => {
-                    for index in fallback_indexes {
-                        verdicts[index] = SimulationVerdict::Pending(
-                            "Pimlico simulation-contract deployment is pending confirmation",
-                        );
-                    }
-                    return verdicts;
-                }
-                SimulationDeploymentState::Unavailable => None,
-            }
-        }
-        PimlicoContractAvailability::Unavailable => None,
+        PimlicoContractAvailability::Missing | PimlicoContractAvailability::Unavailable => None,
     };
     let mut trace_indexes = Vec::new();
     for index in fallback_indexes {
@@ -115,7 +95,7 @@ pub(super) async fn simulate_individually(
             rpc,
             chain_id,
             entry_point,
-            operations[index].clone(),
+            &operations[index],
             hashes[index],
             pimlico_contracts,
         )
@@ -156,13 +136,14 @@ pub(super) async fn simulate_individually(
     verdicts
 }
 
-pub(super) async fn simulate_bundle(
-    rpc: &TrustedRpcClient,
+/// The final full-bundle proof (docker `simulate_bundle` minus the deployment
+/// hook).
+pub async fn simulate_bundle(
+    rpc: &TrustedRpcClient<'_>,
     chain_id: u64,
     entry_point: Address,
     relayer: Address,
     beneficiary: Address,
-    deployer: &SimulationContractDeployer,
     operations: &[PackedOperation],
     hashes: &[B256],
 ) -> SimulationVerdict<SimulationResult> {
@@ -185,18 +166,9 @@ pub(super) async fn simulate_bundle(
         Err(_) => {
             let contracts = match pimlico_contracts(rpc, chain_id, beneficiary).await {
                 PimlicoContractAvailability::Ready(contracts) => Some(contracts),
-                PimlicoContractAvailability::Missing(contracts) => {
-                    match deployer.ensure(chain_id, contracts).await {
-                        SimulationDeploymentState::Ready => Some(contracts),
-                        SimulationDeploymentState::Pending => {
-                            return SimulationVerdict::Pending(
-                                "Pimlico simulation-contract deployment is pending confirmation",
-                            );
-                        }
-                        SimulationDeploymentState::Unavailable => None,
-                    }
+                PimlicoContractAvailability::Missing | PimlicoContractAvailability::Unavailable => {
+                    None
                 }
-                PimlicoContractAvailability::Unavailable => None,
             };
             if let Some(contracts) = contracts {
                 let verdict = simulate_bundle_with_eth_call(
@@ -231,7 +203,7 @@ pub(super) async fn simulate_bundle(
 }
 
 async fn pimlico_contracts(
-    rpc: &TrustedRpcClient,
+    rpc: &TrustedRpcClient<'_>,
     chain_id: u64,
     treasury: Address,
 ) -> PimlicoContractAvailability {
@@ -260,15 +232,15 @@ async fn pimlico_contracts(
     if all_deployed {
         PimlicoContractAvailability::Ready(contracts)
     } else {
-        PimlicoContractAvailability::Missing(contracts)
+        PimlicoContractAvailability::Missing
     }
 }
 
 async fn simulate_with_pimlico(
-    rpc: &TrustedRpcClient,
+    rpc: &TrustedRpcClient<'_>,
     chain_id: u64,
     entry_point: Address,
-    operation: PackedOperation,
+    operation: &PackedOperation,
     hash: B256,
     contracts: Option<PimlicoSimulationContracts>,
 ) -> SimulationVerdict<SimulationResult> {
@@ -278,7 +250,7 @@ async fn simulate_with_pimlico(
         );
     };
     let data =
-        pimlico_simulate_handle_op_calldata(contracts.entry_point_v07, entry_point, &operation);
+        pimlico_simulate_handle_op_calldata(contracts.entry_point_v07, entry_point, operation);
     match rpc
         .simulate(
             chain_id,
@@ -317,11 +289,11 @@ async fn simulate_with_pimlico(
 }
 
 async fn simulate_bundle_with_eth_call(
-    rpc: &TrustedRpcClient,
+    rpc: &TrustedRpcClient<'_>,
     chain_id: u64,
     entry_point: Address,
     relayer: Address,
-    calldata: Bytes,
+    calldata: alloy::primitives::Bytes,
     hashes: &[B256],
     _contracts: PimlicoSimulationContracts,
 ) -> SimulationVerdict<SimulationResult> {

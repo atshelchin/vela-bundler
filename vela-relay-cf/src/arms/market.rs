@@ -119,11 +119,10 @@ async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, Strin
         match fetch_json(&url).await {
             Ok(body) => {
                 if let Ok(metadata) = serde_json::from_str::<ChainMetadata>(&body) {
-                    if let Ok(kv) = env.kv(KV_BINDING) {
-                        let _ = kv
-                            .put(&cache_key, body)
-                            .and_then(|put| Ok(put.expiration_ttl(METADATA_CACHE_TTL_SECS)))
-                            .map(|put| put.execute());
+                    if let Ok(kv) = env.kv(KV_BINDING)
+                        && let Ok(put) = kv.put(&cache_key, body)
+                    {
+                        let _ = put.expiration_ttl(METADATA_CACHE_TTL_SECS).execute().await;
                     }
                     return Ok(metadata);
                 }

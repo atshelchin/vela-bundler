@@ -479,7 +479,7 @@ pub enum BroadcastReply {
 }
 
 #[derive(Debug)]
-#[expect(
+#[allow(
     clippy::large_enum_variant,
     reason = "Shell results are constructed once and consumed immediately in-process; boxing every record-bearing variant would add noise at each decision site."
 )]

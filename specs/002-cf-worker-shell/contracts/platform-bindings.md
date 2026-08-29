@@ -33,7 +33,7 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 | `AcquireLaneLease` / `EnsureLaneLease` | constant `true` | LaneDO single-threading (structurally stronger; interrupt path unreachable — declared) |
 | `LoadPreparedBundle` / `SavePreparedBundle` / `ClearStaleIntent` | LDO storage (put-if-absent / guarded clear) | DO serial |
 | `ResumeBundleIntent` | LDO composite (same sequencing as docker shell) | DO serial + core rules |
-| `SimulateIndividually` / `SimulateBundle` / `FetchAccountNonces` | chain RPC fetches (failover) | shell-owned transport; same interpretation rules (core) |
+| `SimulateIndividually` / `SimulateBundle` / `FetchAccountNonces` | chain RPC fetches (failover), same three-tier order (`eth_simulateV1` → deployed Pimlico `eth_call` → `debug_traceCall`); this shell does NOT auto-deploy the Pimlico pair (see Explicitly absent) | shell-owned transport; same interpretation rules (core `simulation`) |
 | `FetchTransactionContext` / `FetchTempoContext` / `FetchTreasuryContext` / `FetchTempoTreasuryContext` | chain RPC batch fetches | same call sets as docker |
 | `FetchMarketPrice` | Binance fetch + KV cache | same fail-open/closed directions (core-decided) |
 | `AcquireTreasuryLease` / `EnsureTreasuryLease` / `ReleaseTreasuryLease` | TDO lock (token + deadline) | DO serial + explicit lock; store error → `Failed` (batch-fatal, as docker) |
@@ -64,3 +64,12 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
   unchanged; the docker shell continues to use it.
 - No operation exists to delete an admitted record (Constitution III — the
   absent-operation guarantee carries over verbatim).
+- Automatic Pimlico simulation-contract deployment (docker
+  `SimulationContractDeployer`) has no counterpart: deployment needs treasury
+  signing plus a receipt wait, which belongs to the docker shell. The CREATE2
+  addresses are a pure function of the shared treasury (core
+  `simulation::pimlico_contracts_for_treasury`), so a pair deployed by the
+  docker shell is found `Ready` here. A `Missing` pair falls through to
+  `debug_traceCall`; the `SimulationVerdict::Pending` verdict and the
+  deployment-wait diagnostics are never produced on this shell (chains lacking
+  all three tiers defer on the core's hold ladder, unchanged).

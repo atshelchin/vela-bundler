@@ -1,38 +1,43 @@
+//! The docker shell's `TrustedRpcClient` ported onto workerd fetch: the
+//! executor-grade JSON-RPC transport (explicit URLs → Alchemy → controlled
+//! directory, per-URL `eth_chainId` validation, item-level batch failover,
+//! broadcast classification). Interpretation rules come from the core
+//! (`broadcast`); this module owns only transport policy (Constitution,
+//! Shell-owned concerns).
+//!
+//! Caches live per isolate (`thread_local`): the validated-URL set and the
+//! directory URL list — the same lifetimes the docker client gets from its
+//! process-wide maps, scoped to one workerd isolate.
+
 use std::{
+    cell::{Cell, RefCell},
     collections::{BTreeMap, HashMap, HashSet},
     fmt::{Display, Formatter},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
 };
 
-use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use vela_relay_core::broadcast as core_broadcast;
+use worker::{Delay, Env, Fetch, Headers, Method, Request, RequestInit};
 
-use crate::utils::{alchemy, config::ExecutorConfig, rpc as chain_directory};
+use super::market;
+use crate::config::CfConfig;
 
-#[derive(Clone)]
-pub(super) struct TrustedRpcClient {
-    http: Client,
-    explicit_urls: Arc<BTreeMap<u64, Vec<String>>>,
-    alchemy_api_key: Option<Arc<str>>,
-    directory_urls: Arc<Mutex<HashMap<u64, Vec<String>>>>,
-    validated_urls: Arc<Mutex<HashSet<(u64, String)>>>,
-    request_id: Arc<AtomicU64>,
+pub struct TrustedRpcClient<'env> {
+    env: &'env Env,
+    explicit_urls: BTreeMap<u64, Vec<String>>,
+    alchemy_api_key: Option<String>,
+    rpc_timeout_ms: u64,
 }
 
 #[derive(Clone, Debug)]
-pub(super) struct RpcBatchCall<'a> {
-    pub(super) method: &'a str,
-    pub(super) params: Value,
+pub struct RpcBatchCall<'a> {
+    pub method: &'a str,
+    pub params: Value,
 }
 
 #[derive(Debug)]
-pub(super) enum RpcError {
+pub enum RpcError {
     NoTrustedRpc(u64),
     WrongChain,
     Unavailable,
@@ -44,7 +49,7 @@ pub(super) enum RpcError {
 }
 
 #[derive(Debug)]
-pub(super) enum BroadcastOutcome {
+pub enum BroadcastOutcome {
     Accepted(String),
     Ambiguous(String),
     Rejected(String),
@@ -52,6 +57,8 @@ pub(super) enum BroadcastOutcome {
 
 impl Display for RpcError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        // Byte-frozen: these strings flow into record diagnostics on both
+        // shells (docker `RpcError` Display).
         match self {
             Self::NoTrustedRpc(chain_id) => {
                 write!(
@@ -69,33 +76,35 @@ impl Display for RpcError {
     }
 }
 
-impl std::error::Error for RpcError {}
+thread_local! {
+    static DIRECTORY_URLS: RefCell<HashMap<u64, Vec<String>>> = RefCell::new(HashMap::new());
+    static VALIDATED_URLS: RefCell<HashSet<(u64, String)>> = RefCell::new(HashSet::new());
+    static REQUEST_ID: Cell<u64> = const { Cell::new(1) };
+}
 
-impl TrustedRpcClient {
-    pub(super) fn new(config: &ExecutorConfig) -> Result<Self, RpcError> {
-        let http = Client::builder()
-            .connect_timeout(Duration::from_secs(2))
-            .timeout(config.rpc_timeout)
-            .build()
-            .map_err(|_| RpcError::Unavailable)?;
-        Ok(Self {
-            http,
-            explicit_urls: Arc::new(config.trusted_rpc_urls.clone()),
-            alchemy_api_key: config
-                .alchemy_api_key
-                .as_ref()
-                .map(|key| Arc::from(key.expose())),
-            directory_urls: Arc::new(Mutex::new(HashMap::new())),
-            validated_urls: Arc::new(Mutex::new(HashSet::new())),
-            request_id: Arc::new(AtomicU64::new(1)),
-        })
+fn next_request_id(count: u64) -> u64 {
+    REQUEST_ID.with(|id| {
+        let first = id.get();
+        id.set(first.wrapping_add(count));
+        first
+    })
+}
+
+impl<'env> TrustedRpcClient<'env> {
+    pub fn new(config: &CfConfig, env: &'env Env) -> Self {
+        Self {
+            env,
+            explicit_urls: config.trusted_rpc_urls.clone(),
+            alchemy_api_key: config.alchemy_api_key.clone(),
+            rpc_timeout_ms: config.rpc_timeout_ms,
+        }
     }
 
-    pub(super) async fn supports_chain(&self, chain_id: u64) -> bool {
+    pub async fn supports_chain(&self, chain_id: u64) -> bool {
         !self.urls(chain_id).await.is_empty()
     }
 
-    pub(super) async fn call(
+    pub async fn call(
         &self,
         chain_id: u64,
         method: &str,
@@ -117,7 +126,7 @@ impl TrustedRpcClient {
         Err(RpcError::Unavailable)
     }
 
-    pub(super) async fn simulate(
+    pub async fn simulate(
         &self,
         chain_id: u64,
         method: &str,
@@ -145,7 +154,7 @@ impl TrustedRpcClient {
     /// Executes a JSON-RPC batch with item-level failover across trusted endpoints. A successful
     /// item or an explicit EVM revert is final; malformed, omitted, or unsupported-method items
     /// are retried on the next endpoint without repeating already resolved calls.
-    pub(super) async fn batch(
+    pub async fn batch(
         &self,
         chain_id: u64,
         calls: &[RpcBatchCall<'_>],
@@ -154,9 +163,7 @@ impl TrustedRpcClient {
             return Ok(Vec::new());
         }
         let urls = self.urls_or_error(chain_id).await?;
-        let first_id = self
-            .request_id
-            .fetch_add(calls.len() as u64, Ordering::Relaxed);
+        let first_id = next_request_id(calls.len() as u64);
         let mut results = (0..calls.len()).map(|_| None).collect::<Vec<_>>();
         let mut unresolved = (0..calls.len()).collect::<Vec<_>>();
         let mut saw_batch_response = false;
@@ -177,15 +184,11 @@ impl TrustedRpcClient {
                     })
                 })
                 .collect::<Vec<_>>();
-            let response = match self.http.post(&url).json(&payload).send().await {
-                Ok(response) => response,
-                Err(_) => continue,
+            let Ok(body) = self.post_json(&url, &Value::Array(payload)).await else {
+                continue;
             };
-            let mut responses = match response.error_for_status() {
-                Ok(response) => match response.json::<Vec<UpstreamResponse>>().await {
-                    Ok(responses) => responses,
-                    Err(_) => continue,
-                },
+            let mut responses = match serde_json::from_str::<Vec<UpstreamResponse>>(&body) {
+                Ok(responses) => responses,
                 Err(_) => continue,
             };
             saw_batch_response = true;
@@ -239,7 +242,7 @@ impl TrustedRpcClient {
             .collect())
     }
 
-    pub(super) async fn broadcast_raw_transaction(
+    pub async fn broadcast_raw_transaction(
         &self,
         chain_id: u64,
         raw_transaction: &[u8],
@@ -282,16 +285,20 @@ impl TrustedRpcClient {
 
         Ok(
             if !ambiguous_diagnostics.is_empty() || rejection_diagnostics.is_empty() {
-                BroadcastOutcome::Ambiguous(join_broadcast_diagnostics(ambiguous_diagnostics))
+                BroadcastOutcome::Ambiguous(core_broadcast::join_broadcast_diagnostics(
+                    ambiguous_diagnostics,
+                ))
             } else {
-                BroadcastOutcome::Rejected(join_broadcast_diagnostics(rejection_diagnostics))
+                BroadcastOutcome::Rejected(core_broadcast::join_broadcast_diagnostics(
+                    rejection_diagnostics,
+                ))
             },
         )
     }
 
     async fn validate_chain(&self, chain_id: u64, url: &str) -> Result<(), RpcError> {
         let key = (chain_id, url.to_owned());
-        if self.validated_urls.lock().await.contains(&key) {
+        if VALIDATED_URLS.with(|validated| validated.borrow().contains(&key)) {
             return Ok(());
         }
         let response = self.request(url, "eth_chainId", json!([])).await?;
@@ -306,7 +313,7 @@ impl TrustedRpcClient {
         if returned != chain_id {
             return Err(RpcError::WrongChain);
         }
-        self.validated_urls.lock().await.insert(key);
+        VALIDATED_URLS.with(|validated| validated.borrow_mut().insert(key));
         Ok(())
     }
 
@@ -316,23 +323,51 @@ impl TrustedRpcClient {
         method: &str,
         params: Value,
     ) -> Result<UpstreamResponse, RpcError> {
-        let id = self.request_id.fetch_add(1, Ordering::Relaxed);
-        self.http
-            .post(url)
-            .json(&json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "method": method,
-                "params": params,
-            }))
-            .send()
+        let id = next_request_id(1);
+        let body = self
+            .post_json(
+                url,
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": method,
+                    "params": params,
+                }),
+            )
             .await
-            .map_err(|_| RpcError::Unavailable)?
-            .error_for_status()
-            .map_err(|_| RpcError::Unavailable)?
-            .json::<UpstreamResponse>()
-            .await
-            .map_err(|_| RpcError::InvalidResponse)
+            .map_err(|()| RpcError::Unavailable)?;
+        serde_json::from_str::<UpstreamResponse>(&body).map_err(|_| RpcError::InvalidResponse)
+    }
+
+    /// One POST racing the executor deadline — workerd fetch has no native
+    /// timeout, so every request is bounded by a `Delay` (docker: reqwest
+    /// connect + request timeouts).
+    async fn post_json(&self, url: &str, payload: &Value) -> Result<String, ()> {
+        use futures_util::future::{Either, select};
+
+        let request = async {
+            let headers = Headers::new();
+            headers
+                .set("content-type", "application/json")
+                .map_err(|_| ())?;
+            let mut init = RequestInit::new();
+            init.with_method(Method::Post)
+                .with_headers(headers)
+                .with_body(Some(worker::wasm_bindgen::JsValue::from_str(
+                    &payload.to_string(),
+                )));
+            let request = Request::new_with_init(url, &init).map_err(|_| ())?;
+            let mut response = Fetch::Request(request).send().await.map_err(|_| ())?;
+            if !(200..300).contains(&response.status_code()) {
+                return Err(());
+            }
+            response.text().await.map_err(|_| ())
+        };
+        let deadline = Delay::from(std::time::Duration::from_millis(self.rpc_timeout_ms));
+        match select(std::pin::pin!(request), deadline).await {
+            Either::Left((result, _)) => result,
+            Either::Right(((), _)) => Err(()),
+        }
     }
 
     async fn urls_or_error(&self, chain_id: u64) -> Result<Vec<String>, RpcError> {
@@ -351,32 +386,63 @@ impl TrustedRpcClient {
             .cloned()
             .unwrap_or_default();
         if let Some(api_key) = &self.alchemy_api_key
-            && let Some(url) = alchemy::rpc_url(chain_id, api_key)
+            && let Some(url) = vela_relay_core::alchemy::rpc_url(chain_id, api_key)
         {
             append_unique_urls(&mut urls, [url]);
         }
 
-        let directory_urls =
-            if let Some(urls) = self.directory_urls.lock().await.get(&chain_id).cloned() {
-                urls
-            } else {
-                let (urls, cacheable) = match chain_directory::directory_rpc_urls(chain_id).await {
-                    Ok(urls) => (urls, true),
-                    // Do not cache an outage: a subsequent queued batch should be able to retry
-                    // the controlled directory after its built-in request retries are exhausted.
-                    Err(()) => (Vec::new(), false),
-                };
-                if cacheable {
-                    self.directory_urls
-                        .lock()
-                        .await
-                        .insert(chain_id, urls.clone());
+        let cached = DIRECTORY_URLS.with(|directory| directory.borrow().get(&chain_id).cloned());
+        let directory_urls = if let Some(urls) = cached {
+            urls
+        } else {
+            // Do not cache an outage: a subsequent batch should be able to
+            // retry the controlled directory (docker parity; the KV metadata
+            // cache underneath is success-only too).
+            match market::fallback_rpc_urls(self.env, chain_id).await {
+                Ok(urls) => {
+                    let urls = urls
+                        .into_iter()
+                        .filter(|url| is_directory_executor_url(url))
+                        .collect::<Vec<_>>();
+                    DIRECTORY_URLS.with(|directory| {
+                        directory.borrow_mut().insert(chain_id, urls.clone());
+                    });
+                    urls
                 }
-                urls
-            };
+                Err(error) => {
+                    worker::console_warn!(
+                        "could not fetch controlled directory RPC URLs: chain_id={chain_id} error={error}"
+                    );
+                    Vec::new()
+                }
+            }
+        };
         append_unique_urls(&mut urls, directory_urls);
         urls
     }
+}
+
+/// The docker directory filter (`parse_rpc_url`): https only, no local hosts.
+fn is_directory_executor_url(url: &str) -> bool {
+    let Ok(url) = worker::Url::parse(url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    url.scheme() == "https" && !is_local_host(host)
+}
+
+fn is_local_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| {
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || match ip {
+                    std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_link_local(),
+                    std::net::IpAddr::V6(_) => false,
+                }
+        })
 }
 
 fn append_unique_urls(urls: &mut Vec<String>, candidates: impl IntoIterator<Item = String>) {
@@ -435,8 +501,6 @@ impl UpstreamError {
     }
 }
 
-use vela_relay_core::broadcast::{self as core_broadcast, join_broadcast_diagnostics};
-
 impl UpstreamResponse {
     fn into_result_and_error(mut self) -> (Option<Value>, Option<UpstreamError>) {
         let result = self.fields.remove("result");
@@ -456,28 +520,66 @@ fn definitive_batch_result(response: UpstreamResponse) -> Option<Result<Value, R
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::append_unique_urls;
+// --- batch response decoding (docker engine helpers, byte-identical text) ---
 
-    #[test]
-    fn appends_each_executor_rpc_url_once() {
-        let mut urls = vec!["https://first.example".into()];
-        append_unique_urls(
-            &mut urls,
-            [
-                "https://first.example".into(),
-                "https://second.example".into(),
-                "https://second.example".into(),
-            ],
-        );
+use alloy::primitives::U256;
 
-        assert_eq!(
-            urls,
-            vec![
-                "https://first.example".to_owned(),
-                "https://second.example".to_owned(),
-            ]
-        );
+pub fn response_value<'a>(
+    responses: &'a [Result<Value, RpcError>],
+    index: usize,
+    method: &str,
+) -> Result<&'a Value, String> {
+    match responses.get(index) {
+        Some(Ok(value)) => Ok(value),
+        Some(Err(error)) => Err(format!("{method} failed: {error}")),
+        None => Err(format!("{method} is missing from the RPC batch response")),
     }
+}
+
+pub fn response_quantity(
+    responses: &[Result<Value, RpcError>],
+    index: usize,
+    method: &str,
+) -> Result<U256, String> {
+    response_value(responses, index, method)?
+        .as_str()
+        .and_then(parse_quantity)
+        .ok_or_else(|| format!("{method} returned an invalid quantity"))
+}
+
+pub fn response_abi_u256(
+    responses: &[Result<Value, RpcError>],
+    index: usize,
+    method: &str,
+) -> Result<U256, String> {
+    let bytes = response_value(responses, index, method)?
+        .as_str()
+        .and_then(vela_relay_core::broadcast::parse_hex_bytes)
+        .filter(|bytes| bytes.len() == 32)
+        .ok_or_else(|| format!("{method} returned invalid ABI data"))?;
+    Ok(U256::from_be_slice(&bytes))
+}
+
+pub fn response_quantity_optional(
+    responses: &[Result<Value, RpcError>],
+    index: usize,
+) -> Option<U256> {
+    responses
+        .get(index)
+        .and_then(|response| response.as_ref().ok())
+        .and_then(Value::as_str)
+        .and_then(parse_quantity)
+}
+
+/// Canonical JSON-RPC quantity only (docker engine `parse_quantity`): `0x`
+/// prefix, no leading zeros, hex digits.
+pub fn parse_quantity(value: &str) -> Option<U256> {
+    let digits = value.strip_prefix("0x")?;
+    if digits.is_empty()
+        || (digits.len() > 1 && digits.starts_with('0'))
+        || !digits.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    U256::from_str_radix(digits, 16).ok()
 }

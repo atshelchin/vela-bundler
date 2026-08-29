@@ -10,21 +10,69 @@
 //! `delayed:{hash}` → parked operation (payload + attempts + due). The single
 //! alarm serves the delayed inbox (earliest due; US3 adds reconcile packing).
 
+use std::cell::RefCell;
+
+use alloy::primitives::{Address, U256};
+use serde_json::{Value, json};
+use vela_relay_core::broadcast::{nonce_too_low, validate_raw_transaction};
 use vela_relay_core::execution::{
     self as core_execution, ExecutionOperation as Op, ExecutionOutcome as Out,
 };
+use vela_relay_core::simulation::{SimulationResult, SimulationVerdict};
 use vela_relay_core::task::{PreparedBundleIntent, RoutedUserOperation, truncate_diagnostic};
+use vela_relay_core::vault;
 use worker::{
     Date, DurableObject, Env, Request, Response, Result, State, durable_object, wasm_bindgen,
 };
 
 use crate::{
+    arms::{
+        market, simulate,
+        trusted::{
+            RpcBatchCall, TrustedRpcClient, parse_quantity, response_abi_u256, response_quantity,
+            response_quantity_optional, response_value,
+        },
+    },
     config::CfConfig,
     proto::{ItemResolutionWire, LaneCommand, LaneReply, RecordCommand, RecordReply},
 };
 
 const INTENT_KEY: &str = "intent";
 const BROADCAST_RETRY_INTERVAL_MS: u64 = 30_000;
+/// Docker engine `BINANCE_PRICE_TTL`.
+const BINANCE_PRICE_TTL_MS: u64 = 60_000;
+/// Docker engine `ERC20_DECIMALS_SELECTOR` (`decimals()`).
+const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
+
+thread_local! {
+    /// Per-isolate market price cache (docker: per-process map, same TTL).
+    static MARKET_PRICES: RefCell<std::collections::HashMap<String, (u64, U256)>> =
+        RefCell::new(std::collections::HashMap::new());
+}
+
+/// The docker engine's shell-local dispositions for prepared-intent recovery.
+#[derive(Clone, Copy, PartialEq)]
+enum BundleBroadcastDisposition {
+    Confirmed,
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BundleResumeDisposition {
+    Cleared,
+    Confirmed,
+    Unknown,
+}
+
+/// One batch's shared execution context: the derived policy plus the trusted
+/// transport and the per-batch resolved native symbol (docker: engine handler
+/// state).
+struct BatchContext<'a> {
+    config: &'a CfConfig,
+    policy: &'a core_execution::ExecutionPolicy,
+    trusted: &'a TrustedRpcClient<'a>,
+    native_symbol: RefCell<Option<String>>,
+}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct DelayedEntry {
@@ -105,12 +153,20 @@ impl LaneDo {
             }
         };
 
+        let trusted = TrustedRpcClient::new(&config, &self.env);
+        let context = BatchContext {
+            config: &config,
+            policy: &policy,
+            trusted: &trusted,
+            native_symbol: RefCell::new(None),
+        };
+
         let core: crux_core::Core<core_execution::ExecutionApp> = crux_core::Core::new();
         let mut effects: std::collections::VecDeque<core_execution::ExecutionEffect> = core
             .process_event(core_execution::ExecutionEvent::Start(Box::new(
                 core_execution::StartBatch {
                     operations: operations.clone(),
-                    policy,
+                    policy: policy.clone(),
                     // The DO's identity is the lease; the token is bookkeeping.
                     lease_token: format!("lane:{chain_id}:{lane}"),
                 },
@@ -119,7 +175,7 @@ impl LaneDo {
             .collect();
         while let Some(core_execution::ExecutionEffect::Work(mut request)) = effects.pop_front() {
             let outcome = self
-                .execute(&config, chain_id, lane, &operations, &request.operation)
+                .execute(&context, chain_id, lane, &operations, &request.operation)
                 .await;
             match core.resolve(&mut request, outcome) {
                 Ok(next) => effects.extend(next),
@@ -135,7 +191,7 @@ impl LaneDo {
 
     async fn execute(
         &self,
-        config: &CfConfig,
+        context: &BatchContext<'_>,
         chain_id: u64,
         lane: u8,
         batch: &[RoutedUserOperation],
@@ -144,9 +200,9 @@ impl LaneDo {
         match operation {
             // --- chain support & assets ---
             Op::CheckChainSupported => Out::Supported {
-                supported: self.chain_supported(config, chain_id).await,
+                supported: self.chain_supported(context, chain_id).await,
             },
-            Op::LoadChainAssets => self.load_chain_assets(config, chain_id).await,
+            Op::LoadChainAssets => self.load_chain_assets(context, chain_id).await,
             // --- record store (RecordDO subrequests) ---
             Op::LoadRecords { hashes } => {
                 let mut records = Vec::with_capacity(hashes.len());
@@ -302,15 +358,12 @@ impl LaneDo {
                 }
             }
             Op::ClearStaleIntent { intent, reason } => {
-                worker::console_warn!(
-                    "clearing stale prepared bundle intent: chain_id={chain_id} lane={lane} transaction_hash={} reason={reason}",
-                    intent.transaction_hash
-                );
-                match self.clear_intent_if_matches(&intent.transaction_hash).await {
+                match self
+                    .clear_stale_bundle_intent(context, intent, reason)
+                    .await
+                {
                     Ok(()) => Out::Done,
-                    Err(_) => Out::Failed {
-                        message: "could not clear stale prepared bundle intent".into(),
-                    },
+                    Err(message) => Out::Failed { message },
                 }
             }
             // --- broadcast-seen cache (loss harmless) ---
@@ -342,100 +395,302 @@ impl LaneDo {
                 self.mark_bundle_submitted(chain_id, lane, intent, *gas_limit)
                     .await
             }
-            // --- chain IO: lands with T015; unreachable while
-            // `CheckChainSupported` gates execution off (see chain_supported) ---
-            Op::ResumeBundleIntent { .. }
-            | Op::SimulateIndividually { .. }
-            | Op::FetchAccountNonces { .. }
-            | Op::SimulateBundle { .. }
-            | Op::FetchTransactionContext { .. }
-            | Op::FetchMarketPrice
-            | Op::SignBundle { .. }
-            | Op::BroadcastRaw { .. }
-            | Op::ProbeTransactionKnown { .. }
-            | Op::ProbeStaleNonce { .. }
-            | Op::RecordUnprovenBroadcast { .. }
-            | Op::FetchTempoContext
-            | Op::SignTempoBundle { .. }
-            | Op::AcquireTreasuryLease
+            // --- chain IO over the trusted transport (docker engine arms) ---
+            Op::ResumeBundleIntent { intent } => {
+                match self.resume_bundle_intent(context, intent).await {
+                    Ok(disposition) => Out::Resumed {
+                        known_outcome: disposition != BundleResumeDisposition::Unknown,
+                    },
+                    Err(message) => Out::Failed { message },
+                }
+            }
+            Op::SimulateIndividually {
+                entry_point,
+                operations,
+            } => {
+                let packed = operations
+                    .iter()
+                    .map(|(_, packed)| packed.clone())
+                    .collect::<Vec<_>>();
+                let hashes = operations.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let verdicts = simulate::simulate_individually(
+                    context.trusted,
+                    chain_id,
+                    *entry_point,
+                    context.policy.relayer,
+                    context.policy.treasury,
+                    &packed,
+                    &hashes,
+                )
+                .await;
+                Out::OperationVerdicts {
+                    verdicts: verdicts.into_iter().map(operation_sim_verdict).collect(),
+                }
+            }
+            Op::FetchAccountNonces {
+                entry_point,
+                probes,
+            } => {
+                let calls = probes
+                    .iter()
+                    .map(|(sender, nonce)| RpcBatchCall {
+                        method: "eth_call",
+                        params: json!([{
+                            "to": entry_point.to_string(),
+                            "data": format!(
+                                "0x{}",
+                                hex::encode(vela_relay_core::abi::get_nonce_calldata(
+                                    *sender, *nonce
+                                ))
+                            ),
+                        }, "latest"]),
+                    })
+                    .collect::<Vec<_>>();
+                match context.trusted.batch(chain_id, &calls).await {
+                    Ok(responses) => Out::AccountNonces {
+                        nonces: (0..probes.len())
+                            .map(|index| {
+                                response_abi_u256(&responses, index, "EntryPoint getNonce")
+                                    .map_err(|error| {
+                                        worker::console_warn!(
+                                            "could not decode EntryPoint account nonce: chain_id={chain_id} error={error}"
+                                        );
+                                    })
+                                    .ok()
+                            })
+                            .collect(),
+                    },
+                    Err(error) => {
+                        worker::console_warn!(
+                            "could not resolve account nonce mismatches: chain_id={chain_id} count={} error={error}",
+                            probes.len()
+                        );
+                        Out::Failed {
+                            message: error.to_string(),
+                        }
+                    }
+                }
+            }
+            Op::SimulateBundle {
+                entry_point,
+                operations,
+            } => {
+                let packed = operations
+                    .iter()
+                    .map(|(_, packed)| packed.clone())
+                    .collect::<Vec<_>>();
+                let hashes = operations.iter().map(|(hash, _)| *hash).collect::<Vec<_>>();
+                let verdict = simulate::simulate_bundle(
+                    context.trusted,
+                    chain_id,
+                    *entry_point,
+                    context.policy.relayer,
+                    context.policy.treasury,
+                    &packed,
+                    &hashes,
+                )
+                .await;
+                Out::BundleVerdict {
+                    verdict: bundle_sim_verdict(verdict),
+                }
+            }
+            Op::FetchTransactionContext {
+                entry_point,
+                calldata,
+            } => {
+                match transaction_context(
+                    context.trusted,
+                    chain_id,
+                    context.policy.relayer,
+                    *entry_point,
+                    calldata,
+                )
+                .await
+                {
+                    Ok(transaction_context) => Out::Context {
+                        context: transaction_context,
+                    },
+                    Err(message) => Out::Failed { message },
+                }
+            }
+            Op::FetchMarketPrice => {
+                let Some(symbol) = context.native_symbol.borrow().clone() else {
+                    return Out::Failed {
+                        message: "chain assets were not resolved".into(),
+                    };
+                };
+                match market_usd_price(&symbol).await {
+                    Ok(price) => Out::Price { price },
+                    Err(message) => Out::Failed { message },
+                }
+            }
+            Op::SignBundle { request } => sign_bundle(context, chain_id, lane, request),
+            Op::BroadcastRaw {
+                raw_transaction,
+                transaction_hash: _,
+            } => {
+                match context
+                    .trusted
+                    .broadcast_raw_transaction(chain_id, raw_transaction)
+                    .await
+                {
+                    Ok(outcome) => Out::Sent {
+                        reply: broadcast_reply(outcome),
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::ProbeTransactionKnown { transaction_hash } => Out::Known {
+                known: transaction_is_known(context.trusted, chain_id, transaction_hash).await,
+            },
+            Op::ProbeStaleNonce { intent } => Out::Stale {
+                stale: bundle_nonce_is_stale(context, intent).await,
+            },
+            Op::RecordUnprovenBroadcast {
+                transaction_hash,
+                ambiguous,
+                reason,
+            } => {
+                if *ambiguous {
+                    worker::console_warn!(
+                        "ambiguous handleOps broadcast is not yet observable: chain_id={chain_id} lane={lane} transaction_hash={transaction_hash} reason={reason}"
+                    );
+                } else {
+                    worker::console_warn!(
+                        "rejected broadcast is unproven; retaining exact handleOps outbox: chain_id={chain_id} lane={lane} transaction_hash={transaction_hash} reason={reason}"
+                    );
+                }
+                Out::Done
+            }
+            // --- treasury funding: lands with T016 (TreasuryDO) ---
+            Op::AcquireTreasuryLease
             | Op::EnsureTreasuryLease
             | Op::ReleaseTreasuryLease
             | Op::LoadPreparedFunding
             | Op::SaveFundingIntent { .. }
             | Op::ClearFundingIntent { .. }
             | Op::FetchTreasuryContext
-            | Op::FetchTempoTreasuryContext { .. }
             | Op::SignTreasuryTransfer { .. }
             | Op::SignTreasuryPathUsd { .. }
             | Op::AcquireReceiptProbe { .. }
             | Op::FetchTransactionReceipt { .. }
             | Op::RecordTreasuryShortfall { .. }
-            | Op::RecordTempoTreasuryShortfall { .. }
             | Op::RecordPartialTopUp { .. }
             | Op::RecordFundingSubmitted { .. }
             | Op::RecordUnprovenFunding { .. }
             | Op::NoteFundingReceipt { .. } => Out::Failed {
-                message: "chain transport lands with T015".into(),
+                message: "treasury funding lands with T016".into(),
+            },
+            // --- Tempo (0x76 envelope): lands with T017 ---
+            Op::FetchTempoContext
+            | Op::SignTempoBundle { .. }
+            | Op::FetchTempoTreasuryContext { .. }
+            | Op::RecordTempoTreasuryShortfall { .. } => Out::Failed {
+                message: "Tempo transport lands with T017".into(),
             },
         }
     }
 
     /// Dynamic-chain gate (research.md R10): the optional allowlist first,
-    /// then trusted-RPC availability. Until T015 wires the trusted transport,
-    /// execution stays gated off and every batch defers with the frozen
-    /// "chain has no trusted executor RPC" reason (safe staging).
-    async fn chain_supported(&self, config: &CfConfig, chain_id: u64) -> bool {
-        if !config.execution_chains.is_empty() && !config.execution_chains.contains(&chain_id) {
+    /// then trusted-RPC availability (explicit URLs → Alchemy → directory),
+    /// exactly the docker `TrustedRpcClient::supports_chain` resolution.
+    async fn chain_supported(&self, context: &BatchContext<'_>, chain_id: u64) -> bool {
+        if !context.config.execution_chains.is_empty()
+            && !context.config.execution_chains.contains(&chain_id)
+        {
             return false;
         }
-        false // T015: trusted-RPC resolution
+        context.trusted.supports_chain(chain_id).await
     }
 
-    async fn load_chain_assets(&self, config: &CfConfig, chain_id: u64) -> Out {
+    /// Docker `chain_assets_for`: directory payment assets, with missing
+    /// stablecoin decimals resolved through one trusted `eth_call` batch and
+    /// still-undecodable entries dropped.
+    async fn load_chain_assets(&self, context: &BatchContext<'_>, chain_id: u64) -> Out {
         if vela_relay_core::tempo::is_tempo_chain(chain_id) {
-            return Out::Assets {
-                resolved: tempo_chain_assets(config),
-            };
+            let resolved = tempo_chain_assets(context.config);
+            *context.native_symbol.borrow_mut() = Some(resolved.native_symbol.clone());
+            return Out::Assets { resolved };
         }
-        match crate::arms::market::payment_metadata(&self.env, chain_id).await {
-            Ok(metadata) => {
-                let Some(native) = metadata.native_currency else {
-                    return Out::AssetsUnavailable {
-                        reason: "could not load payment assets from chain directory".into(),
-                    };
+        let metadata = match market::payment_metadata(&self.env, chain_id).await {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                return Out::AssetsUnavailable {
+                    reason: "could not load payment assets from chain directory".into(),
                 };
-                let mut stablecoins = std::collections::BTreeMap::new();
-                for stable in metadata.stables {
-                    let Ok(address) = stable.contract.parse::<alloy::primitives::Address>() else {
-                        continue;
-                    };
-                    // T015 resolves missing decimals via the trusted RPC batch
-                    // exactly as the docker shell; until execution is enabled
-                    // this path is unreachable.
-                    let Some(decimals) = stable.decimals.filter(|decimals| *decimals <= 38) else {
-                        continue;
-                    };
-                    stablecoins.insert(
-                        address,
-                        vela_relay_core::settlement::StablecoinConfig {
-                            symbol: stable.symbol.clone(),
-                            decimals,
-                        },
-                    );
-                }
-                Out::Assets {
-                    resolved: core_execution::ResolvedChainAssets {
-                        assets: vela_relay_core::settlement::ChainAssetConfig {
-                            native_decimals: native.decimals,
-                            settlement_markup_bps: config.settlement_markup_bps,
-                            stablecoins,
-                        },
-                        native_symbol: native.symbol,
-                    },
-                }
             }
-            Err(_) => Out::AssetsUnavailable {
+        };
+        let Some(native) = metadata.native_currency else {
+            return Out::AssetsUnavailable {
                 reason: "could not load payment assets from chain directory".into(),
+            };
+        };
+        let mut stablecoins = metadata
+            .stables
+            .into_iter()
+            .filter_map(|stable| {
+                stable
+                    .contract
+                    .parse::<Address>()
+                    .ok()
+                    .map(|address| (address, stable.symbol, stable.decimals))
+            })
+            .collect::<Vec<_>>();
+        let missing_decimals = stablecoins
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (address, _, decimals))| {
+                decimals.is_none().then_some((index, *address))
+            })
+            .collect::<Vec<_>>();
+        if !missing_decimals.is_empty() {
+            let calls = missing_decimals
+                .iter()
+                .map(|(_, address)| RpcBatchCall {
+                    method: "eth_call",
+                    params: json!([{
+                        "to": address.to_string(),
+                        "data": format!("0x{}", hex::encode(ERC20_DECIMALS_SELECTOR)),
+                    }, "latest"]),
+                })
+                .collect::<Vec<_>>();
+            let responses = match context.trusted.batch(chain_id, &calls).await {
+                Ok(responses) => responses,
+                Err(error) => {
+                    return Out::AssetsUnavailable {
+                        reason: error.to_string(),
+                    };
+                }
+            };
+            for (response_index, (stable_index, _)) in missing_decimals.into_iter().enumerate() {
+                let decimals = response_abi_u256(&responses, response_index, "ERC-20 decimals")
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok())
+                    .filter(|decimals| *decimals <= 38);
+                stablecoins[stable_index].2 = decimals;
+            }
+        }
+        let stablecoins = stablecoins
+            .into_iter()
+            .filter_map(|(address, symbol, decimals)| {
+                let decimals = decimals?;
+                Some((
+                    address,
+                    vela_relay_core::settlement::StablecoinConfig { symbol, decimals },
+                ))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        *context.native_symbol.borrow_mut() = Some(native.symbol.clone());
+        Out::Assets {
+            resolved: core_execution::ResolvedChainAssets {
+                assets: vela_relay_core::settlement::ChainAssetConfig {
+                    native_decimals: native.decimals,
+                    settlement_markup_bps: context.config.settlement_markup_bps,
+                    stablecoins,
+                },
+                native_symbol: native.symbol,
             },
         }
     }
@@ -453,15 +708,241 @@ impl LaneDo {
         self.state.storage().get(INTENT_KEY).await.ok().flatten()
     }
 
-    async fn clear_intent_if_matches(&self, transaction_hash: &str) -> Result<()> {
+    /// Guarded delete; reports whether this caller removed the intent (the
+    /// docker store's `clear_prepared_bundle_intent` atomicity contract).
+    async fn clear_intent_if_matches(&self, transaction_hash: &str) -> Result<bool> {
         if let Some(intent) = self.intent().await
             && intent
                 .transaction_hash
                 .eq_ignore_ascii_case(transaction_hash)
         {
             self.state.storage().delete(INTENT_KEY).await?;
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// Docker engine `clear_stale_bundle_intent`: only the caller that
+    /// atomically removed the intent clears the seen cache and logs.
+    async fn clear_stale_bundle_intent(
+        &self,
+        context: &BatchContext<'_>,
+        intent: &PreparedBundleIntent,
+        reason: &str,
+    ) -> std::result::Result<(), String> {
+        let cleared = self
+            .clear_intent_if_matches(&intent.transaction_hash)
+            .await
+            .map_err(|_| "could not clear stale prepared bundle intent".to_owned())?;
+        if !cleared {
+            return Ok(());
+        }
+        self.forget_broadcast(&intent.transaction_hash).await;
+        let relayer = relayer_address_for_lane(context, intent.lane)
+            .map(|relayer| relayer.to_string())
+            .unwrap_or_else(|| "<underivable>".into());
+        worker::console_warn!(
+            "discarded a prepared handleOps transaction whose nonce is already mined; queued operations will be rebuilt: chain_id={} lane={} relayer={relayer} stale_nonce={} transaction_hash={} reason={reason}",
+            intent.chain_id,
+            intent.lane,
+            intent.nonce,
+            intent.transaction_hash
+        );
         Ok(())
+    }
+
+    async fn remember_broadcast(&self, transaction_hash: &str) {
+        let _ = self
+            .state
+            .storage()
+            .put(&format!("seen:{transaction_hash}"), Date::now().as_millis())
+            .await;
+    }
+
+    async fn forget_broadcast(&self, transaction_hash: &str) {
+        let _ = self
+            .state
+            .storage()
+            .delete(&format!("seen:{transaction_hash}"))
+            .await;
+    }
+
+    // --- prepared-intent recovery (docker engine `resume_bundle_intent`) ---
+
+    async fn resume_bundle_intent(
+        &self,
+        context: &BatchContext<'_>,
+        intent: &PreparedBundleIntent,
+    ) -> std::result::Result<BundleResumeDisposition, String> {
+        let audit = self.audit_bundle_replay(intent).await?;
+        if audit.active == 0 && audit.terminal != 0 {
+            self.clear_obsolete_bundle_intent(intent, audit).await?;
+            return Ok(BundleResumeDisposition::Cleared);
+        }
+        if audit.terminal != 0 || audit.expired != 0 {
+            worker::console_warn!(
+                "replaying prepared bundle after auditing unavailable members: chain_id={} lane={} transaction_hash={} active_members={} terminal_members={} expired_members={}",
+                intent.chain_id,
+                intent.lane,
+                intent.transaction_hash,
+                audit.active,
+                audit.terminal,
+                audit.expired
+            );
+        }
+        match self.broadcast_bundle_intent(context, intent).await? {
+            BundleBroadcastDisposition::Unknown => {
+                return Ok(BundleResumeDisposition::Unknown);
+            }
+            BundleBroadcastDisposition::Confirmed => {}
+        }
+        if audit.active == 0 {
+            // Lifecycle records expire sooner than the signed outbox. Without a terminal record
+            // or receipt there is no proof that this transaction is safe to forget, so retain it
+            // and keep reconciling the relayer nonce.
+            return Ok(BundleResumeDisposition::Confirmed);
+        }
+        let indexed = self.submit_bundle_members(intent.chain_id, intent).await?;
+        if indexed != audit.active {
+            // Records retain a shorter TTL than prepared outbox entries. A member can expire or
+            // reach a terminal state between the preflight audit and this atomic transition.
+            // Re-audit before deciding that the lane is corrupt; exact submitted membership is
+            // also safe when an earlier recovery attempt already completed the transition.
+            let after = self.audit_bundle_replay(intent).await?;
+            if after.active == 0 {
+                if after.terminal != 0 {
+                    self.clear_obsolete_bundle_intent(intent, after).await?;
+                    return Ok(BundleResumeDisposition::Cleared);
+                }
+                return Ok(BundleResumeDisposition::Confirmed);
+            }
+            if after.awaiting_submission != 0 {
+                return Err(
+                    "prepared bundle has live members that could not enter submitted state".into(),
+                );
+            }
+        }
+        Ok(BundleResumeDisposition::Confirmed)
+    }
+
+    async fn audit_bundle_replay(
+        &self,
+        intent: &PreparedBundleIntent,
+    ) -> std::result::Result<core_execution::BundleReplayAudit, String> {
+        let mut records = Vec::with_capacity(intent.user_operation_hashes.len());
+        for hash in &intent.user_operation_hashes {
+            match self
+                .record(intent.chain_id, hash, &RecordCommand::Get)
+                .await
+            {
+                Ok(RecordReply::Record { record }) => records.push(record.map(|record| *record)),
+                _ => return Err("could not read UserOperation records".into()),
+            }
+        }
+        core_execution::audit_bundle_replay(intent, &records)
+    }
+
+    async fn clear_obsolete_bundle_intent(
+        &self,
+        intent: &PreparedBundleIntent,
+        audit: core_execution::BundleReplayAudit,
+    ) -> std::result::Result<(), String> {
+        if audit.terminal == 0 {
+            return Err("refusing to clear an unproven prepared bundle".into());
+        }
+        self.clear_intent_if_matches(&intent.transaction_hash)
+            .await
+            .map_err(|_| "could not clear prepared bundle intent".to_owned())?;
+        self.forget_broadcast(&intent.transaction_hash).await;
+        worker::console_warn!(
+            "cleared prepared bundle with no live lifecycle members: chain_id={} lane={} transaction_hash={} terminal_members={} expired_members={}",
+            intent.chain_id,
+            intent.lane,
+            intent.transaction_hash,
+            audit.terminal,
+            audit.expired
+        );
+        Ok(())
+    }
+
+    /// Broadcasts the exact durable bytes. An ambiguous send is not mempool admission: the
+    /// expected transaction hash must be observable before callers may persist `submitted`.
+    async fn broadcast_bundle_intent(
+        &self,
+        context: &BatchContext<'_>,
+        intent: &PreparedBundleIntent,
+    ) -> std::result::Result<BundleBroadcastDisposition, String> {
+        let raw = validate_raw_transaction(&intent.raw_transaction, &intent.transaction_hash)
+            .map_err(|error| error.to_string())?;
+        if self.broadcast_seen(&intent.transaction_hash).await {
+            return Ok(BundleBroadcastDisposition::Confirmed);
+        }
+        let outcome = match context
+            .trusted
+            .broadcast_raw_transaction(intent.chain_id, &raw)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.forget_broadcast(&intent.transaction_hash).await;
+                return Err(error.to_string());
+            }
+        };
+        use crate::arms::trusted::BroadcastOutcome;
+        match outcome {
+            BroadcastOutcome::Accepted(hash)
+                if hash.eq_ignore_ascii_case(&intent.transaction_hash) =>
+            {
+                self.remember_broadcast(&intent.transaction_hash).await;
+                Ok(BundleBroadcastDisposition::Confirmed)
+            }
+            BroadcastOutcome::Accepted(_) => {
+                self.forget_broadcast(&intent.transaction_hash).await;
+                Err("RPC returned a transaction hash different from the signed bytes".into())
+            }
+            BroadcastOutcome::Ambiguous(reason) => {
+                self.forget_broadcast(&intent.transaction_hash).await;
+                if transaction_is_known(context.trusted, intent.chain_id, &intent.transaction_hash)
+                    .await
+                {
+                    self.remember_broadcast(&intent.transaction_hash).await;
+                    Ok(BundleBroadcastDisposition::Confirmed)
+                } else if nonce_too_low(&reason) && bundle_nonce_is_stale(context, intent).await {
+                    self.clear_stale_bundle_intent(context, intent, &reason)
+                        .await?;
+                    Ok(BundleBroadcastDisposition::Unknown)
+                } else {
+                    worker::console_warn!(
+                        "ambiguous handleOps broadcast is not yet observable: chain_id={} lane={} transaction_hash={} reason={reason}",
+                        intent.chain_id,
+                        intent.lane,
+                        intent.transaction_hash
+                    );
+                    Ok(BundleBroadcastDisposition::Unknown)
+                }
+            }
+            BroadcastOutcome::Rejected(reason) => {
+                self.forget_broadcast(&intent.transaction_hash).await;
+                if transaction_is_known(context.trusted, intent.chain_id, &intent.transaction_hash)
+                    .await
+                {
+                    self.remember_broadcast(&intent.transaction_hash).await;
+                    return Ok(BundleBroadcastDisposition::Confirmed);
+                }
+                if nonce_too_low(&reason) && bundle_nonce_is_stale(context, intent).await {
+                    self.clear_stale_bundle_intent(context, intent, &reason)
+                        .await?;
+                    return Ok(BundleBroadcastDisposition::Unknown);
+                }
+                worker::console_warn!(
+                    "rejected broadcast is unproven; retaining exact handleOps outbox: chain_id={} lane={} transaction_hash={} reason={reason}",
+                    intent.chain_id,
+                    intent.lane,
+                    intent.transaction_hash
+                );
+                Ok(BundleBroadcastDisposition::Unknown)
+            }
+        }
     }
 
     async fn broadcast_seen(&self, transaction_hash: &str) -> bool {
@@ -530,6 +1011,19 @@ impl LaneDo {
         intent: &PreparedBundleIntent,
         _gas_limit: u64,
     ) -> Out {
+        match self.submit_bundle_members(chain_id, intent).await {
+            Ok(indexed) => Out::Indexed { indexed },
+            Err(message) => Out::Failed { message },
+        }
+    }
+
+    /// The docker store's `mark_bundle_submitted`, spelled as per-member
+    /// guarded RecordDO transitions plus the lane's bundle index.
+    async fn submit_bundle_members(
+        &self,
+        chain_id: u64,
+        intent: &PreparedBundleIntent,
+    ) -> std::result::Result<usize, String> {
         let mut indexed = 0usize;
         let mut members: Vec<String> = Vec::new();
         for hash in &intent.user_operation_hashes {
@@ -550,9 +1044,7 @@ impl LaneDo {
                 }
                 Ok(_) => {}
                 Err(()) => {
-                    return Out::Failed {
-                        message: "could not mark bundle members submitted".into(),
-                    };
+                    return Err("could not mark bundle members submitted".into());
                 }
             }
         }
@@ -561,7 +1053,7 @@ impl LaneDo {
             .storage()
             .put(&format!("bundle:{}", intent.transaction_hash), &members)
             .await;
-        Out::Indexed { indexed }
+        Ok(indexed)
     }
 
     async fn dead_letter(&self, batch: &[RoutedUserOperation], index: usize, reason: &str) -> Out {
@@ -776,6 +1268,289 @@ impl LaneDo {
             ),
         }
     }
+}
+
+// --- verdict/reply conversions (docker engine arm mappings, verbatim) ---
+
+fn operation_sim_verdict(
+    verdict: SimulationVerdict<SimulationResult>,
+) -> core_execution::OperationSimVerdict {
+    match verdict {
+        SimulationVerdict::Success(_) => core_execution::OperationSimVerdict::Success,
+        SimulationVerdict::NonceMismatch => core_execution::OperationSimVerdict::NonceMismatch,
+        SimulationVerdict::Rejected(reason) => core_execution::OperationSimVerdict::Rejected {
+            reason: reason.to_string(),
+        },
+        SimulationVerdict::Pending(reason) => core_execution::OperationSimVerdict::Pending {
+            reason: reason.to_string(),
+        },
+        SimulationVerdict::Transient(reason) => core_execution::OperationSimVerdict::Transient {
+            reason: reason.to_string(),
+        },
+    }
+}
+
+fn bundle_sim_verdict(
+    verdict: SimulationVerdict<SimulationResult>,
+) -> core_execution::BundleSimVerdict {
+    match verdict {
+        SimulationVerdict::Success(simulation) => {
+            core_execution::BundleSimVerdict::Success(core_execution::BundleSimulationData {
+                gas_used: simulation.gas_used,
+                operation_gas_used: simulation
+                    .events
+                    .iter()
+                    .map(|event| event.actual_gas_used)
+                    .collect(),
+                logs: simulation
+                    .logs
+                    .iter()
+                    .map(|log| vela_relay_core::settlement::SettlementLog {
+                        address: log.address,
+                        topics: log.topics.clone(),
+                        data: log.data.clone(),
+                    })
+                    .collect(),
+            })
+        }
+        SimulationVerdict::NonceMismatch => core_execution::BundleSimVerdict::NonceMismatch,
+        SimulationVerdict::Rejected(reason) => core_execution::BundleSimVerdict::Rejected {
+            reason: reason.to_string(),
+        },
+        SimulationVerdict::Pending(reason) => core_execution::BundleSimVerdict::Pending {
+            reason: reason.to_string(),
+        },
+        SimulationVerdict::Transient(reason) => core_execution::BundleSimVerdict::Transient {
+            reason: reason.to_string(),
+        },
+    }
+}
+
+fn broadcast_reply(
+    outcome: crate::arms::trusted::BroadcastOutcome,
+) -> core_execution::BroadcastReply {
+    use crate::arms::trusted::BroadcastOutcome;
+    match outcome {
+        BroadcastOutcome::Accepted(hash) => core_execution::BroadcastReply::Accepted {
+            transaction_hash: hash,
+        },
+        BroadcastOutcome::Ambiguous(reason) => core_execution::BroadcastReply::Ambiguous { reason },
+        BroadcastOutcome::Rejected(reason) => core_execution::BroadcastReply::Rejected { reason },
+    }
+}
+
+/// Docker engine `transaction_context`: one five-call batch (estimate, block,
+/// tip, nonce, balance) with the legacy-gas-price tip fallback; every error
+/// string byte-identical.
+async fn transaction_context(
+    trusted: &TrustedRpcClient<'_>,
+    chain_id: u64,
+    relayer: Address,
+    entry_point: Address,
+    calldata: &[u8],
+) -> std::result::Result<core_execution::TransactionContext, String> {
+    let transaction = json!({
+        "from": relayer.to_string(),
+        "to": entry_point.to_string(),
+        "data": format!("0x{}", hex::encode(calldata)),
+    });
+    let calls = [
+        RpcBatchCall {
+            method: "eth_estimateGas",
+            params: json!([transaction]),
+        },
+        RpcBatchCall {
+            method: "eth_getBlockByNumber",
+            params: json!(["latest", false]),
+        },
+        RpcBatchCall {
+            method: "eth_maxPriorityFeePerGas",
+            params: json!([]),
+        },
+        RpcBatchCall {
+            method: "eth_getTransactionCount",
+            params: json!([relayer.to_string(), "pending"]),
+        },
+        RpcBatchCall {
+            method: "eth_getBalance",
+            params: json!([relayer.to_string(), "pending"]),
+        },
+    ];
+    let responses = trusted
+        .batch(chain_id, &calls)
+        .await
+        .map_err(|error| error.to_string())?;
+    let estimated_gas = response_quantity(&responses, 0, "eth_estimateGas")?;
+    let block = response_value(&responses, 1, "eth_getBlockByNumber")?;
+    let base_fee = block
+        .get("baseFeePerGas")
+        .and_then(Value::as_str)
+        .and_then(parse_quantity)
+        .ok_or_else(|| "latest block has no EIP-1559 base fee".to_owned())?;
+    let tip = match response_quantity_optional(&responses, 2) {
+        Some(tip) => tip,
+        None => {
+            let gas_price = trusted
+                .call(chain_id, "eth_gasPrice", json!([]))
+                .await
+                .map_err(|error| error.to_string())?
+                .as_str()
+                .and_then(parse_quantity)
+                .ok_or_else(|| "eth_gasPrice returned an invalid quantity".to_owned())?;
+            vela_relay_core::gas_math::tip_from_legacy_gas_price(gas_price, base_fee)
+                .ok_or_else(|| "gas price is below the latest base fee".to_owned())?
+        }
+    };
+    let base_fee = u128::try_from(base_fee).map_err(|_| "base fee exceeds uint128".to_owned())?;
+    let tip = u128::try_from(tip).map_err(|_| "priority fee exceeds uint128".to_owned())?;
+    let max_fee_per_gas = vela_relay_core::gas_math::quoted_outer_fee(base_fee, tip)
+        .ok_or_else(|| "EIP-1559 fee overflow".to_owned())?;
+    let nonce = u64::try_from(response_quantity(&responses, 3, "eth_getTransactionCount")?)
+        .map_err(|_| "relayer nonce exceeds uint64".to_owned())?;
+    let relayer_balance = response_quantity(&responses, 4, "eth_getBalance")?;
+
+    Ok(core_execution::TransactionContext {
+        estimated_gas,
+        base_fee_per_gas: base_fee,
+        max_fee_per_gas,
+        max_priority_fee_per_gas: tip,
+        nonce,
+        relayer_balance,
+    })
+}
+
+/// Docker engine `market_usd_price` (Binance, 60 s cache, same error texts).
+/// Pegged chains never reach this arm — the core decides the peg.
+async fn market_usd_price(symbol: &str) -> std::result::Result<U256, String> {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if symbol.is_empty() || !symbol.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return Err("native currency symbol is invalid".into());
+    }
+    let now = Date::now().as_millis();
+    let cached = MARKET_PRICES.with(|prices| {
+        prices
+            .borrow()
+            .get(&symbol)
+            .filter(|(expires_at, _)| *expires_at > now)
+            .map(|(_, price)| *price)
+    });
+    if let Some(price) = cached {
+        return Ok(price);
+    }
+    let raw_price = market::binance_usdt_price(&symbol)
+        .await
+        .ok_or_else(|| "Binance native USD price request failed".to_owned())?;
+    let price = vela_relay_core::settlement::parse_market_usd_price(&raw_price)
+        .ok_or_else(|| "Binance native USD price is invalid".to_owned())?;
+    MARKET_PRICES.with(|prices| {
+        prices
+            .borrow_mut()
+            .insert(symbol, (now + BINANCE_PRICE_TTL_MS, price));
+    });
+    Ok(price)
+}
+
+/// Docker engine `SignBundle` arm: the same core signing math over the
+/// vault-derived per-lane key. The key never enters the core (Constitution).
+fn sign_bundle(
+    context: &BatchContext<'_>,
+    chain_id: u64,
+    lane: u8,
+    request: &core_execution::BundleSignRequest,
+) -> Out {
+    let Some(secret) = context.config.operator_secret.as_deref() else {
+        return Out::Failed {
+            message: "OPERATOR_SECRET is required for execution".into(),
+        };
+    };
+    let key = match vault::derive_pool_relayer_secret_key(secret, lane as usize) {
+        Ok(key) => key,
+        Err(error) => {
+            return Out::Failed {
+                message: error.to_string(),
+            };
+        }
+    };
+    match vela_relay_core::signing::sign_eip1559(
+        &key,
+        vela_relay_core::signing::TransactionPlan {
+            chain_id,
+            nonce: request.nonce,
+            gas_limit: request.gas_limit,
+            max_fee_per_gas: request.max_fee_per_gas,
+            max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+            to: request.entry_point,
+            value: U256::ZERO,
+            input: request.calldata.clone().into(),
+        },
+    ) {
+        Ok(signed) => Out::Signed {
+            signed: core_execution::SignedBundle {
+                raw_transaction_hex: format!("0x{}", hex::encode(&signed.raw_transaction)),
+                transaction_hash: signed.transaction_hash,
+                nonce: signed.nonce,
+            },
+        },
+        Err(error) => Out::Failed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Docker engine `transaction_is_known`: the expected hash must be observable.
+async fn transaction_is_known(
+    trusted: &TrustedRpcClient<'_>,
+    chain_id: u64,
+    expected_hash: &str,
+) -> bool {
+    match trusted
+        .call(chain_id, "eth_getTransactionByHash", json!([expected_hash]))
+        .await
+    {
+        Ok(Value::Object(transaction)) => transaction
+            .get("hash")
+            .and_then(Value::as_str)
+            .is_some_and(|hash| hash.eq_ignore_ascii_case(expected_hash)),
+        Ok(_) => false,
+        Err(error) => {
+            worker::console_warn!(
+                "could not confirm ambiguous transaction broadcast: chain_id={chain_id} transaction_hash={expected_hash} error={error}"
+            );
+            false
+        }
+    }
+}
+
+/// Docker engine `bundle_nonce_is_stale`: errors keep the intent (false).
+async fn bundle_nonce_is_stale(context: &BatchContext<'_>, intent: &PreparedBundleIntent) -> bool {
+    let Some(relayer) = relayer_address_for_lane(context, intent.lane) else {
+        return false;
+    };
+    match context
+        .trusted
+        .call(
+            intent.chain_id,
+            "eth_getTransactionCount",
+            json!([relayer.to_string(), "latest"]),
+        )
+        .await
+        .ok()
+        .and_then(|value| value.as_str().and_then(parse_quantity))
+        .and_then(|nonce| u64::try_from(nonce).ok())
+    {
+        Some(latest_nonce) => latest_nonce > intent.nonce,
+        None => false,
+    }
+}
+
+/// The docker engine indexes its pre-derived key table; here the pool address
+/// is derived on demand from the operator secret (chain-agnostic, vault).
+fn relayer_address_for_lane(context: &BatchContext<'_>, lane: u8) -> Option<Address> {
+    let secret = context.config.operator_secret.as_deref()?;
+    vault::derive_pool_relayer_address(secret, lane as usize)
+        .ok()?
+        .parse()
+        .ok()
 }
 
 fn tempo_chain_assets(config: &CfConfig) -> core_execution::ResolvedChainAssets {
