@@ -151,3 +151,21 @@ deployment; recorded in the deploy checklist.
 | 3 Time-driven | Gate 4 passes |
 | 4 Scale | Gate 5 passes |
 | 5 Coexistence | Gate 0 on the final merge + Gate 6 review |
+
+## Full gate pass record (T027, 2026-08-29)
+
+| Gate | Result |
+|---|---|
+| 0 — native untouched | fmt clean; clippy 5 baseline warnings (none added); docker shell suite 79 + core suite 129 = 208, all green |
+| 1 — wasm + purity | `cargo check -p vela-relay-cf --target wasm32-unknown-unknown --locked` clean, wasm clippy 0 warnings; `cargo tree -p vela-relay-core -e normal` has zero IO/runtime crates; the SC-003 grep set (`transition_is_allowed`, `retry_delay`, `parse_reimbursement`) finds no local definitions in `vela-relay-cf/src/` — every hit resolves into `vela_relay_core` |
+| 2 — replay battery | 42/42 (19 bodies byte-identical + health/version declared deltas + 21 statuses), re-verified after every US and finally at T027 |
+| 3 — fault injection | as-run record above (anvil rig): funding cycles, both simulation tiers, nonce triage, burst serialization, restart resume with zero double-broadcast, DLQ backstop; found + fixed the u128 boundary bug |
+| 4 — tolerances | as-run record above: ladder ≤1 s deviation; submitted→included 2–3 s; park→auto-execute arc closed |
+| 5 — load (SC-004/007) | NOT RUN — requires a deployed Workers environment (T022, user-gated: account + `wrangler deploy` + three-region k6) |
+| 6 — ownership review | checklist recorded in `docs/cloudflare.md`; to be executed against the real second deployment |
+
+Artifacts: final wasm 2,422,916 B raw / 804,691 B gzipped (full shell: all
+execution arms, treasury, tempo, alerts — the Paid-plan 10 MB gzip limit has
+>12× headroom); suites docker 79 + core 129 (four alert tests moved
+shell→core with the `alert` module promotion); spec checklist
+`checklists/requirements.md` re-verified 16/16.

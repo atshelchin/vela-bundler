@@ -41,6 +41,7 @@
 pub mod abi;
 pub mod admission;
 pub mod alchemy;
+pub mod alert;
 pub mod broadcast;
 pub mod cost;
 pub mod estimate;

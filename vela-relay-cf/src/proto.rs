@@ -131,6 +131,20 @@ pub enum TreasuryCommand {
         transaction_hash: String,
         ttl_ms: u64,
     },
+    /// Telegram alert suppression slot (docker `claim_executor_alert`,
+    /// `SET NX PX cooldown`): the chain's coordinator is the natural home for
+    /// its cross-lane alert dedup.
+    ClaimAlert {
+        fingerprint: String,
+        token: String,
+        ttl_ms: u64,
+    },
+    /// Token-guarded release so an undelivered alert can retry before the
+    /// cooldown expires (docker `release_executor_alert`).
+    ReleaseAlert {
+        fingerprint: String,
+        token: String,
+    },
 }
 
 #[derive(Serialize, Deserialize)]

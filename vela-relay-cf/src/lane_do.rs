@@ -388,11 +388,8 @@ impl LaneDo {
                 stage,
                 reason,
             } => {
-                // Telegram delivery lands with T023; the gating decision is
-                // the core's and is preserved in the log line meanwhile.
-                worker::console_error!(
-                    "executor issue: chain_id={chain_id} stage={stage} user_operation_hash={hash} reason={reason}"
-                );
+                self.notify_executor_issue(context, chain_id, stage, hash, reason)
+                    .await;
                 Out::Done
             }
             Op::EmitDiagnostic { diagnostic } => {
@@ -1027,6 +1024,75 @@ impl LaneDo {
         command: &RecordCommand,
     ) -> std::result::Result<RecordReply, ()> {
         crate::admission::record_command(&self.env, chain_id, hash, command).await
+    }
+
+    /// Docker `TelegramAlertNotifier::notify_executor_issue`: silent no-op
+    /// when unconfigured; otherwise fingerprint → TreasuryDO suppression slot
+    /// (`SET NX PX cooldown`) → sendMessage; the slot is released on delivery
+    /// failure so the alert can retry before the cooldown expires.
+    async fn notify_executor_issue(
+        &self,
+        context: &BatchContext<'_>,
+        chain_id: u64,
+        stage: &str,
+        user_operation_hash: &str,
+        reason: &str,
+    ) {
+        let (Some(bot_token), Some(chat_id)) = (
+            context.config.telegram_bot_token.as_deref(),
+            context.config.telegram_chat_id.as_deref(),
+        ) else {
+            return;
+        };
+        let fingerprint = vela_relay_core::alert::alert_fingerprint(chain_id, stage, reason);
+        let claim_token = unique_token("telegram", chain_id, 0);
+        let claimed = match self
+            .treasury(
+                chain_id,
+                None,
+                TreasuryCommand::ClaimAlert {
+                    fingerprint: fingerprint.clone(),
+                    token: claim_token.clone(),
+                    ttl_ms: context.config.telegram_cooldown_ms,
+                },
+            )
+            .await
+        {
+            Ok(TreasuryReply::Acquired { acquired }) => acquired,
+            _ => {
+                worker::console_warn!(
+                    "could not acquire Telegram alert suppression slot: chain_id={chain_id} stage={stage}"
+                );
+                return;
+            }
+        };
+        if !claimed {
+            return;
+        }
+        let text = vela_relay_core::alert::executor_alert_text(
+            chain_id,
+            stage,
+            user_operation_hash,
+            reason,
+            context.config.telegram_cooldown_ms / 1_000,
+        );
+        if crate::arms::telegram::send_message(bot_token, chat_id, &text).await {
+            worker::console_log!("sent Telegram executor alert: chain_id={chain_id} stage={stage}");
+            return;
+        }
+        worker::console_warn!(
+            "could not deliver Telegram executor alert; releasing suppression slot for retry: chain_id={chain_id} stage={stage}"
+        );
+        let _ = self
+            .treasury(
+                chain_id,
+                None,
+                TreasuryCommand::ReleaseAlert {
+                    fingerprint,
+                    token: claim_token,
+                },
+            )
+            .await;
     }
 
     /// One TreasuryDO round-trip (instance = the chain). `renew` piggybacks a

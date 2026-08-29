@@ -109,7 +109,7 @@ declared tolerances.
 
 **Independent Test**: quickstart Gate 5.
 
-- [ ] T022 [US4] Load harness (k6 or fetch-based) in `specs/002-cf-worker-shell/load/`: sustained ≥1,000 submits/s + ≥10,000 reads/s from three regions, 30 min, p95 targets; then per-chain isolation experiment (SC-007); tune queue batch size/consumer concurrency from results; record numbers in quickstart
+- [ ] T022 [US4] Load harness (k6 or fetch-based) in `specs/002-cf-worker-shell/load/`: sustained ≥1,000 submits/s + ≥10,000 reads/s from three regions, 30 min, p95 targets; then per-chain isolation experiment (SC-007); tune queue batch size/consumer concurrency from results; record numbers in quickstart. *DEFERRED — user-gated: needs a real deployed Workers environment (Paid account + `wrangler deploy` + three-region load generators); everything local-testable about US4's mechanisms is already covered by Gates 2–4. The deploy workflow it needs is documented in docs/cloudflare.md*
 
 **Checkpoint**: scale evidence recorded; merge as its own PR.
 
@@ -121,10 +121,10 @@ declared tolerances.
 
 **Independent Test**: Gate 0 on the final merge + Gate 6 ownership review.
 
-- [ ] T023 [P] [US5] `vela-relay-cf/src/arms/telegram.rs` + diagnostics: alert delivery with the core-decided gating, structured logs carrying the historical field names (EmitDiagnostic arm parity with the docker shell's)
-- [ ] T024 [P] [US5] `docs/cloudflare.md`: deploy workflow (wrangler secrets, vars, Paid-plan requirement, EXECUTION_CHAINS semantics incl. the shared-key rule, lane-width provisioning note per R11, Gate 6 checklist); README architecture section gains the three-member picture
-- [ ] T025 [US5] Constitution PATCH amendment PR: Principle I's illustrative shell list + Architectural Constraints name the second shell (`vela-relay-cf` wiring Cloudflare primitives); Sync Impact Report + version bump per governance
-- [ ] T026 [US5] Finalize FR-012 equivalence notes: `specs/002-cf-worker-shell/equivalence-notes/transport.md` (queue ack granularity vs offset rule, structural lease answers, alarm tolerances, treasury lock mapping) + platform-bindings.md as-built pass
+- [x] T023 [P] [US5] `vela-relay-cf/src/arms/telegram.rs` + diagnostics: alert delivery with the core-decided gating, structured logs carrying the historical field names (EmitDiagnostic arm parity with the docker shell's). *As built: the suppression RULES (fingerprint normalization — numbers → #, ≥10-hex-digit literals → <hex> — bounded single-line reason, frozen message text) were promoted to the NEW core `alert` module (4 tests moved shell→core; docker alert.rs delegates); the suppression SLOT lives in each chain's TreasuryDO (`ClaimAlert` = SET NX PX cooldown, token-guarded `ReleaseAlert` on delivery failure — strongly consistent per chain, unlike KV); transport = fetch + 5 s Delay race; config TELEGRAM_BOT_TOKEN (secret) + TELEGRAM_CHAT_ID paired-or-neither + VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS (30 min default) — docker names/rules verbatim. Unconfigured = silent no-op (docker parity; the T014 placeholder log removed). EmitDiagnostic arm parity was already complete since T014*
+- [x] T024 [P] [US5] `docs/cloudflare.md`: deploy workflow (wrangler secrets, vars, Paid-plan requirement, EXECUTION_CHAINS semantics incl. the shared-key rule, lane-width provisioning note per R11, Gate 6 checklist); README architecture section gains the three-member picture. *Done: full provision→secrets→vars→deploy→verify workflow, the (chain, key set) ownership rule, narrowing-width drain warning, executor RPC resolution order, Gate 6 checklist, operational notes (JSON-text DO boundaries, Delay-raced fetches, per-chain alert dedup, wasm size); README now describes the three-member workspace with both shells*
+- [x] T025 [US5] Constitution PATCH amendment PR: Principle I's illustrative shell list + Architectural Constraints name the second shell (`vela-relay-cf` wiring Cloudflare primitives); Sync Impact Report + version bump per governance. *Done: 1.0.2 → 1.0.3; Principle I now says 'a Shell wires Core decisions to real infrastructure; the repository has two' with both shells' primitive lists; Architectural Constraints gained the second-shell bullet (wasm-only member, bindings-contract-in-same-PR rule, (chain, key set) ownership) and the shell-owned/toolchain bullets name both shells' mechanisms; Sync Impact Report records the rationale*
+- [x] T026 [US5] Finalize FR-012 equivalence notes: `specs/002-cf-worker-shell/equivalence-notes/transport.md` (queue ack granularity vs offset rule, structural lease answers, alarm tolerances, treasury lock mapping) + platform-bindings.md as-built pass. *Done: transport.md written covering ack-vs-offset mapping, structural lane lease + never-produced Interrupted, the treasury lock + renewal-on-touch, alarms-for-loops with measured tolerances, alert suppression, and the no-auto-deploy simulation delta; platform-bindings.md needed no further pass — it was updated as-built in the same PR as every transport change (the FR-012 rule working as designed)*
 
 **Checkpoint**: feature complete; final merge PR.
 
@@ -132,7 +132,7 @@ declared tolerances.
 
 ## Phase 8: Polish & Cross-Cutting
 
-- [ ] T027 Full gate pass: Gates 0–4 re-run, SC-003 rule-duplication audit recorded (grep set from quickstart Gate 1), suite counts recorded; `specs/002-cf-worker-shell/checklists/requirements.md` re-verified; memory of measured wasm size + battery result in quickstart
+- [x] T027 Full gate pass: Gates 0–4 re-run, SC-003 rule-duplication audit recorded (grep set from quickstart Gate 1), suite counts recorded; `specs/002-cf-worker-shell/checklists/requirements.md` re-verified; memory of measured wasm size + battery result in quickstart. *Recorded in quickstart 'Full gate pass record': Gate 0 green (fmt / clippy 5-baseline / docker 79 + core 129), Gate 1 clean (wasm check + clippy 0, core tree IO-free, SC-003 grep finds no local rule definitions), Gate 2 final 42/42, Gates 3–4 as-run records, Gate 5 deferred with T022, Gate 6 checklist in docs. Final wasm 2,422,916 B raw / 804,691 B gz (>12× Paid-limit headroom); checklist 16/16*
 
 ---
 

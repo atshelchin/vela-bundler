@@ -113,6 +113,43 @@ impl DurableObject for TreasuryDo {
                 }
                 TreasuryReply::Acquired { acquired }
             }
+            TreasuryCommand::ClaimAlert {
+                fingerprint,
+                token,
+                ttl_ms,
+            } => {
+                let key = format!("alert:{fingerprint}");
+                let held: Option<LeaseState> = self.state.storage().get(&key).await.ok().flatten();
+                let acquired = held.is_none_or(|held| now >= held.deadline_ms);
+                if acquired {
+                    self.state
+                        .storage()
+                        .put(
+                            &key,
+                            &LeaseState {
+                                token,
+                                deadline_ms: now + ttl_ms,
+                            },
+                        )
+                        .await?;
+                }
+                TreasuryReply::Acquired { acquired }
+            }
+            TreasuryCommand::ReleaseAlert { fingerprint, token } => {
+                let key = format!("alert:{fingerprint}");
+                if let Some(held) = self
+                    .state
+                    .storage()
+                    .get::<LeaseState>(&key)
+                    .await
+                    .ok()
+                    .flatten()
+                    && held.token == token
+                {
+                    self.state.storage().delete(&key).await?;
+                }
+                TreasuryReply::Released
+            }
         };
         Response::from_json(&reply)
     }

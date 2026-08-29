@@ -27,6 +27,11 @@ pub struct CfConfig {
     /// Delayed-payload retention floor (docker `attempt_ttl`, default 48 h;
     /// the effective retention is `max(this, 14 d)` — queue-retention parity).
     pub attempt_ttl_ms: u64,
+    /// Telegram alerts (docker `TelegramAlertsConfig`): both or neither.
+    pub telegram_bot_token: Option<String>,
+    pub telegram_chat_id: Option<String>,
+    /// Suppression cooldown (docker default 30 min).
+    pub telegram_cooldown_ms: u64,
     // Executor policy values — same names, defaults, and bounds as the docker
     // parser; injected into the core as data.
     pub max_bundle_operations: usize,
@@ -142,6 +147,15 @@ impl CfConfig {
                 .collect::<Result<Vec<_>, _>>()?,
         };
 
+        // Same pairing rule as the docker parser.
+        let telegram_bot_token = secret(env, "TELEGRAM_BOT_TOKEN").filter(|t| !t.trim().is_empty());
+        let telegram_chat_id = var(env, "TELEGRAM_CHAT_ID").filter(|c| !c.trim().is_empty());
+        if telegram_bot_token.is_some() != telegram_chat_id.is_some() {
+            return Err(
+                "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured together".into(),
+            );
+        }
+
         // Same defaults and bounds as the docker parser.
         let settlement_markup_bps =
             u64_var(env, "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS", 14_000)?;
@@ -193,6 +207,10 @@ impl CfConfig {
             receipt_poll_ms: u64_var(env, "VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS", 3)?
                 .saturating_mul(1_000),
             attempt_ttl_ms: u64_var(env, "VELA_RELAY_EXECUTOR_ATTEMPT_TTL_SECS", 48 * 60 * 60)?
+                .saturating_mul(1_000),
+            telegram_bot_token,
+            telegram_chat_id,
+            telegram_cooldown_ms: u64_var(env, "VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS", 30 * 60)?
                 .saturating_mul(1_000),
             max_bundle_operations: usize_var(env, "VELA_RELAY_MAX_BUNDLE_OPERATIONS", 10)?,
             gas_buffer_bps: u64_var(env, "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,

@@ -5,4 +5,5 @@ pub mod market;
 pub mod quote;
 pub mod rpc;
 pub mod simulate;
+pub mod telegram;
 pub mod trusted;
