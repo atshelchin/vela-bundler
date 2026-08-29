@@ -51,6 +51,52 @@ Scripted against `wrangler dev`:
 - concurrent consumer scale-out on one lane → single LaneDO serializes; no
   interleaved execution.
 
+### Gate 3 as run (T018, anvil rig)
+
+Rig: anvil claiming chain 42161 (`--block-time 3`), the real EntryPoint v0.7
+runtime installed via `anvil_setCode`, trivially-valid account contracts at
+the fixture senders, the treasury funded 10 ETH, and a JSON-RPC shaper between
+the worker and anvil (`scratchpad/t018/shaper.py`) that (a) restores the
+production error shapes anvil strips — anvil returns FailedOp custom-error
+reverts with empty `data` in every tier, so the shaper re-derives the AA25
+cause from `EntryPoint.getNonce` and surfaces it exactly as geth's tracer
+would — and (b) injects faults on demand. Local chain metadata was seeded
+into the dev KV (`chainmeta:42161`, `rpc: []`) so no executor traffic can
+leave localhost. Results:
+
+- **Full batches landed**: four complete treasury funding cycles (treasury
+  nonce 0→4, each `SET NX`-guarded intent saved/probed/cleared through
+  TreasuryDO) and four mined `handleOps` bundles across four lanes — via BOTH
+  simulation tiers (`eth_simulateV1`, and `debug_traceCall` with the shaper
+  refusing simulateV1). Records reached `submitted` with the mined hashes.
+- **Nonce triage**: future nonce → `future account nonce moved to durable
+  delayed inbox … user_nonce=3 onchain_nonce=1 attempt=1` (parked, alarm
+  set); stale nonce → `stale account nonce rejected … user_nonce=0
+  onchain_nonce=1` (terminal). Frozen texts, real probe values.
+- **Same-lane burst**: six same-sender ops (nonces 0–5) sent concurrently →
+  exactly one outer transaction (relayer nonce advanced by exactly 1), the
+  five future ops held; single LaneDO serialized the whole burst.
+- **Restart + resume, zero double-broadcast**: the lane's prepared intent and
+  the parked delayed-inbox entries survived a hard kill of every wrangler and
+  workerd process; after restart, redeliveries re-ran `ResumeBundleIntent`
+  17 more times (≈100 times pre-restart) — the relayer nonce never moved and
+  no second funding/bundle transaction ever appeared. At-least-once
+  redelivery and the queue's `max_retries` → DLQ backstop (observed at 101
+  attempts) both behaved.
+- **Known pre-US3 limitation (by design)**: with receipt confirmation not yet
+  landed (T020), a submitted bundle's members never reach a terminal state,
+  so the lane's intent is retained and new work on that lane redelivers until
+  the DLQ backstop — the core's resume-first rule working as specified; US3
+  closes it.
+- **Found and fixed by this gate**: `PreparedFundingIntent.amount_wei: u128`
+  degraded to a float crossing the TreasuryDO boundary (workers-rs
+  `Request::json` parses via JS `JSON.parse` → JsValue). The whole TreasuryDO
+  boundary now speaks JSON text and stores the funding intent as its JSON
+  string (see platform-bindings.md).
+- Not externally injectable: a kill between RecordDO create and queue send
+  (sub-millisecond window); the crash-window contract is declared on the
+  `Enqueue` row of platform-bindings.md and matches the docker shell's.
+
 ## Gate 4 — Time-driven tolerances (SC-006)
 
 Park an operation at attempt *k*; assert redelivery within the tolerance

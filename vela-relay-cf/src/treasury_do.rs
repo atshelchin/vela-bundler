@@ -44,7 +44,14 @@ impl DurableObject for TreasuryDo {
     }
 
     async fn fetch(&self, mut req: Request) -> Result<Response> {
-        let request: TreasuryRequest = req.json().await?;
+        // The funding intent carries a u128 (`amount_wei`); anything that
+        // round-trips through a JS value (structured clone, JsValue serde)
+        // degrades it to a float. The whole boundary therefore speaks JSON
+        // text: request body parsed with serde_json, funding intent stored as
+        // its JSON string (see contracts/platform-bindings.md).
+        let text = req.text().await?;
+        let request: TreasuryRequest = serde_json::from_str(&text)
+            .map_err(|error| worker::Error::RustError(error.to_string()))?;
         let now = Date::now().as_millis();
         if let Some(renew) = &request.renew {
             self.renew_lease(renew, now).await?;
@@ -65,22 +72,20 @@ impl DurableObject for TreasuryDo {
                 TreasuryReply::Released
             }
             TreasuryCommand::LoadFunding => TreasuryReply::Funding {
-                intent: self.state.storage().get(FUNDING_KEY).await.ok().flatten(),
+                intent: self.funding().await,
             },
             TreasuryCommand::SaveFunding { intent } => {
-                let existing: Option<vela_relay_core::task::PreparedFundingIntent> =
-                    self.state.storage().get(FUNDING_KEY).await.ok().flatten();
-                if existing.is_some() {
+                if self.funding().await.is_some() {
                     TreasuryReply::Saved { saved: false }
                 } else {
-                    self.state.storage().put(FUNDING_KEY, &intent).await?;
+                    let payload = serde_json::to_string(&intent)
+                        .map_err(|error| worker::Error::RustError(error.to_string()))?;
+                    self.state.storage().put(FUNDING_KEY, payload).await?;
                     TreasuryReply::Saved { saved: true }
                 }
             }
             TreasuryCommand::ClearFunding { transaction_hash } => {
-                let existing: Option<vela_relay_core::task::PreparedFundingIntent> =
-                    self.state.storage().get(FUNDING_KEY).await.ok().flatten();
-                let cleared = match existing {
+                let cleared = match self.funding().await {
                     Some(intent) if intent.transaction_hash == transaction_hash => {
                         self.state.storage().delete(FUNDING_KEY).await?;
                         // Housekeeping only: a cleared intent is never probed
@@ -116,6 +121,13 @@ impl DurableObject for TreasuryDo {
 impl TreasuryDo {
     async fn lease(&self) -> Option<LeaseState> {
         self.state.storage().get(LEASE_KEY).await.ok().flatten()
+    }
+
+    /// The funding intent is stored as its JSON string (u128 `amount_wei`
+    /// must never round-trip through a JS number).
+    async fn funding(&self) -> Option<vela_relay_core::task::PreparedFundingIntent> {
+        let payload: Option<String> = self.state.storage().get(FUNDING_KEY).await.ok().flatten();
+        payload.and_then(|payload| serde_json::from_str(&payload).ok())
     }
 
     /// `SET NX PX`: only an absent or expired lease can be taken.

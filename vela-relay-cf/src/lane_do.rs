@@ -1031,7 +1031,10 @@ impl LaneDo {
         if response.status_code() != 200 {
             return Err(());
         }
-        response.json::<TreasuryReply>().await.map_err(|_| ())
+        // Text + serde_json, never a JsValue round-trip: the funding intent's
+        // u128 `amount_wei` would degrade to a float.
+        let text = response.text().await.map_err(|_| ())?;
+        serde_json::from_str::<TreasuryReply>(&text).map_err(|_| ())
     }
 
     async fn intent(&self) -> Option<PreparedBundleIntent> {
