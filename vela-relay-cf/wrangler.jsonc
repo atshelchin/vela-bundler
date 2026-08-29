@@ -49,7 +49,9 @@
     // Same validated policy values as the docker shell; parsed by src/config.rs
     // and injected into the core as data (Constitution II).
     "VELA_RELAY_RELAYER_COUNT": "10",
-    "VELA_RELAY_EXECUTOR_ENABLED": "false",
+    // VELA_RELAY_EXECUTOR_ENABLED is deliberately unset: the default is
+    // enabled (docker parity) and requires the OPERATOR_SECRET secret; set
+    // "false" explicitly for an intake-only deployment.
     // Optional; empty/absent = dynamic directory-driven chains (research R10).
     // MANDATORY + globally disjoint only when key material is shared across
     // deployments (FR-010).
