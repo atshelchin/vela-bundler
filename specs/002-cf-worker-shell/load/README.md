@@ -75,6 +75,11 @@ k6 run -e BASE_URL=http://127.0.0.1:8787 -e RECIPIENT=<dev vault> \
 
 | Run | Date | Regions | Submits/s (agg) | Reads/s (agg) | p95 submit | p95 read | Failures | Verdict |
 |---|---|---|---|---|---|---|---|---|
-| SC-004 | _pending real deployment_ | | | | | | | |
-| SC-007 baseline | _pending_ | | | | | | | |
-| SC-007 saturated | _pending_ | | | | | | | |
+| SC-004 sample (reduced rate, single vantage) | 2026-08-29 | 1 (dev machine via proxy → KIX edge) | 50 (held: 12,001 accepted in 4 min) | 500 | — (aggregate p95 726 ms, client-vantage) | — | 0 / 131,938 | correctness + rate-holding proven; p95 targets NOT claimable from this vantage (proxy adds latency; min RTT 56 ms) |
+| SC-007 baseline (victim 8453: 20 sub/s + 100 read/s) | 2026-08-29 | 1 | 20 | 100 | p95 701 ms (victim, all reqs) | — | 0 / 14,394 | baseline captured |
+| SC-007 saturated (42161 at +300 sub/s) | 2026-08-29 | 1 | 320 | 100 | victim p95 661 ms (−5.7% vs baseline) | — | 0 / 50,396 | **PASS — victim degradation < 0% ≪ 10%** |
+
+The full SC-004 claim (≥1,000 submits/s + ≥10,000 reads/s, three continents,
+30 min, p95 500/200 ms) still needs three clean regional load generators; the
+deployment itself showed zero failures and zero backpressure at every rate
+tried from this vantage.

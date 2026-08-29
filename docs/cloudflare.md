@@ -41,21 +41,30 @@ behind a system proxy, curl to localhost needs `--noproxy '*'`.
 1. **Provision** (once per account):
    - a Workers Paid account;
    - the queues: `wrangler queues create vela-relay-ops` and
-     `wrangler queues create vela-relay-dlq`;
-   - a KV namespace: `wrangler kv namespace create CACHE`, then put its id
-     into `wrangler.jsonc` (`REPLACE_WITH_KV_NAMESPACE_ID`).
-2. **Secrets** (never in config files):
+     `wrangler queues create vela-relay-dlq`.
+   The KV namespace needs NO provisioning and NO config edit: the tracked
+   `wrangler.jsonc` declares the `CACHE` binding without an id, and
+   `wrangler deploy` auto-provisions a namespace on first deploy (and stays
+   bound to it afterwards — shown as `env.CACHE (inherited)`). The config
+   file deliberately contains nothing account-specific.
+2. **Secrets** (never in config files; account-specific values all live
+   here):
 
    ```sh
    wrangler secret put OPERATOR_SECRET      # required when the executor is enabled
    wrangler secret put ALCHEMY_API_KEY      # optional executor RPC tier
    wrangler secret put TELEGRAM_BOT_TOKEN   # optional; pairs with TELEGRAM_CHAT_ID
+   wrangler secret put TELEGRAM_CHAT_ID     # optional; both or neither
    ```
+
+   Deploying overwrites remote vars with the config file's `vars` block, so
+   never park account-specific values as dashboard vars — the secret store
+   survives every deploy.
 
 3. **Vars** (in `wrangler.jsonc` or the dashboard): the executor policy
    values use the docker names, defaults, and bounds
    (`VELA_RELAY_EXECUTOR_*`, `VELA_RELAY_MAX_BUNDLE_OPERATIONS`,
-   `VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS`, `TELEGRAM_CHAT_ID`); see
+   `VELA_RELAY_TELEGRAM_ALERT_COOLDOWN_SECS`); see
    `vela-relay-cf/src/config.rs` for the full list.
 4. `wrangler deploy`. The Durable Object migrations (v1 RecordDo, v2 LaneDo,
    v3 TreasuryDo) ship with the config and apply on first deploy.
@@ -106,7 +115,8 @@ Before pointing production traffic at a second deployment:
 
 ## Operational notes
 
-- The wasm binary is ~750 KB (222 KB gzipped) with the full core linked.
+- The wasm binary is ~2.4 MB (~790 KB gzipped) with the full shell linked
+  (>12x headroom under the Paid-plan 10 MB gzip limit).
 - Every DO boundary speaks JSON text (never JsValue serde): u128 fields
   degrade to floats through JS `JSON.parse`/structured clone. The queue
   envelope travels as its exact JSON text for the same reason.

@@ -161,8 +161,8 @@ deployment; recorded in the deploy checklist.
 | 2 — replay battery | 42/42 (19 bodies byte-identical + health/version declared deltas + 21 statuses), re-verified after every US and finally at T027 |
 | 3 — fault injection | as-run record above (anvil rig): funding cycles, both simulation tiers, nonce triage, burst serialization, restart resume with zero double-broadcast, DLQ backstop; found + fixed the u128 boundary bug |
 | 4 — tolerances | as-run record above: ladder ≤1 s deviation; submitted→included 2–3 s; park→auto-execute arc closed |
-| 5 — load (SC-004/007) | NOT RUN — requires a deployed Workers environment (T022, user-gated: account + `wrangler deploy` + three-region k6) |
-| 6 — ownership review | checklist recorded in `docs/cloudflare.md`; to be executed against the real second deployment |
+| 5 — load (SC-004/007) | PARTIAL (2026-08-29, real deployment at https://vela-relay-cf.atshelchin.workers.dev): SC-007 isolation **PASSED** (victim-chain p95 661 ms under a 300/s saturation of another chain vs 701 ms baseline — degradation < 0% ≪ 10%; 50,396/50,396 checks); SC-004 sample at 1/10 rate from one vantage held 50 submits/s + 500 reads/s for 4 min with 143,939/143,939 checks and 0/131,938 failures (12,001 operations accepted into real Durable Objects + Queues). The full three-region 30-min p95 claim still needs regional load generators (load/README.md result table) |
+| 6 — ownership review | EXECUTED against the real deployment: distinct `OPERATOR_SECRET` (fresh key, vault 0x3e59292e…fe3c — never the docker secret; FR-010 satisfied with no `EXECUTION_CHAINS` restriction needed), settlement recipient = own derivation, queues deployment-private (`vela-relay-ops`/`-dlq`), **production Gate 2 replay 42/42 byte-identical** vs a docker reference round paying the same vault; alarm observation (submitted→included) awaits the executor being enabled + treasury funding (user decision) |
 
 Artifacts: final wasm 2,422,916 B raw / 804,691 B gzipped (full shell: all
 execution arms, treasury, tempo, alerts — the Paid-plan 10 MB gzip limit has

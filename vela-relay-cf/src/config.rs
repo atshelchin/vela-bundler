@@ -147,9 +147,13 @@ impl CfConfig {
                 .collect::<Result<Vec<_>, _>>()?,
         };
 
-        // Same pairing rule as the docker parser.
+        // Same pairing rule as the docker parser. The chat id is
+        // account-specific, so deployments keep it in the secret store with
+        // the token (a plain var also works, e.g. under `wrangler dev`).
         let telegram_bot_token = secret(env, "TELEGRAM_BOT_TOKEN").filter(|t| !t.trim().is_empty());
-        let telegram_chat_id = var(env, "TELEGRAM_CHAT_ID").filter(|c| !c.trim().is_empty());
+        let telegram_chat_id = var(env, "TELEGRAM_CHAT_ID")
+            .or_else(|| secret(env, "TELEGRAM_CHAT_ID"))
+            .filter(|c| !c.trim().is_empty());
         if telegram_bot_token.is_some() != telegram_chat_id.is_some() {
             return Err(
                 "TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be configured together".into(),

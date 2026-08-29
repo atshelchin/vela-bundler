@@ -7,3 +7,4 @@ vela-relay-cf/build/
 node_modules/
 .wrangler/
 .dev.vars
+.env.cloudflare

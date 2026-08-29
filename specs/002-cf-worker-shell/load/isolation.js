@@ -115,7 +115,14 @@ if (SATURATE_RATE > 0) {
   };
 }
 
-export const options = { scenarios };
+// Always-passing bounds: they exist to force per-chain sub-metric reporting.
+export const options = {
+  scenarios,
+  thresholds: {
+    "http_req_duration{chain:victim}": ["p(95)<60000"],
+    "http_req_duration{chain:saturated}": ["p(95)<60000"],
+  },
+};
 
 export function saturate() {
   submitTo(SATURATED_CHAIN, "5a", "saturated");
