@@ -1,12 +1,18 @@
 <!--
 Sync Impact Report
-- Version change: 1.0.1 → 1.0.2 (PATCH: core crate renamed vela-bundler →
-  vela-relay-core by user decision — "vela-bundler" is the name of the
-  predecessor system referenced throughout the code (HKDF salt, golden-vector
-  tests) and collides with it; naming bullet updated accordingly.
-  Earlier 1.0.0 → 1.0.1: toolchain gate corrected to match the repository's
-  actual CI — clippy runs without -D warnings, 9 pre-existing warnings on main)
-- Modified principles: none (Architectural Constraints bullets only)
+- Version change: 1.0.2 → 1.0.3 (PATCH: spec 002 added a second shell —
+  `vela-relay-cf`, Cloudflare Workers/wasm. Principle I's shell wording and
+  the Architectural Constraints now name both shells; no principle changes
+  meaning — the second shell is exactly what Principle I's "the Shell wires
+  Core decisions to real infrastructure" anticipated, with Cloudflare
+  primitives (Durable Objects, Queues, KV, alarms) as the infrastructure.
+  The toolchain bullet records the wasm-only member's exclusion from native
+  default builds and its own wasm gate.
+  Earlier 1.0.1 → 1.0.2: core crate renamed vela-bundler → vela-relay-core
+  (predecessor-name collision). Earlier 1.0.0 → 1.0.1: toolchain gate
+  corrected to match actual CI.)
+- Modified principles: I (illustrative shell list names both shells; rule
+  unchanged)
 - Added sections: none
 - Removed sections: none
 - Follow-up TODOs: none
@@ -20,8 +26,11 @@ Sync Impact Report
 
 All business vocabulary and decision rules live in the `vela-relay-core` crate (the Core).
 The Core is deliberately I/O-free: no Redis, no Iggy, no HTTP clients, no tokio, no
-clocks, no environment access. The `vela-relay` crate (the Shell) wires Core decisions
-to real infrastructure: Axum, Redis, Iggy, EVM JSON-RPC, Binance, Telegram.
+clocks, no environment access. A Shell wires Core decisions to real infrastructure;
+the repository has two: the `vela-relay` crate (docker shell — Axum, Redis, Iggy,
+EVM JSON-RPC, Binance, Telegram) and the `vela-relay-cf` crate (Cloudflare shell —
+Workers fetch/queue handlers, Durable Objects, Queues, KV caches, DO alarms). Both
+consume the same Core decisions; neither may define a rule of its own.
 
 - Adding an I/O dependency to `vela-relay-core` is a design violation, not a convenience.
   The crate manifest MUST state this rule in a comment, mirroring `p256-registrar`.
@@ -117,13 +126,23 @@ cause of a behavior change that was not consciously specified.
   must not be reused. Core *modules* are still named for business domains
   (admission, settlement, lifecycle), never for architectural layers.
 - **Shell-owned concerns**: transport (body limits, JSON envelopes, IP extraction),
-  Redis key naming, TTL values, Iggy topology and reconnection, RPC endpoint failover
-  and cooldown, key custody and signing execution, process lifecycle.
+  storage key naming and TTL values (Redis keys / Durable Object storage layouts),
+  queue topology and redelivery (Iggy reconnection / Cloudflare Queues ack-retry),
+  RPC endpoint failover and cooldown, key custody and signing execution, process
+  lifecycle (tokio supervision / DO alarms and isolate lifetimes).
+- **Second shell (`vela-relay-cf`, spec 002)**: wasm-only workspace member excluded
+  from native default builds (`default-members`); its Operation→primitive mapping
+  and every declared behavioral delta live in
+  `specs/002-cf-worker-shell/contracts/platform-bindings.md`, which MUST be updated
+  in the same PR as any transport-mapping change. Execution ownership is
+  (chain, key set): deployments sharing an operator secret MUST declare disjoint
+  `VELA_RELAY_EXECUTION_CHAINS`.
 - **Toolchain**: Rust edition 2024; the repository CI gates — `cargo fmt --check`,
   `cargo clippy --all-targets --locked`, and `cargo test --locked` — MUST pass on
-  every commit that lands. Warnings-as-errors is not currently a CI gate (9
-  pre-existing warnings exist on main); migration changes MUST NOT add new
-  warnings.
+  every commit that lands (the native gates exclude `vela-relay-cf`; its gate is
+  `cargo check -p vela-relay-cf --target wasm32-unknown-unknown --locked`).
+  Warnings-as-errors is not currently a CI gate (pre-existing warnings exist on
+  main); migration changes MUST NOT add new warnings.
 
 ## Development Workflow & Quality Gates
 
@@ -151,4 +170,4 @@ that violates a principle MUST either be revised or carry an explicit, justified
 complexity-tracking entry. Reviews of migration PRs verify Principles I–VI
 explicitly.
 
-**Version**: 1.0.2 | **Ratified**: 2026-08-28 | **Last Amended**: 2026-08-28
+**Version**: 1.0.3 | **Ratified**: 2026-08-28 | **Last Amended**: 2026-08-29

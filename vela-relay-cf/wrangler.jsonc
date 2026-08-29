@@ -1,0 +1,62 @@
+// Cloudflare shell deployment manifest. Requires Workers Paid (research.md R1:
+// the Free plan's 10 ms CPU budget cannot host the crypto paths).
+{
+  "name": "vela-relay-cf",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-08-01",
+  "build": {
+    "command": "cargo install -q worker-build && worker-build --release"
+  },
+  // Raise the CPU ceiling for execution batches (paid-plan knob).
+  "limits": {
+    "cpu_ms": 300000
+  },
+  // Loss-harmless caches only (FR-006): chain metadata, market price, gas quotes.
+  // No id on purpose: `wrangler deploy` auto-provisions the namespace on
+  // first deploy and keeps the worker bound to it afterwards, so a clone
+  // deploys with zero config edits.
+  "kv_namespaces": [
+    { "binding": "CACHE" }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "name": "RECORDS", "class_name": "RecordDo" },
+      { "name": "LANES", "class_name": "LaneDo" },
+      { "name": "TREASURY", "class_name": "TreasuryDo" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RecordDo"] },
+    { "tag": "v2", "new_sqlite_classes": ["LaneDo"] },
+    { "tag": "v3", "new_sqlite_classes": ["TreasuryDo"] }
+  ],
+  "queues": {
+    "producers": [
+      { "binding": "OPS_QUEUE", "queue": "vela-relay-ops" },
+      { "binding": "DLQ_QUEUE", "queue": "vela-relay-dlq" }
+    ],
+    "consumers": [
+      {
+        "queue": "vela-relay-ops",
+        "max_batch_size": 20,
+        "max_batch_timeout": 2,
+        "max_retries": 100,
+        "dead_letter_queue": "vela-relay-dlq"
+      }
+    ]
+  },
+  "vars": {
+    // Same validated policy values as the docker shell; parsed by src/config.rs
+    // and injected into the core as data (Constitution II).
+    "VELA_RELAY_RELAYER_COUNT": "10",
+    // VELA_RELAY_EXECUTOR_ENABLED is deliberately unset: the default is
+    // enabled (docker parity) and requires the OPERATOR_SECRET secret; set
+    // "false" explicitly for an intake-only deployment.
+    // Optional; empty/absent = dynamic directory-driven chains (research R10).
+    // MANDATORY + globally disjoint only when key material is shared across
+    // deployments (FR-010).
+    "VELA_RELAY_EXECUTION_CHAINS": ""
+  }
+  // Secrets (never in this file): OPERATOR_SECRET, ALCHEMY_API_KEY,
+  // TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID — set via `wrangler secret put`.
+}

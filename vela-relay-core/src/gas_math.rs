@@ -8,7 +8,7 @@ use std::{
 };
 
 use alloy::primitives::U256;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,13 +32,13 @@ impl Default for GasPricePolicy {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GasPrice {
     pub max_fee_per_gas: u128,
     pub max_priority_fee_per_gas: u128,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct GasPriceTiers {
     pub slow: GasPrice,
     pub standard: GasPrice,

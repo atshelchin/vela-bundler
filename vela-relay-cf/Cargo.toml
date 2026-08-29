@@ -1,0 +1,30 @@
+# The Cloudflare Shell: it wires business decisions made in the
+# `vela-relay-core` crate to Cloudflare primitives (Workers fetch, Durable
+# Objects, Queues, KV, alarms). Business policy does not live here — no
+# transition table, schedule, budget, parser, or reason string may be defined
+# in this crate.
+#
+# This crate targets wasm32-unknown-unknown only. Its dependencies live under
+# a wasm32 target gate and its modules behind #[cfg(target_arch = "wasm32")],
+# so a native `cargo check -p vela-relay-cf` compiles an empty crate and the
+# repository's native gates keep their exact meaning.
+[package]
+name = "vela-relay-cf"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+worker = { version = "=0.8.5", features = ["queue"] }
+vela-relay-core = { path = "../vela-relay-core" }
+alloy = { version = "2.2.0", default-features = false, features = ["sol-types"] }
+crux_core = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+hex = "0.4"
+# k256's rand plumbing needs a wasm randomness backend to COMPILE; signing is
+# RFC6979-deterministic, so no entropy is drawn at run time (research.md R1).
+getrandom = { version = "0.2", features = ["js"] }

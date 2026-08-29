@@ -13,8 +13,9 @@ directory or Binance for Tempo quotes.
 
 ## Architecture
 
-The repository is a two-crate workspace with a strict core/shell split
-(mirroring the discipline of `p256-index`):
+The repository is a three-member workspace with a strict core/shell split
+(mirroring the discipline of `p256-index`): one decision core, two deployable
+shells.
 
 - **`vela-relay-core`** owns every business decision and is deliberately
   I/O-free — no Redis, no Iggy, no HTTP clients, no runtime, no clocks.
@@ -22,19 +23,29 @@ The repository is a two-crate workspace with a strict core/shell split
   `eth_sendUserOperation` program), `execution` (the per-lane batch program),
   `lifecycle` (the single authoritative status transition table), `settlement`
   (reimbursement parsing, evaluation, and the accept/reprice verdict), `hold`
-  (the delayed-inbox ladder and budget), `broadcast`, `funding`, `gas_math`,
-  `abi`, `signing`, `vault`, `tempo`, and the shared `task` vocabulary.
-  `cargo test -p vela-relay-core` runs the whole decision suite in well under
-  a second with no infrastructure.
-- **`vela-relay`** (this crate) is the shell: Axum transport, Redis storage
-  (Lua reduced to mechanical guarded writes), Iggy queueing, EVM RPC, key
-  custody, Binance, and Telegram. HTTP admission and the lane executor both
-  drive one crux `Core` per unit of work — the shell executes the requested
-  operations and reports what happened back as data; failures fold into
-  result variants and the core decides what they mean.
+  (the delayed-inbox ladder and budget), `broadcast`, `funding`, `simulation`
+  (verdict parsing and reasons), `receipt`, `wire` (the JSON-RPC envelope
+  bytes), `quote`, `estimate`, `alert`, `gas_math`, `abi`, `signing`, `vault`,
+  `tempo`, and the shared `task` vocabulary. `cargo test -p vela-relay-core`
+  runs the whole decision suite in well under a second with no infrastructure.
+- **`vela-relay`** (this crate) is the docker shell: Axum transport, Redis
+  storage (Lua reduced to mechanical guarded writes), Iggy queueing, EVM RPC,
+  key custody, Binance, and Telegram. HTTP admission and the lane executor
+  both drive one crux `Core` per unit of work — the shell executes the
+  requested operations and reports what happened back as data; failures fold
+  into result variants and the core decides what they mean.
+- **`vela-relay-cf`** is the Cloudflare shell (wasm-only; excluded from
+  native default builds): the same core decisions wired to Workers
+  primitives — Durable Objects supply the guard semantics Redis Lua supplies
+  (RecordDO per operation, LaneDO per chain+lane, TreasuryDO per chain),
+  Queues replace Iggy, KV holds loss-harmless caches only, and DO alarms
+  replace the timer loops. The external JSON-RPC surface is byte-identical to
+  the docker shell's (both render through `vela_relay_core::wire`). See
+  `docs/cloudflare.md`.
 
-The refactor is governed by the Spec Kit artifacts in
-`specs/001-crux-core-split/` (spec, plan, tasks, per-story equivalence notes)
+Both shells are governed by Spec Kit artifacts — `specs/001-crux-core-split/`
+(the core/shell split) and `specs/002-cf-worker-shell/` (the second shell,
+including the Operation→primitive bindings contract and measured tolerances) —
 and the project constitution in `.specify/memory/constitution.md`.
 
 ## Requirements

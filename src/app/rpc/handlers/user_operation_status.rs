@@ -1,10 +1,9 @@
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::{
     app::rpc::types::{
         GetUserOperationByHashParams, GetUserOperationReceiptParams, GetUserOperationStatusParams,
-        RpcError, RpcResponse, UserOperation, UserOperationByHash, UserOperationStatus,
-        UserOperationStatusKind,
+        RpcError, RpcResponse, UserOperationByHash, UserOperationStatus, UserOperationStatusKind,
     },
     app::{AppState, StoredUserOperation},
 };
@@ -92,54 +91,9 @@ fn result<T: serde::Serialize>(id: Value, value: T) -> RpcResponse<Value> {
     }
 }
 
-fn receipt_response(user_operation_hash: &str, operation: &StoredUserOperation) -> Option<Value> {
-    let event = operation.event.as_ref()?;
-    let receipt = operation.receipt.as_ref()?;
-    match operation.status {
-        UserOperationStatusKind::Included => {}
-        UserOperationStatusKind::Rejected if !event.success => {}
-        _ => return None,
-    }
-    let (sender, nonce, paymaster) = match &operation.user_operation {
-        UserOperation::V0_7(user_operation) => (
-            user_operation.sender.clone(),
-            user_operation.nonce.clone(),
-            user_operation.paymaster.clone(),
-        ),
-        UserOperation::V0_6(user_operation) => (
-            user_operation.sender.clone(),
-            user_operation.nonce.clone(),
-            paymaster_from_v06(&user_operation.paymaster_and_data),
-        ),
-    };
-    // ERC-7769 exposes the logs associated with the UserOperation. The persisted outer receipt is
-    // the authoritative chain snapshot; returning its logs matches the existing vela-bundler
-    // formatter and is strictly more useful than silently returning an empty list.
-    let logs = receipt
-        .get("logs")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    Some(json!({
-        "userOpHash": user_operation_hash,
-        "entryPoint": operation.entry_point,
-        "sender": sender,
-        "nonce": nonce,
-        "paymaster": paymaster,
-        "actualGasCost": event.actual_gas_cost,
-        "actualGasUsed": event.actual_gas_used,
-        "success": event.success,
-        "reason": "0x",
-        "logs": logs,
-        "receipt": receipt,
-    }))
-}
-
-fn paymaster_from_v06(paymaster_and_data: &str) -> Option<String> {
-    let value = paymaster_and_data.strip_prefix("0x")?;
-    (value.len() >= 40).then(|| format!("0x{}", &value[..40]))
-}
+/// Moved to the core wire module (spec 002) so both shells render identical
+/// ERC-7769 receipts; re-imported here for the call sites and tests.
+use vela_relay_core::wire::receipt_response;
 
 #[cfg(test)]
 mod tests {

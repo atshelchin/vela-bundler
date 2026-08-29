@@ -1,0 +1,171 @@
+# Quickstart: Validating the Cloudflare Worker Shell
+
+How to prove, at any merge point, that the second deployment target is on
+contract. See [data-model.md](data-model.md) for the object catalog and
+[contracts/](contracts/) for the frozen surfaces.
+
+## Gate 0 — Existing deployments untouched (every commit)
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --locked     # baseline warnings, add none
+cargo test --locked                     # docker shell suite
+cargo test -p vela-relay-core --locked  # core suite (includes new wire tests)
+```
+
+Expected: green, with the docker shell's behavior unchanged (FR-003/SC-002).
+
+## Gate 1 — Wasm build + purity audit
+
+```bash
+cargo check -p vela-relay-cf --target wasm32-unknown-unknown --locked
+cargo tree -p vela-relay-core -e normal   # still zero IO/runtime crates
+grep -rn "transition_is_allowed\|retry_delay\|parse_reimbursement" vela-relay-cf/src/  # expect: only core:: calls, no local definitions (SC-003)
+```
+
+## Gate 2 — Local platform emulation + replay battery (SC-001)
+
+```bash
+cd vela-relay-cf && npx wrangler dev &          # workerd: DO + Queues + KV emulated
+../specs/001-crux-core-split/replay-harness/replay.sh http://127.0.0.1:8787 out-cf full
+# docker side (same battery, same fixtures):
+../specs/001-crux-core-split/replay-harness/round.sh <docker-shell-binary> 4601 docker
+diff -r out-cf out-docker    # bodies byte-identical for every deterministic surface
+```
+
+Expected: byte-identical response bodies; RecordDO record JSON identical to the
+Redis record (masked-timestamp normalization as in the harness).
+
+## Gate 3 — Execution dispositions under fault injection (SC-005)
+
+Scripted against `wrangler dev`:
+
+- duplicate delivery of one envelope → second delivery resolves via
+  durable-status skip; one nonce consumed;
+- reordered nonces from one sender → future nonce parks in the delayed inbox
+  (LaneDO alarm set), stale nonce rejects — same reasons as the core tests pin;
+- kill/restart between RecordDO create and queue send → crash-window behavior
+  (record retained, idempotent resubmission);
+- forced DO restart mid-batch → prepared-intent resume, no
+  same-nonce-different-bytes broadcast;
+- concurrent consumer scale-out on one lane → single LaneDO serializes; no
+  interleaved execution.
+
+### Gate 3 as run (T018, anvil rig)
+
+Rig: anvil claiming chain 42161 (`--block-time 3`), the real EntryPoint v0.7
+runtime installed via `anvil_setCode`, trivially-valid account contracts at
+the fixture senders, the treasury funded 10 ETH, and a JSON-RPC shaper between
+the worker and anvil (`scratchpad/t018/shaper.py`) that (a) restores the
+production error shapes anvil strips — anvil returns FailedOp custom-error
+reverts with empty `data` in every tier, so the shaper re-derives the AA25
+cause from `EntryPoint.getNonce` and surfaces it exactly as geth's tracer
+would — and (b) injects faults on demand. Local chain metadata was seeded
+into the dev KV (`chainmeta:42161`, `rpc: []`) so no executor traffic can
+leave localhost. Results:
+
+- **Full batches landed**: four complete treasury funding cycles (treasury
+  nonce 0→4, each `SET NX`-guarded intent saved/probed/cleared through
+  TreasuryDO) and four mined `handleOps` bundles across four lanes — via BOTH
+  simulation tiers (`eth_simulateV1`, and `debug_traceCall` with the shaper
+  refusing simulateV1). Records reached `submitted` with the mined hashes.
+- **Nonce triage**: future nonce → `future account nonce moved to durable
+  delayed inbox … user_nonce=3 onchain_nonce=1 attempt=1` (parked, alarm
+  set); stale nonce → `stale account nonce rejected … user_nonce=0
+  onchain_nonce=1` (terminal). Frozen texts, real probe values.
+- **Same-lane burst**: six same-sender ops (nonces 0–5) sent concurrently →
+  exactly one outer transaction (relayer nonce advanced by exactly 1), the
+  five future ops held; single LaneDO serialized the whole burst.
+- **Restart + resume, zero double-broadcast**: the lane's prepared intent and
+  the parked delayed-inbox entries survived a hard kill of every wrangler and
+  workerd process; after restart, redeliveries re-ran `ResumeBundleIntent`
+  17 more times (≈100 times pre-restart) — the relayer nonce never moved and
+  no second funding/bundle transaction ever appeared. At-least-once
+  redelivery and the queue's `max_retries` → DLQ backstop (observed at 101
+  attempts) both behaved.
+- **Known pre-US3 limitation (by design)**: with receipt confirmation not yet
+  landed (T020), a submitted bundle's members never reach a terminal state,
+  so the lane's intent is retained and new work on that lane redelivers until
+  the DLQ backstop — the core's resume-first rule working as specified; US3
+  closes it.
+- **Found and fixed by this gate**: `PreparedFundingIntent.amount_wei: u128`
+  degraded to a float crossing the TreasuryDO boundary (workers-rs
+  `Request::json` parses via JS `JSON.parse` → JsValue). The whole TreasuryDO
+  boundary now speaks JSON text and stores the funding intent as its JSON
+  string (see platform-bindings.md).
+- Not externally injectable: a kill between RecordDO create and queue send
+  (sub-millisecond window); the crash-window contract is declared on the
+  `Enqueue` row of platform-bindings.md and matches the docker shell's.
+
+## Gate 4 — Time-driven tolerances (SC-006)
+
+Park an operation at attempt *k*; assert redelivery within the tolerance
+declared in [contracts/platform-bindings.md](contracts/platform-bindings.md);
+observe a reconcile alarm pass and a receipt-check alarm against the emulator's
+clock.
+
+### Gate 4 as run (T021, anvil rig)
+
+Same rig as Gate 3 (fresh `.wrangler/state` — a stale prepared intent from a
+previous rig chain correctly refuses to clear without terminal proof, so the
+state must match the chain). Measured under `wrangler dev`:
+
+- **Full lifecycle with receipt confirmation**: send → `queued` → `submitted`
+  at T+6–8 s (funding + bundle) → **`included` at T+9–10 s** — the lane
+  reconcile alarm fetched the mined receipt, applied the per-member
+  `receipt_patch` (status/receipt/blockHash/blockNumber/event), and cleared
+  the intent. `eth_getUserOperationReceipt` then serves the real on-chain
+  event (`success: true`, `actualGasUsed` from the UserOperationEvent, full
+  receipt logs).
+- **Ladder timing**: a future-nonce op parked at attempt 1 re-drove at
+  +5 s → attempt 2, +10 s → attempt 3, +21 s → attempt 4 against the core's
+  5/10/20 s ladder — deviation ≤ 1 s, far inside max(30 s, 10%).
+- **Park → auto-execute arc**: with the parked op's nonce made current (its
+  predecessor included at T+9 s), the next ladder re-drive executed it with
+  no external traffic: parked → `submitted` at T+15 s → `included` at
+  T+17 s. The lane processed three operations back-to-back with no wedge —
+  the pre-US3 limitation recorded under Gate 3 is closed.
+
+## Gate 5 — Load and isolation (SC-004/SC-007, pre-production)
+
+Deployed environment: sustained-rate submission/read load from three regions
+(k6 or equivalent), 30 minutes, with the SC-004 targets; then saturate one
+chain and assert other chains' p95 degradation <10%.
+
+## Gate 6 — Ownership review (FR-010)
+
+```bash
+# per deployment: the execution allowlist
+grep EXECUTION_CHAINS vela-relay-cf/wrangler.jsonc .env* 
+```
+
+Expected: no (chain, key set) enabled for execution in more than one
+deployment; recorded in the deploy checklist.
+
+## Story completion map
+
+| Story | Done when |
+|---|---|
+| 1 Edge intake/reads | Gates 0–2 pass with execution disabled |
+| 2 Edge execution | Gate 3 passes; a full batch lands on a testnet via `wrangler dev`/staging |
+| 3 Time-driven | Gate 4 passes |
+| 4 Scale | Gate 5 passes |
+| 5 Coexistence | Gate 0 on the final merge + Gate 6 review |
+
+## Full gate pass record (T027, 2026-08-29)
+
+| Gate | Result |
+|---|---|
+| 0 — native untouched | fmt clean; clippy 5 baseline warnings (none added); docker shell suite 79 + core suite 129 = 208, all green |
+| 1 — wasm + purity | `cargo check -p vela-relay-cf --target wasm32-unknown-unknown --locked` clean, wasm clippy 0 warnings; `cargo tree -p vela-relay-core -e normal` has zero IO/runtime crates; the SC-003 grep set (`transition_is_allowed`, `retry_delay`, `parse_reimbursement`) finds no local definitions in `vela-relay-cf/src/` — every hit resolves into `vela_relay_core` |
+| 2 — replay battery | 42/42 (19 bodies byte-identical + health/version declared deltas + 21 statuses), re-verified after every US and finally at T027 |
+| 3 — fault injection | as-run record above (anvil rig): funding cycles, both simulation tiers, nonce triage, burst serialization, restart resume with zero double-broadcast, DLQ backstop; found + fixed the u128 boundary bug |
+| 4 — tolerances | as-run record above: ladder ≤1 s deviation; submitted→included 2–3 s; park→auto-execute arc closed |
+| 5 — load (SC-004/007) | PARTIAL (2026-08-29, real deployment at https://vela-relay-cf.atshelchin.workers.dev): SC-007 isolation **PASSED** (victim-chain p95 661 ms under a 300/s saturation of another chain vs 701 ms baseline — degradation < 0% ≪ 10%; 50,396/50,396 checks); SC-004 sample at 1/10 rate from one vantage held 50 submits/s + 500 reads/s for 4 min with 143,939/143,939 checks and 0/131,938 failures (12,001 operations accepted into real Durable Objects + Queues). The full three-region 30-min p95 claim still needs regional load generators (load/README.md result table) |
+| 6 — ownership review | EXECUTED against the real deployment: distinct `OPERATOR_SECRET` (fresh key, vault 0x3e59292e…fe3c — never the docker secret; FR-010 satisfied with no `EXECUTION_CHAINS` restriction needed), settlement recipient = own derivation, queues deployment-private (`vela-relay-ops`/`-dlq`), **production Gate 2 replay 42/42 byte-identical** vs a docker reference round paying the same vault; alarm observation (submitted→included) awaits the executor being enabled + treasury funding (user decision) |
+
+Artifacts: final wasm 2,422,916 B raw / 804,691 B gzipped (full shell: all
+execution arms, treasury, tempo, alerts — the Paid-plan 10 MB gzip limit has
+>12× headroom); suites docker 79 + core 129 (four alert tests moved
+shell→core with the `alert` module promotion); spec checklist
+`checklists/requirements.md` re-verified 16/16.

@@ -1,5 +1,12 @@
 [workspace]
-members = ["vela-relay-core"]
+members = ["vela-relay-core", "vela-relay-cf"]
+
+# vela-relay-cf is wasm-only: it never enters native default builds (cargo
+# builds the root package by default), and workspace-wide native invocations
+# must pass --exclude vela-relay-cf.
+[profile.release.package.vela-relay-cf]
+opt-level = "z"
+codegen-units = 1
 
 # The root package is the Shell: it wires business decisions made in the
 # `vela-relay-core` crate to real infrastructure (Axum, Redis, Iggy, EVM RPC,

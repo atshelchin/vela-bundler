@@ -8,10 +8,7 @@ use redis::{FromRedisValue, aio::MultiplexedConnection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{
-    app::rpc::types::{UserOperationStatus, UserOperationStatusKind},
-    utils::config::RedisConfig,
-};
+use crate::{app::rpc::types::UserOperationStatusKind, utils::config::RedisConfig};
 
 const USER_OPERATION_TTL_SECS: u64 = 60 * 60;
 const STATUS_KEY_PREFIX: &str = "vela:relay:user-operation:";
@@ -300,27 +297,9 @@ pub use vela_relay_core::task::StoredUserOperation;
 /// The RPC-facing status view of a stored record. (Formerly
 /// `StoredUserOperation::rpc_status`; the record type now lives in the core
 /// and the response shape is transport vocabulary that stays here.)
-pub fn rpc_status(record: &StoredUserOperation) -> UserOperationStatus {
-    let exposes_executor_diagnostic = matches!(
-        record.status,
-        UserOperationStatusKind::Queued
-            | UserOperationStatusKind::NotSubmitted
-            | UserOperationStatusKind::Rejected
-    );
-    UserOperationStatus {
-        status: record.status,
-        transaction_hash: record.transaction_hash.clone(),
-        last_executor_stage: exposes_executor_diagnostic
-            .then(|| record.last_executor_stage.clone())
-            .flatten(),
-        last_executor_error: exposes_executor_diagnostic
-            .then(|| record.last_executor_error.clone())
-            .flatten(),
-        last_executor_attempt_at_ms: exposes_executor_diagnostic
-            .then_some(record.last_executor_attempt_at_ms)
-            .flatten(),
-    }
-}
+/// Moved to the core wire module (spec 002) so both shells expose the same
+/// status read model; re-exported under the historical path.
+pub use vela_relay_core::wire::rpc_status;
 
 pub use vela_relay_core::task::QueuedUserOperation;
 
@@ -1334,40 +1313,12 @@ fn receipt_patch(
     patch
 }
 
-fn queued_record(operation: QueuedUserOperation, admitted: bool) -> StoredUserOperation {
-    StoredUserOperation {
-        status: UserOperationStatusKind::Queued,
-        transaction_hash: None,
-        chain_id: operation.chain_id,
-        chain_id_text: operation.chain_id.to_string(),
-        entry_point: operation.entry_point,
-        user_operation: operation.user_operation,
-        admitted,
-        next_receipt_check_at_ms: 0,
-        block_hash: None,
-        block_number: None,
-        receipt: None,
-        event: None,
-        last_executor_stage: None,
-        last_executor_error: None,
-        last_executor_attempt_at_ms: None,
-    }
-}
+/// Moved to the core (spec 002) so both shells persist the identical initial
+/// record shape.
+use vela_relay_core::task::queued_record;
 
-fn truncate_diagnostic(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        return value.to_owned();
-    }
-    let end = value
-        .char_indices()
-        .take_while(|(index, character)| {
-            index.saturating_add(character.len_utf8()) <= limit.saturating_sub(3)
-        })
-        .map(|(index, character)| index + character.len_utf8())
-        .last()
-        .unwrap_or(0);
-    format!("{}...", &value[..end])
-}
+/// Moved to the core (spec 002) so both shells bound diagnostics identically.
+use vela_relay_core::task::truncate_diagnostic;
 
 fn status_key(user_operation_hash: &str) -> String {
     format!("{STATUS_KEY_PREFIX}{user_operation_hash}")

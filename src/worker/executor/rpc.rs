@@ -402,79 +402,40 @@ struct UpstreamError {
     data: Option<Value>,
 }
 
+// Classification and rendering live in the core (`broadcast`); this shell
+// only carries the deserialized upstream fields to them.
 impl UpstreamError {
     fn diagnostic(&self) -> String {
-        let code = self
-            .code
-            .map(|code| code.to_string())
-            .unwrap_or_else(|| "unknown".into());
-        let message = self.message.as_deref().unwrap_or("upstream error");
-        format!("RPC code {code}: {}", truncate_diagnostic(message, 256))
-    }
-
-    fn normalized_message(&self) -> String {
-        self.message
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
+        core_broadcast::upstream_error_diagnostic(self.code, self.message.as_deref())
     }
 
     fn is_execution_revert(&self) -> bool {
-        let message = self.normalized_message();
-        self.code == Some(3)
-            || message.contains("execution reverted")
-            || message.contains("failedop")
+        core_broadcast::is_executor_revert(self.code, self.message.as_deref().unwrap_or_default())
     }
 
     fn into_revert(self) -> RpcError {
         RpcError::Reverted {
+            data: core_broadcast::revert_data(&self.data),
             message: self.message.unwrap_or_default(),
-            data: revert_data(&self.data),
         }
     }
 
     fn is_already_known(&self) -> bool {
-        let message = self.normalized_message();
-        message.contains("already known")
-            || message.contains("known transaction")
-            || message.contains("already imported")
+        core_broadcast::is_broadcast_already_known(self.message.as_deref().unwrap_or_default())
     }
 
     fn is_nonce_ambiguous(&self) -> bool {
-        let message = self.normalized_message();
-        message.contains("nonce too low") || message.contains("replacement transaction underpriced")
+        core_broadcast::is_broadcast_nonce_ambiguous(self.message.as_deref().unwrap_or_default())
     }
 
     fn is_definitive_broadcast_rejection(&self) -> bool {
-        let message = self.normalized_message();
-        message.contains("insufficient funds")
-            || message.contains("intrinsic gas")
-            || message.contains("fee cap")
-            || message.contains("max fee per gas")
-            || message.contains("transaction type not supported")
+        core_broadcast::is_definitive_broadcast_rejection(
+            self.message.as_deref().unwrap_or_default(),
+        )
     }
 }
 
-fn join_broadcast_diagnostics(diagnostics: Vec<String>) -> String {
-    let mut unique = Vec::new();
-    for diagnostic in diagnostics {
-        if !unique.contains(&diagnostic) {
-            unique.push(diagnostic);
-        }
-    }
-    truncate_diagnostic(&unique.join("; "), 512)
-}
-
-fn truncate_diagnostic(value: &str, maximum: usize) -> String {
-    if value.len() <= maximum {
-        return value.to_owned();
-    }
-    let mut end = maximum;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &value[..end])
-}
+use vela_relay_core::broadcast::{self as core_broadcast, join_broadcast_diagnostics};
 
 impl UpstreamResponse {
     fn into_result_and_error(mut self) -> (Option<Value>, Option<UpstreamError>) {
@@ -495,37 +456,9 @@ fn definitive_batch_result(response: UpstreamResponse) -> Option<Result<Value, R
     }
 }
 
-fn revert_data(value: &Option<Value>) -> Option<String> {
-    match value.as_ref()? {
-        Value::String(value) => Some(value.clone()),
-        Value::Object(object) => ["data", "result", "returnData"]
-            .into_iter()
-            .find_map(|key| object.get(key).and_then(Value::as_str).map(str::to_owned)),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{UpstreamError, append_unique_urls};
-
-    #[test]
-    fn distinguishes_ambiguous_and_definitive_broadcast_errors() {
-        let ambiguous = UpstreamError {
-            code: Some(-32000),
-            message: Some("nonce too low".into()),
-            data: None,
-        };
-        let definitive = UpstreamError {
-            code: Some(-32000),
-            message: Some("insufficient funds for gas * price + value".into()),
-            data: None,
-        };
-
-        assert!(ambiguous.is_nonce_ambiguous());
-        assert!(!ambiguous.is_definitive_broadcast_rejection());
-        assert!(definitive.is_definitive_broadcast_rejection());
-    }
+    use super::append_unique_urls;
 
     #[test]
     fn appends_each_executor_rpc_url_once() {
