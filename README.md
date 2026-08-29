@@ -160,6 +160,18 @@ docker compose up -d --no-build
 See [the Docker deployment guide](docs/docker.md) for configuration details and Docker Hub
 publishing setup.
 
+## In-band fees
+
+Relay charges no separate fee: each UserOperation declares zero EntryPoint fees
+and embeds a trusted Safe MultiSend transfer reimbursing the settlement recipient
+for the gas the relay spends. The relay requires `max(1.4 × gas × (2×base+tip),
+floor)` (floor = 0.00001 native or $0.01 stablecoin), recovers 1.4× its gas, and
+reprices the outer transaction down toward the inclusion floor rather than
+rejecting an honest-but-short payment. A client must pay ABOVE this minimum to
+survive the gas-price drift between signing and inclusion. The full rule — the
+requirement, the repricing safety valve, the client-side headroom math, and
+stablecoin/Tempo specifics — is documented in [docs/fees.md](docs/fees.md).
+
 ## HTTP endpoints
 
 | Endpoint | Purpose |
