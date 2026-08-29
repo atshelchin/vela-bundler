@@ -23,11 +23,15 @@ pub struct ChainMetadata {
 
 #[derive(Clone, Deserialize)]
 pub struct StablecoinMetadata {
+    #[serde(default)]
+    pub symbol: String,
     pub contract: String,
 }
 
 #[derive(Clone, Deserialize)]
 pub struct NativeCurrencyMetadata {
+    #[serde(default)]
+    pub symbol: String,
     pub decimals: u32,
 }
 
@@ -65,6 +69,37 @@ pub async fn fallback_rpc_urls(env: &Env, chain_id: u64) -> Result<Vec<String>, 
         .into_iter()
         .filter(|url| is_plain_http_url(url))
         .collect())
+}
+
+/// The quote path needs symbols and decimals too (docker: `payment_assets`).
+pub async fn payment_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, String> {
+    chain_metadata(env, chain_id).await
+}
+
+const BINANCE_TICKER_URLS: [&str; 3] = [
+    "https://api.binance.com/api/v3/ticker/price?symbol=",
+    "https://data-api.binance.vision/api/v3/ticker/price?symbol=",
+    "https://api.binance.us/api/v3/ticker/price?symbol=",
+];
+
+#[derive(Deserialize)]
+struct BinanceTicker {
+    price: String,
+}
+
+/// Same endpoint order and shape as the docker `binance_usdt_price`.
+pub async fn binance_usdt_price(symbol: &str) -> Option<String> {
+    for endpoint in BINANCE_TICKER_URLS {
+        let url = format!("{endpoint}{symbol}USDT");
+        let Ok(body) = fetch_json_with_timeout(&url, MARKET_FETCH_TIMEOUT_MS).await else {
+            continue;
+        };
+        let Ok(ticker) = serde_json::from_str::<BinanceTicker>(&body) else {
+            continue;
+        };
+        return Some(ticker.price);
+    }
+    None
 }
 
 async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, String> {
@@ -105,25 +140,44 @@ async fn chain_metadata(env: &Env, chain_id: u64) -> Result<ChainMetadata, Strin
     ))
 }
 
+/// Mirrors the docker HTTP clients' per-request deadlines (metadata 10 s,
+/// Binance 2 s): workerd fetch has no native timeout, so requests race a
+/// `Delay`.
+const METADATA_FETCH_TIMEOUT_MS: u64 = 10_000;
+const MARKET_FETCH_TIMEOUT_MS: u64 = 2_000;
+
 async fn fetch_json(url: &str) -> Result<String, String> {
-    let headers = Headers::new();
-    headers
-        .set("accept", "application/json")
-        .map_err(|error| error.to_string())?;
-    let mut init = RequestInit::new();
-    init.with_method(Method::Get).with_headers(headers);
-    let request = Request::new_with_init(url, &init).map_err(|error| error.to_string())?;
-    let mut response = Fetch::Request(request)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    if response.status_code() >= 400 {
-        return Err(format!(
-            "metadata request returned {}",
-            response.status_code()
-        ));
+    fetch_json_with_timeout(url, METADATA_FETCH_TIMEOUT_MS).await
+}
+
+async fn fetch_json_with_timeout(url: &str, timeout_ms: u64) -> Result<String, String> {
+    use futures_util::future::{Either, select};
+
+    let request = async {
+        let headers = Headers::new();
+        headers
+            .set("accept", "application/json")
+            .map_err(|error| error.to_string())?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Get).with_headers(headers);
+        let request = Request::new_with_init(url, &init).map_err(|error| error.to_string())?;
+        let mut response = Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if response.status_code() >= 400 {
+            return Err(format!(
+                "upstream request returned {}",
+                response.status_code()
+            ));
+        }
+        response.text().await.map_err(|error| error.to_string())
+    };
+    let deadline = Delay::from(std::time::Duration::from_millis(timeout_ms));
+    match select(std::pin::pin!(request), deadline).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err("upstream request timed out".into()),
     }
-    response.text().await.map_err(|error| error.to_string())
 }
 
 pub fn is_hex_address(address: &str) -> bool {
@@ -136,37 +190,87 @@ fn is_plain_http_url(url: &str) -> bool {
     (url.starts_with("https://") || url.starts_with("http://")) && !url.contains("${")
 }
 
+/// One simulation upstream's reply: a result, or the JSON-RPC error object
+/// (which the caller classifies as revert vs try-next).
+pub enum SimulationReply {
+    Result(Value),
+    UpstreamError(vela_relay_core::estimate::SimulationRevert),
+}
+
+pub async fn json_rpc_simulation(
+    url: &str,
+    method: &str,
+    params: &Value,
+) -> Result<SimulationReply, String> {
+    let value = json_rpc_raw(url, method, params).await?;
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+        return Ok(SimulationReply::UpstreamError(
+            vela_relay_core::estimate::SimulationRevert {
+                code: error.get("code").and_then(Value::as_i64),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("upstream JSON-RPC error")
+                    .to_owned(),
+                data: error.get("data").cloned(),
+            },
+        ));
+    }
+    match value.get("result") {
+        Some(result) if !result.is_null() => Ok(SimulationReply::Result(result.clone())),
+        _ => Err("upstream JSON-RPC response has no result".into()),
+    }
+}
+
 /// Fetch a JSON-RPC result `Value` from one upstream. Ok(None) = this
 /// upstream answered with an error/invalid envelope (try the next); Err =
 /// transport failure (try the next).
 pub async fn json_rpc(url: &str, method: &str, params: &Value) -> Result<Option<Value>, String> {
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": method,
-        "params": params,
-    });
-    let headers = Headers::new();
-    headers
-        .set("content-type", "application/json")
-        .map_err(|error| error.to_string())?;
-    let mut init = RequestInit::new();
-    init.with_method(Method::Post)
-        .with_headers(headers)
-        .with_body(Some(worker::wasm_bindgen::JsValue::from_str(
-            &body.to_string(),
-        )));
-    let request = Request::new_with_init(url, &init).map_err(|error| error.to_string())?;
-    let mut response = Fetch::Request(request)
-        .send()
-        .await
-        .map_err(|error| error.to_string())?;
-    let value: Value = response.json().await.map_err(|error| error.to_string())?;
+    let value = json_rpc_raw(url, method, params).await?;
     if value.get("error").is_some_and(|error| !error.is_null()) {
         return Ok(None);
     }
     match value.get("result") {
         Some(result) if !result.is_null() => Ok(Some(result.clone())),
         _ => Ok(None),
+    }
+}
+
+/// Per-attempt deadline for chain JSON-RPC calls (docker: 1 s request + 1 s
+/// connect timeouts).
+const RPC_FETCH_TIMEOUT_MS: u64 = 2_000;
+
+/// POST one JSON-RPC envelope and return the whole reply envelope.
+async fn json_rpc_raw(url: &str, method: &str, params: &Value) -> Result<Value, String> {
+    use futures_util::future::{Either, select};
+
+    let request = async {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params,
+        });
+        let headers = Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(|error| error.to_string())?;
+        let mut init = RequestInit::new();
+        init.with_method(Method::Post)
+            .with_headers(headers)
+            .with_body(Some(worker::wasm_bindgen::JsValue::from_str(
+                &body.to_string(),
+            )));
+        let request = Request::new_with_init(url, &init).map_err(|error| error.to_string())?;
+        let mut response = Fetch::Request(request)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        response.json().await.map_err(|error| error.to_string())
+    };
+    let deadline = Delay::from(std::time::Duration::from_millis(RPC_FETCH_TIMEOUT_MS));
+    match select(std::pin::pin!(request), deadline).await {
+        Either::Left((result, _)) => result,
+        Either::Right(((), _)) => Err("upstream request timed out".into()),
     }
 }

@@ -3507,9 +3507,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.8"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -5749,7 +5749,9 @@ dependencies = [
 name = "vela-relay-cf"
 version = "0.1.0"
 dependencies = [
+ "alloy",
  "crux_core",
+ "futures-util",
  "getrandom 0.2.17",
  "hex",
  "serde",
@@ -5768,6 +5770,7 @@ dependencies = [
  "hex",
  "hkdf",
  "k256",
+ "num-bigint",
  "serde",
  "serde_json",
  "sha2",

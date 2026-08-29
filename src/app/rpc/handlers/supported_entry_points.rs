@@ -2,13 +2,9 @@ use serde_json::Value;
 
 use crate::app::rpc::types::RpcResponse;
 
-pub const SUPPORTED_ENTRY_POINTS: &[&str] = &["0x0000000071727De22E5E9d8BAf0edAc6f37da032"];
-
-pub fn is_supported(entry_point: &str) -> bool {
-    SUPPORTED_ENTRY_POINTS
-        .iter()
-        .any(|supported| supported.eq_ignore_ascii_case(entry_point))
-}
+/// The list is core vocabulary (`vela_relay_core::admission`); re-exported
+/// under the historical path.
+pub use vela_relay_core::admission::SUPPORTED_ENTRY_POINTS;
 
 pub fn handle(id: Value) -> RpcResponse<Value> {
     RpcResponse::result(

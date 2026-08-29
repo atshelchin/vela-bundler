@@ -20,6 +20,7 @@ alloy = { version = "2.2.0", default-features = false, features = [
 ] }
 anyhow = "1"
 crux_core = "0.19"
+num-bigint = "0.4"
 hex = "0.4"
 hkdf = "0.12"
 k256 = "0.13"

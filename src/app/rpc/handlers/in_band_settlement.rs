@@ -1,36 +1,9 @@
 //! String helpers for the RPC handlers over the decision core's settlement
-//! vocabulary. Reimbursement parsing itself lives only in the core
-//! (`vela_relay_core::settlement::parse_reimbursement`, driven through the
-//! admission program); this module keeps the string-facing minimum-amount
-//! adapters and hex/address utilities the quote and estimate handlers use.
-
-use vela_relay_core::settlement::{
-    MIN_NATIVE_FRACTION_DECIMALS, MIN_STABLE_FRACTION_DECIMALS, minimum_amount,
-};
-
-pub use vela_relay_core::tempo::is_tempo_chain;
-
-pub fn minimum_native_amount(native_decimals: u32) -> Option<u128> {
-    minimum_amount(native_decimals, MIN_NATIVE_FRACTION_DECIMALS)
-        .ok()
-        .and_then(|value| u128::try_from(value).ok())
-}
-
-pub fn minimum_stablecoin_amount(token_decimals: u32) -> Option<u128> {
-    minimum_amount(token_decimals, MIN_STABLE_FRACTION_DECIMALS)
-        .ok()
-        .and_then(|value| u128::try_from(value).ok())
-}
-
-pub fn parse_address(value: &str) -> Result<[u8; 20], ()> {
-    let value = value.strip_prefix("0x").ok_or(())?;
-    if value.len() != 40 {
-        return Err(());
-    }
-
-    let bytes = hex::decode(value).map_err(|_| ())?;
-    bytes.try_into().map_err(|_| ())
-}
+//! vocabulary. Reimbursement parsing lives only in the core
+//! (`vela_relay_core::settlement::parse_reimbursement`); the minimum-amount
+//! adapters and address parsing moved into `vela_relay_core::quote` /
+//! `vela_relay_core::estimate` with their consumers (spec 002). Only the hex
+//! utility remains here for the quote handler's transport decoding.
 
 pub fn decode_hex(value: &str) -> Result<Vec<u8>, ()> {
     let value = value.strip_prefix("0x").ok_or(())?;
@@ -68,14 +41,15 @@ mod hex {
 
 #[cfg(test)]
 mod tests {
-    use super::{minimum_native_amount, minimum_stablecoin_amount};
+    use super::decode_hex;
 
     // Reimbursement parsing tests live with the single parser in
-    // `vela_relay_core` (settlement + admission::string_reimbursement).
+    // `vela_relay_core`; the minimum-amount boundary test moved to
+    // `vela_relay_core::quote` with the adapters (spec 002).
     #[test]
-    fn calculates_minimum_amounts_in_smallest_units() {
-        assert_eq!(minimum_native_amount(18), Some(10_000_000_000_000));
-        assert_eq!(minimum_stablecoin_amount(6), Some(10_000));
-        assert_eq!(minimum_stablecoin_amount(18), Some(10_000_000_000_000_000));
+    fn decodes_prefixed_even_length_hex_only() {
+        assert_eq!(decode_hex("0x0102"), Ok(vec![1, 2]));
+        assert!(decode_hex("0102").is_err());
+        assert!(decode_hex("0x102").is_err());
     }
 }

@@ -57,9 +57,25 @@ pub async fn handle(mut req: Request, env: Env) -> Result<Response> {
             };
             let user_rpc_url = req.headers().get(USER_RPC_URL_HEADER).ok().flatten();
             let body = req.bytes().await?;
-            let response =
-                rpc_dispatch(chain_id, user_rpc_url.as_deref(), &env, &config, &body).await;
-            json_response(&response)
+            let mut rpc_domain = None;
+            let response = rpc_dispatch(
+                chain_id,
+                user_rpc_url.as_deref(),
+                &env,
+                &config,
+                &body,
+                &mut rpc_domain,
+            )
+            .await;
+            let http_response = json_response(&response)?;
+            if let Some(domain) = rpc_domain {
+                let headers = http_response.headers().clone();
+                if headers.set("x-vela-rpc-domain", &domain).is_err() {
+                    worker::console_warn!("could not add RPC domain response header");
+                }
+                return Ok(http_response.with_headers(headers));
+            }
+            Ok(http_response)
         }
         _ => Response::error("not found", 404),
     }
@@ -72,6 +88,7 @@ async fn rpc_dispatch(
     env: &Env,
     config: &CfConfig,
     body: &[u8],
+    rpc_domain: &mut Option<String>,
 ) -> RpcResponse<Value> {
     let request = match wire::parse_envelope(body) {
         Ok(request) => request,
@@ -185,17 +202,162 @@ async fn rpc_dispatch(
             };
             admission::handle(request.id, chain_id, user_rpc_url, env, config, params).await
         }
-        // Read-side methods that consult chain RPCs land with the second US1
-        // change set (tasks T009/T011 remain open until they do).
         RpcMethod::GetUserOperationGasPrice => {
-            RpcResponse::error(request.id, RpcError::gas_price_unavailable())
-        }
-        RpcMethod::EstimateUserOperationGas => {
-            RpcResponse::error(request.id, RpcError::estimation_unavailable())
+            match crate::arms::gas_price::user_operation_gas_prices(
+                config,
+                env,
+                chain_id,
+                user_rpc_url,
+            )
+            .await
+            {
+                Ok(quote) => {
+                    *rpc_domain = Some(quote.rpc_domain);
+                    result_value(request.id, gas_price_result(quote.tiers))
+                }
+                Err(error) => {
+                    worker::console_warn!(
+                        "could not estimate user operation gas prices: {error:?}"
+                    );
+                    RpcResponse::error(request.id, gas_price_error(error))
+                }
+            }
         }
         RpcMethod::GetInBandGasQuote => {
-            RpcResponse::error(request.id, RpcError::in_band_gas_quote_unavailable())
+            let params: vela_relay_core::wire::GetInBandGasQuoteParams =
+                match serde_json::from_value(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RpcResponse::error(
+                            request.id,
+                            RpcError::invalid_params(error.to_string()),
+                        );
+                    }
+                };
+            match crate::arms::quote::handle(
+                config,
+                env,
+                chain_id,
+                user_rpc_url,
+                params.safe_address(),
+            )
+            .await
+            {
+                Ok((quotes, domain)) => {
+                    *rpc_domain = Some(domain);
+                    result_value(request.id, quotes)
+                }
+                Err(error) => RpcResponse::error(request.id, error),
+            }
         }
+        RpcMethod::EstimateUserOperationGas => {
+            let params: vela_relay_core::wire::EstimateUserOperationGasParams =
+                match serde_json::from_value(request.params) {
+                    Ok(params) => params,
+                    Err(error) => {
+                        return RpcResponse::error(
+                            request.id,
+                            RpcError::invalid_params(error.to_string()),
+                        );
+                    }
+                };
+            match estimate_gas(config, env, chain_id, user_rpc_url, params).await {
+                Ok((estimate, domain)) => {
+                    *rpc_domain = Some(domain);
+                    result_value(request.id, estimate)
+                }
+                Err(error) => RpcResponse::error(request.id, error),
+            }
+        }
+    }
+}
+
+/// The same thin driver as the docker handler: plan → two simulation calls →
+/// finish; every rule lives in `vela_relay_core::estimate`.
+async fn estimate_gas(
+    config: &CfConfig,
+    env: &Env,
+    chain_id: u64,
+    user_rpc_url: Option<&str>,
+    params: vela_relay_core::wire::EstimateUserOperationGasParams,
+) -> std::result::Result<(vela_relay_core::wire::UserOperationGasEstimate, String), RpcError> {
+    use vela_relay_core::estimate::{self, CallGasSource, SimulationCallError};
+
+    let vela_relay_core::wire::EstimateUserOperationGasParams(
+        user_operation,
+        entry_point,
+        state_overrides,
+    ) = params;
+    let plan = estimate::plan(
+        chain_id,
+        user_operation,
+        &entry_point,
+        state_overrides.as_ref(),
+    )?;
+
+    let validation = crate::arms::rpc::call_simulation(
+        config,
+        env,
+        chain_id,
+        user_rpc_url,
+        "eth_call",
+        plan.validation_params().clone(),
+    )
+    .await
+    .map_err(estimate::simulation_error)?;
+
+    let call_gas = match plan.execution_params() {
+        None => CallGasSource::NotNeeded,
+        Some(params) => {
+            match crate::arms::rpc::call_simulation(
+                config,
+                env,
+                chain_id,
+                user_rpc_url,
+                "eth_estimateGas",
+                params.clone(),
+            )
+            .await
+            {
+                Ok(result) => CallGasSource::Estimated(result.value),
+                Err(SimulationCallError::Reverted(error)) => CallGasSource::Reverted(error),
+                Err(SimulationCallError::Unavailable) => CallGasSource::Unavailable,
+            }
+        }
+    };
+
+    let outcome = estimate::finish(&plan, &validation.value, call_gas)?;
+    if let Some(fallback) = outcome.fallback_call_gas {
+        worker::console_warn!(
+            "could not estimate UserOperation call gas; returning the conservative fallback: chain_id={chain_id} fallback_call_gas_limit={fallback}"
+        );
+    }
+    Ok((outcome.estimate, validation.domain))
+}
+
+/// The docker handler's tier → wire conversion, byte-for-byte.
+fn gas_price_result(
+    tiers: vela_relay_core::gas_math::GasPriceTiers,
+) -> vela_relay_core::wire::UserOperationGasPrice {
+    fn tier(price: vela_relay_core::gas_math::GasPrice) -> vela_relay_core::wire::GasPriceTier {
+        vela_relay_core::wire::GasPriceTier {
+            max_fee_per_gas: format!("0x{:x}", price.max_fee_per_gas),
+            max_priority_fee_per_gas: format!("0x{:x}", price.max_priority_fee_per_gas),
+        }
+    }
+    vela_relay_core::wire::UserOperationGasPrice {
+        slow: tier(tiers.slow),
+        standard: tier(tiers.standard),
+        fast: tier(tiers.fast),
+    }
+}
+
+fn gas_price_error(error: vela_relay_core::gas_math::GasPriceError) -> RpcError {
+    match error {
+        vela_relay_core::gas_math::GasPriceError::ResponseDeadlineExceeded => {
+            RpcError::gas_price_timeout()
+        }
+        _ => RpcError::gas_price_unavailable(),
     }
 }
 
