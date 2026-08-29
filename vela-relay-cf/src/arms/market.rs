@@ -26,6 +26,8 @@ pub struct StablecoinMetadata {
     #[serde(default)]
     pub symbol: String,
     pub contract: String,
+    #[serde(default)]
+    pub decimals: Option<u32>,
 }
 
 #[derive(Clone, Deserialize)]

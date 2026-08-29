@@ -135,7 +135,10 @@ async fn execute(
                     "retrying an incomplete UserOperation queue admission for {user_operation_hash}"
                 );
             }
-            match queue.send(envelope).await {
+            // Send the envelope as its exact JSON text: the v8 structured
+            // clone of a serde_json map arrives as a JS Map (unreadable as an
+            // object), so the consumer parses the string form instead.
+            match queue.send(&envelope.to_string()).await {
                 Ok(()) => AdmissionResult::Enqueued,
                 Err(error) => {
                     worker::console_warn!(

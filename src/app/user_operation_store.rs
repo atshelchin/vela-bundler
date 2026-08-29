@@ -1317,20 +1317,8 @@ fn receipt_patch(
 /// record shape.
 use vela_relay_core::task::queued_record;
 
-fn truncate_diagnostic(value: &str, limit: usize) -> String {
-    if value.len() <= limit {
-        return value.to_owned();
-    }
-    let end = value
-        .char_indices()
-        .take_while(|(index, character)| {
-            index.saturating_add(character.len_utf8()) <= limit.saturating_sub(3)
-        })
-        .map(|(index, character)| index + character.len_utf8())
-        .last()
-        .unwrap_or(0);
-    format!("{}...", &value[..end])
-}
+/// Moved to the core (spec 002) so both shells bound diagnostics identically.
+use vela_relay_core::task::truncate_diagnostic;
 
 fn status_key(user_operation_hash: &str) -> String {
     format!("{STATUS_KEY_PREFIX}{user_operation_hash}")

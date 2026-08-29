@@ -6,10 +6,6 @@ use vela_relay_core::vault;
 use worker::Env;
 
 #[derive(Clone)]
-#[expect(
-    dead_code,
-    reason = "relayer_count/executor_enabled/execution_chains are consumed by the US2 queue consumer and LaneDO; parsed now so configuration errors surface before execution lands."
-)]
 pub struct CfConfig {
     pub settlement_recipient: Option<String>,
     pub relayer_count: usize,
@@ -17,6 +13,59 @@ pub struct CfConfig {
     /// Empty = dynamic directory-driven chains (research.md R10).
     pub execution_chains: Vec<u64>,
     pub alchemy_api_key: Option<String>,
+    pub operator_secret: Option<String>,
+    // Executor policy values — same names, defaults, and bounds as the docker
+    // parser; injected into the core as data.
+    pub max_bundle_operations: usize,
+    pub gas_buffer_bps: u64,
+    pub fixed_gas_buffer: u64,
+    pub settlement_markup_bps: u64,
+    pub settlement_inclusion_floor_bps: u64,
+    pub settlement_hold_max_attempts: u32,
+    pub relayer_float_cost_multiplier: u64,
+    pub relayer_float_target_wei: u128,
+    pub relayer_float_min_wei: u128,
+    pub top_up_max_wei: u128,
+    pub treasury_floor_wei: u128,
+}
+
+impl CfConfig {
+    /// The core's per-batch policy, with the treasury and per-lane relayer
+    /// addresses derived from `OPERATOR_SECRET` (core vault, chain-agnostic).
+    pub fn execution_policy(
+        &self,
+        chain_id: u64,
+        lane: u8,
+    ) -> Result<vela_relay_core::execution::ExecutionPolicy, String> {
+        let secret = self
+            .operator_secret
+            .as_deref()
+            .ok_or("OPERATOR_SECRET is required for execution")?;
+        let treasury = vault::derive_address(secret)
+            .map_err(|error| format!("invalid OPERATOR_SECRET: {error}"))?
+            .parse()
+            .map_err(|_| "derived treasury address is invalid".to_owned())?;
+        let relayer = vault::derive_pool_relayer_address(secret, lane as usize)
+            .map_err(|error| format!("invalid OPERATOR_SECRET: {error}"))?
+            .parse()
+            .map_err(|_| "derived relayer address is invalid".to_owned())?;
+        Ok(vela_relay_core::execution::ExecutionPolicy {
+            pool_width: self.relayer_count,
+            max_bundle_operations: self.max_bundle_operations,
+            gas_buffer_bps: self.gas_buffer_bps,
+            fixed_gas_buffer: self.fixed_gas_buffer,
+            settlement_inclusion_floor_bps: self.settlement_inclusion_floor_bps,
+            settlement_hold_max_attempts: self.settlement_hold_max_attempts,
+            top_up_max_wei: self.top_up_max_wei,
+            is_tempo: vela_relay_core::tempo::is_tempo_chain(chain_id),
+            treasury,
+            relayer,
+            relayer_float_cost_multiplier: self.relayer_float_cost_multiplier,
+            relayer_float_target_wei: self.relayer_float_target_wei,
+            relayer_float_min_wei: self.relayer_float_min_wei,
+            treasury_floor_wei: self.treasury_floor_wei,
+        })
+    }
 }
 
 impl CfConfig {
@@ -80,13 +129,110 @@ impl CfConfig {
                 .collect::<Result<Vec<_>, _>>()?,
         };
 
+        // Same defaults and bounds as the docker parser.
+        let settlement_markup_bps =
+            u64_var(env, "VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS", 14_000)?;
+        if settlement_markup_bps < 10_000 {
+            return Err("VELA_RELAY_EXECUTOR_SETTLEMENT_MARKUP_BPS cannot be below 10000".into());
+        }
+        let settlement_inclusion_floor_bps = u64_var(
+            env,
+            "VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS",
+            15_000,
+        )?;
+        if settlement_inclusion_floor_bps <= 10_000 {
+            return Err(
+                "VELA_RELAY_EXECUTOR_SETTLEMENT_INCLUSION_FLOOR_BPS must be above 10000".into(),
+            );
+        }
+        let relayer_float_min_wei = u128_var(
+            env,
+            "VELA_RELAY_EXECUTOR_FLOAT_MIN_WEI",
+            500_000_000_000_000,
+        )?;
+        let relayer_float_target_wei = u128_var(
+            env,
+            "VELA_RELAY_EXECUTOR_FLOAT_TARGET_WEI",
+            2_000_000_000_000_000,
+        )?;
+        if relayer_float_target_wei < relayer_float_min_wei {
+            return Err(
+                "VELA_RELAY_EXECUTOR_FLOAT_TARGET_WEI cannot be below VELA_RELAY_EXECUTOR_FLOAT_MIN_WEI"
+                    .into(),
+            );
+        }
+
         Ok(Self {
             settlement_recipient,
             relayer_count,
             executor_enabled,
             execution_chains,
             alchemy_api_key: secret(env, "ALCHEMY_API_KEY").filter(|key| !key.trim().is_empty()),
+            operator_secret,
+            max_bundle_operations: usize_var(env, "VELA_RELAY_MAX_BUNDLE_OPERATIONS", 10)?,
+            gas_buffer_bps: u64_var(env, "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,
+            fixed_gas_buffer: u64_var(env, "VELA_RELAY_EXECUTOR_FIXED_GAS_BUFFER", 30_000)?,
+            settlement_markup_bps,
+            settlement_inclusion_floor_bps,
+            settlement_hold_max_attempts: u32_var(
+                env,
+                "VELA_RELAY_EXECUTOR_SETTLEMENT_HOLD_MAX_ATTEMPTS",
+                12,
+            )?,
+            relayer_float_cost_multiplier: u64_var(
+                env,
+                "VELA_RELAY_EXECUTOR_FLOAT_COST_MULTIPLIER",
+                5,
+            )?,
+            relayer_float_target_wei,
+            relayer_float_min_wei,
+            top_up_max_wei: u128_var(
+                env,
+                "VELA_RELAY_EXECUTOR_TOP_UP_MAX_WEI",
+                10_000_000_000_000_000_000,
+            )?,
+            treasury_floor_wei: u128_var(
+                env,
+                "VELA_RELAY_EXECUTOR_TREASURY_FLOOR_WEI",
+                100_000_000_000_000,
+            )?,
         })
+    }
+}
+
+fn u64_var(env: &Env, name: &str, default: u64) -> Result<u64, String> {
+    match var(env, name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|error| format!("invalid {name}: {error}")),
+    }
+}
+
+fn u32_var(env: &Env, name: &str, default: u32) -> Result<u32, String> {
+    match var(env, name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u32>()
+            .map_err(|error| format!("invalid {name}: {error}")),
+    }
+}
+
+fn u128_var(env: &Env, name: &str, default: u128) -> Result<u128, String> {
+    match var(env, name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<u128>()
+            .map_err(|error| format!("invalid {name}: {error}")),
+    }
+}
+
+fn usize_var(env: &Env, name: &str, default: usize) -> Result<usize, String> {
+    match var(env, name) {
+        None => Ok(default),
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {name}: {error}")),
     }
 }
 

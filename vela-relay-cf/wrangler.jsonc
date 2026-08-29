@@ -17,29 +17,30 @@
   ],
   "durable_objects": {
     "bindings": [
-      { "name": "RECORDS", "class_name": "RecordDo" }
-      // { "name": "LANES", "class_name": "LaneDo" },       // US2 (T013)
+      { "name": "RECORDS", "class_name": "RecordDo" },
+      { "name": "LANES", "class_name": "LaneDo" }
       // { "name": "TREASURY", "class_name": "TreasuryDo" } // US2 (T016)
     ]
   },
   "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["RecordDo"] }
-    // US2 appends { "tag": "v2", "new_sqlite_classes": ["LaneDo", "TreasuryDo"] }
+    { "tag": "v1", "new_sqlite_classes": ["RecordDo"] },
+    { "tag": "v2", "new_sqlite_classes": ["LaneDo"] }
+    // T016 appends { "tag": "v3", "new_sqlite_classes": ["TreasuryDo"] }
   ],
   "queues": {
     "producers": [
-      { "binding": "OPS_QUEUE", "queue": "vela-relay-ops" }
+      { "binding": "OPS_QUEUE", "queue": "vela-relay-ops" },
+      { "binding": "DLQ_QUEUE", "queue": "vela-relay-dlq" }
+    ],
+    "consumers": [
+      {
+        "queue": "vela-relay-ops",
+        "max_batch_size": 20,
+        "max_batch_timeout": 2,
+        "max_retries": 100,
+        "dead_letter_queue": "vela-relay-dlq"
+      }
     ]
-    // US2 (T013) adds the consumer:
-    // "consumers": [
-    //   {
-    //     "queue": "vela-relay-ops",
-    //     "max_batch_size": 20,
-    //     "max_batch_timeout": 2,
-    //     "max_retries": 100,
-    //     "dead_letter_queue": "vela-relay-dlq"
-    //   }
-    // ]
   },
   "vars": {
     // Same validated policy values as the docker shell; parsed by src/config.rs

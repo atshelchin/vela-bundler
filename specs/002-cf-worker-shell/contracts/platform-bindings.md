@@ -16,7 +16,7 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 | `FetchTokenDecimals` | chain RPC fetch (failover) | same upstream policy; shell-owned transport |
 | `CreateQueued` | RDO create-if-absent | DO serial = SETNX |
 | `LoadExisting` | RDO read | read-your-write |
-| `Enqueue` | Queues producer send | durable at-least-once; `QueueUnavailable` on send failure (crash-window semantics preserved) |
+| `Enqueue` | Queues producer send — the envelope travels as its exact JSON text (the v8 structured clone of a serde map arrives as a JS Map, unreadable as an object; the consumer parses the string) | durable at-least-once; `QueueUnavailable` on send failure (crash-window semantics preserved) |
 | `MarkAdmitted` | RDO write | DO serial |
 
 ## ExecutionOperation (LaneDO drives `ExecutionApp`)

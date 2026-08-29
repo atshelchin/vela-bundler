@@ -122,7 +122,7 @@ pub struct UserOperationEvent {
 use serde_json::Value;
 
 /// The validated queue envelope plus its deterministic relayer lane and Iggy position.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct RoutedUserOperation {
     pub schema_version: u32,
     pub user_operation_hash: String,
@@ -174,6 +174,24 @@ pub struct StoredUserOperation {
     pub last_executor_error: Option<String>,
     #[serde(default)]
     pub last_executor_attempt_at_ms: Option<u64>,
+}
+
+/// Bounds an operator-facing diagnostic before it is stored: external error
+/// bodies are untrusted input and clients poll the record directly. Shared by
+/// both shells (docker `truncate_diagnostic` moved here, spec 002).
+pub fn truncate_diagnostic(value: &str, limit: usize) -> String {
+    if value.len() <= limit {
+        return value.to_owned();
+    }
+    let end = value
+        .char_indices()
+        .take_while(|(index, character)| {
+            index.saturating_add(character.len_utf8()) <= limit.saturating_sub(3)
+        })
+        .map(|(index, character)| index + character.len_utf8())
+        .last()
+        .unwrap_or(0);
+    format!("{}...", &value[..end])
 }
 
 /// The initial stored record for a freshly queued operation — the shape both
