@@ -4,7 +4,9 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use vela_relay_core::task::{QueuedUserOperation, RoutedUserOperation, StoredUserOperation};
+use vela_relay_core::task::{
+    PreparedFundingIntent, QueuedUserOperation, RoutedUserOperation, StoredUserOperation,
+};
 
 /// One command per RecordDO invocation (POST body).
 #[derive(Serialize, Deserialize)]
@@ -76,6 +78,78 @@ pub enum ItemResolutionWire {
 pub enum LaneReply {
     Resolutions {
         resolutions: Vec<ItemResolutionWire>,
+    },
+}
+
+/// A lease holder's identity: the unique acquisition token plus the TTL it
+/// keeps renewing with (docker store `acquire_lease`/`renew_lease` args).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct LeaseIdentity {
+    pub token: String,
+    pub ttl_ms: u64,
+}
+
+/// One command per TreasuryDO invocation. `renew` piggybacks a lease renewal
+/// on every touch from the current holder — the docker shell's background
+/// heartbeat task, replaced by renewal-on-touch (declared in
+/// contracts/platform-bindings.md).
+#[derive(Serialize, Deserialize)]
+pub struct TreasuryRequest {
+    pub renew: Option<LeaseIdentity>,
+    pub command: TreasuryCommand,
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum TreasuryCommand {
+    /// The docker store's `acquire_lease` (`SET NX PX`): succeeds only when
+    /// the lease is unheld or expired.
+    AcquireLease {
+        lease: LeaseIdentity,
+    },
+    /// The docker store's `renew_lease`: extends only while `token` holds it.
+    EnsureLease {
+        lease: LeaseIdentity,
+    },
+    /// The docker store's `release_lease`: deletes only while `token` holds it.
+    ReleaseLease {
+        token: String,
+    },
+    LoadFunding,
+    /// Put-if-absent — one pending treasury transfer per chain (docker
+    /// `save_prepared_funding_intent`).
+    SaveFunding {
+        intent: PreparedFundingIntent,
+    },
+    /// Guarded delete — only while the stored intent still carries this
+    /// transaction hash (docker `clear_prepared_funding_intent`).
+    ClearFunding {
+        transaction_hash: String,
+    },
+    /// One receipt prober per interval per transaction: an expiring throttle
+    /// slot, never released (docker: `acquire_lease` with a unique token).
+    AcquireReceiptProbe {
+        transaction_hash: String,
+        ttl_ms: u64,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum TreasuryReply {
+    Acquired {
+        acquired: bool,
+    },
+    Held {
+        held: bool,
+    },
+    Released,
+    Funding {
+        intent: Option<PreparedFundingIntent>,
+    },
+    Saved {
+        saved: bool,
+    },
+    Cleared {
+        cleared: bool,
     },
 }
 

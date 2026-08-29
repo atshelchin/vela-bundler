@@ -19,6 +19,11 @@ pub struct CfConfig {
     pub trusted_rpc_urls: std::collections::BTreeMap<u64, Vec<String>>,
     /// Per-request executor RPC deadline (docker `rpc_timeout`, default 5 s).
     pub rpc_timeout_ms: u64,
+    /// Treasury lease TTL (docker `lease_ttl`, default 30 s).
+    pub lease_ttl_ms: u64,
+    /// Receipt-probe throttle interval (docker `receipt_poll_interval`,
+    /// default 3 s).
+    pub receipt_poll_ms: u64,
     // Executor policy values — same names, defaults, and bounds as the docker
     // parser; injected into the core as data.
     pub max_bundle_operations: usize,
@@ -179,6 +184,10 @@ impl CfConfig {
                 None => std::collections::BTreeMap::new(),
             },
             rpc_timeout_ms: u64_var(env, "VELA_RELAY_EXECUTOR_RPC_TIMEOUT_SECS", 5)?
+                .saturating_mul(1_000),
+            lease_ttl_ms: u64_var(env, "VELA_RELAY_EXECUTOR_LEASE_TTL_SECS", 30)?
+                .saturating_mul(1_000),
+            receipt_poll_ms: u64_var(env, "VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS", 3)?
                 .saturating_mul(1_000),
             max_bundle_operations: usize_var(env, "VELA_RELAY_MAX_BUNDLE_OPERATIONS", 10)?,
             gas_buffer_bps: u64_var(env, "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,

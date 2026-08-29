@@ -25,3 +25,5 @@ mod proto;
 mod record_do;
 #[cfg(target_arch = "wasm32")]
 mod shell;
+#[cfg(target_arch = "wasm32")]
+mod treasury_do;

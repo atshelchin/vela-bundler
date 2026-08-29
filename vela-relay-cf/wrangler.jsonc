@@ -18,14 +18,14 @@
   "durable_objects": {
     "bindings": [
       { "name": "RECORDS", "class_name": "RecordDo" },
-      { "name": "LANES", "class_name": "LaneDo" }
-      // { "name": "TREASURY", "class_name": "TreasuryDo" } // US2 (T016)
+      { "name": "LANES", "class_name": "LaneDo" },
+      { "name": "TREASURY", "class_name": "TreasuryDo" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RecordDo"] },
-    { "tag": "v2", "new_sqlite_classes": ["LaneDo"] }
-    // T016 appends { "tag": "v3", "new_sqlite_classes": ["TreasuryDo"] }
+    { "tag": "v2", "new_sqlite_classes": ["LaneDo"] },
+    { "tag": "v3", "new_sqlite_classes": ["TreasuryDo"] }
   ],
   "queues": {
     "producers": [

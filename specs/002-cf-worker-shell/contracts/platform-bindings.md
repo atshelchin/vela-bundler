@@ -36,10 +36,10 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 | `SimulateIndividually` / `SimulateBundle` / `FetchAccountNonces` | chain RPC fetches (failover), same three-tier order (`eth_simulateV1` → deployed Pimlico `eth_call` → `debug_traceCall`); this shell does NOT auto-deploy the Pimlico pair (see Explicitly absent) | shell-owned transport; same interpretation rules (core `simulation`) |
 | `FetchTransactionContext` / `FetchTempoContext` / `FetchTreasuryContext` / `FetchTempoTreasuryContext` | chain RPC batch fetches | same call sets as docker |
 | `FetchMarketPrice` | Binance fetch + KV cache | same fail-open/closed directions (core-decided) |
-| `AcquireTreasuryLease` / `EnsureTreasuryLease` / `ReleaseTreasuryLease` | TDO lock (token + deadline) | DO serial + explicit lock; store error → `Failed` (batch-fatal, as docker) |
+| `AcquireTreasuryLease` / `EnsureTreasuryLease` / `ReleaseTreasuryLease` | TDO lock (token + deadline; acquire = `SET NX PX`, renew/release guarded by the holder token, expiry judged on read) | DO serial + explicit lock; store error → `Failed` (batch-fatal, as docker). The docker background heartbeat (renew every ttl/3) is replaced by renewal-on-touch: every TDO request from the current holder piggybacks a lease extension (`TreasuryRequest::renew`) |
 | `LoadPreparedFunding` / `SaveFundingIntent` / `ClearFundingIntent` | TDO storage | DO serial |
 | `SignTreasuryTransfer` / `SignTreasuryPathUsd` / `SignBundle` / `SignTempoBundle` | core signing fns + secret bindings | keys never enter core; same signing math |
-| `AcquireReceiptProbe` | TDO short lock | DO serial |
+| `AcquireReceiptProbe` | TDO expiring throttle slot (`probe:{txhash}` deadline; never released, exactly the docker per-interval receipt lease; the slot is deleted as housekeeping when its funding intent clears) | DO serial |
 | `FetchTransactionReceipt` | chain RPC fetch | same policy |
 | `RecordTreasuryShortfall` / `RecordPartialTopUp` / `RecordFundingSubmitted` / `RecordUnprovenFunding` / `NoteFundingReceipt` | TDO/RDO writes + logs | same texts |
 | `CheckBroadcastSeen` / `RememberBroadcast` / `ForgetBroadcast` | LDO cache | cache (30 s), loss harmless |

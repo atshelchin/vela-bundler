@@ -34,7 +34,10 @@ use crate::{
         },
     },
     config::CfConfig,
-    proto::{ItemResolutionWire, LaneCommand, LaneReply, RecordCommand, RecordReply},
+    proto::{
+        ItemResolutionWire, LaneCommand, LaneReply, LeaseIdentity, RecordCommand, RecordReply,
+        TreasuryCommand, TreasuryReply, TreasuryRequest,
+    },
 };
 
 const INTENT_KEY: &str = "intent";
@@ -48,6 +51,22 @@ thread_local! {
     /// Per-isolate market price cache (docker: per-process map, same TTL).
     static MARKET_PRICES: RefCell<std::collections::HashMap<String, (u64, U256)>> =
         RefCell::new(std::collections::HashMap::new());
+    /// Disambiguates lease tokens minted in the same millisecond (docker:
+    /// `unique_token`'s process counter).
+    static TOKEN_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Docker `unique_token`: unique per acquisition attempt within this shell.
+fn unique_token(prefix: &str, chain_id: u64, lane: u8) -> String {
+    let counter = TOKEN_COUNTER.with(|counter| {
+        let value = counter.get();
+        counter.set(value.wrapping_add(1));
+        value
+    });
+    format!(
+        "{prefix}:{chain_id}:{lane}:{}:{counter}",
+        Date::now().as_millis()
+    )
 }
 
 /// The docker engine's shell-local dispositions for prepared-intent recovery.
@@ -72,6 +91,26 @@ struct BatchContext<'a> {
     policy: &'a core_execution::ExecutionPolicy,
     trusted: &'a TrustedRpcClient<'a>,
     native_symbol: RefCell<Option<String>>,
+    /// This batch's treasury lease token (docker: the handler's
+    /// `treasury_token`); the scope is the chain's TreasuryDO itself.
+    treasury_token: String,
+}
+
+impl BatchContext<'_> {
+    fn treasury_lease(&self) -> LeaseIdentity {
+        LeaseIdentity {
+            token: self.treasury_token.clone(),
+            ttl_ms: self.config.lease_ttl_ms,
+        }
+    }
+}
+
+/// The docker arms surface the store error as a batch-fatal `Failed`
+/// (bindings contract); this is its stable shell-side text.
+fn treasury_unavailable() -> Out {
+    Out::Failed {
+        message: "chain treasury coordinator is unavailable".into(),
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -159,6 +198,7 @@ impl LaneDo {
             policy: &policy,
             trusted: &trusted,
             native_symbol: RefCell::new(None),
+            treasury_token: unique_token("treasury", chain_id, lane),
         };
 
         let core: crux_core::Core<core_execution::ExecutionApp> = crux_core::Core::new();
@@ -564,25 +604,244 @@ impl LaneDo {
                 }
                 Out::Done
             }
-            // --- treasury funding: lands with T016 (TreasuryDO) ---
-            Op::AcquireTreasuryLease
-            | Op::EnsureTreasuryLease
-            | Op::ReleaseTreasuryLease
-            | Op::LoadPreparedFunding
-            | Op::SaveFundingIntent { .. }
-            | Op::ClearFundingIntent { .. }
-            | Op::FetchTreasuryContext
-            | Op::SignTreasuryTransfer { .. }
-            | Op::SignTreasuryPathUsd { .. }
-            | Op::AcquireReceiptProbe { .. }
-            | Op::FetchTransactionReceipt { .. }
-            | Op::RecordTreasuryShortfall { .. }
-            | Op::RecordPartialTopUp { .. }
-            | Op::RecordFundingSubmitted { .. }
-            | Op::RecordUnprovenFunding { .. }
-            | Op::NoteFundingReceipt { .. } => Out::Failed {
-                message: "treasury funding lands with T016".into(),
-            },
+            // --- treasury funding (TreasuryDO = the chain's real lock) ---
+            Op::AcquireTreasuryLease => {
+                match self
+                    .treasury(
+                        chain_id,
+                        None,
+                        TreasuryCommand::AcquireLease {
+                            lease: context.treasury_lease(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(TreasuryReply::Acquired { acquired }) => Out::LeaseAcquired { acquired },
+                    _ => treasury_unavailable(),
+                }
+            }
+            Op::EnsureTreasuryLease => {
+                match self
+                    .treasury(
+                        chain_id,
+                        None,
+                        TreasuryCommand::EnsureLease {
+                            lease: context.treasury_lease(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(TreasuryReply::Held { held }) => Out::LeaseHeld { held },
+                    _ => treasury_unavailable(),
+                }
+            }
+            Op::ReleaseTreasuryLease => {
+                let _ = self
+                    .treasury(
+                        chain_id,
+                        None,
+                        TreasuryCommand::ReleaseLease {
+                            token: context.treasury_token.clone(),
+                        },
+                    )
+                    .await;
+                Out::Done
+            }
+            Op::LoadPreparedFunding => {
+                match self
+                    .treasury(
+                        chain_id,
+                        Some(context.treasury_lease()),
+                        TreasuryCommand::LoadFunding,
+                    )
+                    .await
+                {
+                    Ok(TreasuryReply::Funding { intent }) => Out::FundingIntent { intent },
+                    _ => treasury_unavailable(),
+                }
+            }
+            Op::SaveFundingIntent { intent } => {
+                match self
+                    .treasury(
+                        chain_id,
+                        Some(context.treasury_lease()),
+                        TreasuryCommand::SaveFunding {
+                            intent: intent.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(TreasuryReply::Saved { saved }) => Out::Saved { saved },
+                    _ => treasury_unavailable(),
+                }
+            }
+            Op::ClearFundingIntent { transaction_hash } => {
+                match self
+                    .treasury(
+                        chain_id,
+                        Some(context.treasury_lease()),
+                        TreasuryCommand::ClearFunding {
+                            transaction_hash: transaction_hash.clone(),
+                        },
+                    )
+                    .await
+                {
+                    Ok(TreasuryReply::Cleared { .. }) => Out::Done,
+                    _ => treasury_unavailable(),
+                }
+            }
+            Op::FetchTreasuryContext => {
+                let calls = [
+                    RpcBatchCall {
+                        method: "eth_getTransactionCount",
+                        params: json!([context.policy.treasury.to_string(), "pending"]),
+                    },
+                    RpcBatchCall {
+                        method: "eth_getBalance",
+                        params: json!([context.policy.treasury.to_string(), "pending"]),
+                    },
+                ];
+                match context.trusted.batch(chain_id, &calls).await {
+                    Ok(responses) => {
+                        let treasury_context =
+                            response_quantity(&responses, 0, "treasury eth_getTransactionCount")
+                                .and_then(|nonce| {
+                                    let nonce = u64::try_from(nonce)
+                                        .map_err(|_| "treasury nonce exceeds uint64".to_owned())?;
+                                    let balance = response_quantity(
+                                        &responses,
+                                        1,
+                                        "treasury eth_getBalance",
+                                    )?;
+                                    Ok((nonce, balance))
+                                });
+                        match treasury_context {
+                            Ok((nonce, balance)) => Out::TreasuryContext { nonce, balance },
+                            Err(message) => Out::Failed { message },
+                        }
+                    }
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::SignTreasuryTransfer { request } => {
+                sign_treasury_transfer(context, chain_id, request)
+            }
+            Op::SignTreasuryPathUsd { request } => {
+                sign_treasury_path_usd(context, chain_id, request)
+            }
+            Op::AcquireReceiptProbe { transaction_hash } => {
+                match self
+                    .treasury(
+                        chain_id,
+                        Some(context.treasury_lease()),
+                        TreasuryCommand::AcquireReceiptProbe {
+                            transaction_hash: transaction_hash.clone(),
+                            ttl_ms: context.config.receipt_poll_ms,
+                        },
+                    )
+                    .await
+                {
+                    Ok(TreasuryReply::Acquired { acquired }) => Out::LeaseAcquired { acquired },
+                    _ => treasury_unavailable(),
+                }
+            }
+            Op::FetchTransactionReceipt { transaction_hash } => {
+                match context
+                    .trusted
+                    .call(
+                        chain_id,
+                        "eth_getTransactionReceipt",
+                        json!([transaction_hash]),
+                    )
+                    .await
+                {
+                    Ok(receipt) => Out::Receipt {
+                        receipt: (!receipt.is_null()).then_some(receipt),
+                    },
+                    Err(error) => Out::Failed {
+                        message: error.to_string(),
+                    },
+                }
+            }
+            Op::RecordTreasuryShortfall {
+                treasury_balance,
+                required_treasury,
+                requested,
+                minimum,
+                top_up_gas_cost,
+            } => {
+                worker::console_warn!(
+                    "treasury cannot fund the current UserOperation relayer prefund: chain_id={chain_id} treasury_native_balance={treasury_balance} required_native_balance={required_treasury} requested_top_up_native_amount={requested} minimum_top_up_native_amount={minimum} top_up_gas_cost={top_up_gas_cost} reserve_native_amount={}",
+                    context.config.treasury_floor_wei
+                );
+                Out::Done
+            }
+            Op::RecordPartialTopUp {
+                requested,
+                submitted,
+                minimum,
+            } => {
+                worker::console_log!(
+                    "treasury funding the current UserOperation with a partial relayer float top-up: chain_id={chain_id} requested_top_up_native_amount={requested} submitted_top_up_native_amount={submitted} minimum_top_up_native_amount={minimum}"
+                );
+                Out::Done
+            }
+            Op::RecordFundingSubmitted {
+                amount,
+                transaction_hash,
+                tempo: is_tempo,
+            } => {
+                if *is_tempo {
+                    worker::console_log!(
+                        "submitted Tempo treasury pathUSD relayer top-up: chain_id={chain_id} relayer={} amount_path_usd={amount} transaction_hash={transaction_hash}",
+                        context.policy.relayer
+                    );
+                } else {
+                    worker::console_log!(
+                        "submitted treasury relayer gas top-up: chain_id={chain_id} relayer={} amount_wei={amount} transaction_hash={transaction_hash}",
+                        context.policy.relayer
+                    );
+                }
+                Out::Done
+            }
+            Op::RecordUnprovenFunding {
+                transaction_hash,
+                ambiguous,
+                reason,
+            } => {
+                if *ambiguous {
+                    worker::console_debug!(
+                        "funding broadcast is ambiguous; retaining exact outbox: chain_id={chain_id} transaction_hash={transaction_hash} reason={reason}"
+                    );
+                } else {
+                    worker::console_warn!(
+                        "rejected broadcast is unproven; retaining exact funding outbox: chain_id={chain_id} transaction_hash={transaction_hash} reason={reason}"
+                    );
+                }
+                Out::Done
+            }
+            Op::NoteFundingReceipt { intent, success } => {
+                if *success {
+                    worker::console_log!(
+                        "treasury relayer gas top-up included: chain_id={} relayer={} amount_wei={} transaction_hash={}",
+                        intent.chain_id,
+                        intent.relayer,
+                        intent.amount_wei,
+                        intent.transaction_hash
+                    );
+                } else {
+                    worker::console_error!(
+                        "treasury relayer top-up transaction reverted: chain_id={} relayer={} amount_wei={} transaction_hash={}",
+                        intent.chain_id,
+                        intent.relayer,
+                        intent.amount_wei,
+                        intent.transaction_hash
+                    );
+                }
+                Out::Done
+            }
             // --- Tempo (0x76 envelope): lands with T017 ---
             Op::FetchTempoContext
             | Op::SignTempoBundle { .. }
@@ -702,6 +961,39 @@ impl LaneDo {
         command: &RecordCommand,
     ) -> std::result::Result<RecordReply, ()> {
         crate::admission::record_command(&self.env, chain_id, hash, command).await
+    }
+
+    /// One TreasuryDO round-trip (instance = the chain). `renew` piggybacks a
+    /// lease extension on every touch from the current holder — the docker
+    /// heartbeat's counterpart (declared in the bindings contract).
+    async fn treasury(
+        &self,
+        chain_id: u64,
+        renew: Option<LeaseIdentity>,
+        command: TreasuryCommand,
+    ) -> std::result::Result<TreasuryReply, ()> {
+        let namespace = self.env.durable_object("TREASURY").map_err(|_| ())?;
+        let id = namespace
+            .id_from_name(&chain_id.to_string())
+            .map_err(|_| ())?;
+        let stub = id.get_stub().map_err(|_| ())?;
+
+        let body = serde_json::to_string(&TreasuryRequest { renew, command }).map_err(|_| ())?;
+        let headers = worker::Headers::new();
+        headers
+            .set("content-type", "application/json")
+            .map_err(|_| ())?;
+        let mut init = worker::RequestInit::new();
+        init.with_method(worker::Method::Post)
+            .with_headers(headers)
+            .with_body(Some(worker::wasm_bindgen::JsValue::from_str(&body)));
+        let request =
+            worker::Request::new_with_init("https://treasury-do/", &init).map_err(|_| ())?;
+        let mut response = stub.fetch_with_request(request).await.map_err(|_| ())?;
+        if response.status_code() != 200 {
+            return Err(());
+        }
+        response.json::<TreasuryReply>().await.map_err(|_| ())
     }
 
     async fn intent(&self) -> Option<PreparedBundleIntent> {
@@ -1482,6 +1774,102 @@ fn sign_bundle(
             to: request.entry_point,
             value: U256::ZERO,
             input: request.calldata.clone().into(),
+        },
+    ) {
+        Ok(signed) => Out::Signed {
+            signed: core_execution::SignedBundle {
+                raw_transaction_hex: format!("0x{}", hex::encode(&signed.raw_transaction)),
+                transaction_hash: signed.transaction_hash,
+                nonce: signed.nonce,
+            },
+        },
+        Err(error) => Out::Failed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Docker engine `SignTreasuryTransfer` arm: a plain-value EIP-1559 transfer
+/// from the treasury to this lane's relayer, gas pinned to the core's
+/// `TOP_UP_GAS_LIMIT`.
+fn sign_treasury_transfer(
+    context: &BatchContext<'_>,
+    chain_id: u64,
+    request: &core_execution::TreasurySignRequest,
+) -> Out {
+    let Some(secret) = context.config.operator_secret.as_deref() else {
+        return Out::Failed {
+            message: "OPERATOR_SECRET is required for execution".into(),
+        };
+    };
+    let key = match vault::derive_treasury_secret_key(secret) {
+        Ok(key) => key,
+        Err(error) => {
+            return Out::Failed {
+                message: error.to_string(),
+            };
+        }
+    };
+    match vela_relay_core::signing::sign_eip1559(
+        &key,
+        vela_relay_core::signing::TransactionPlan {
+            chain_id,
+            nonce: request.nonce,
+            gas_limit: vela_relay_core::funding::TOP_UP_GAS_LIMIT,
+            max_fee_per_gas: request.max_fee_per_gas,
+            max_priority_fee_per_gas: request.max_priority_fee_per_gas,
+            to: context.policy.relayer,
+            value: request.amount,
+            input: alloy::primitives::Bytes::new(),
+        },
+    ) {
+        Ok(signed) => Out::Signed {
+            signed: core_execution::SignedBundle {
+                raw_transaction_hex: format!("0x{}", hex::encode(&signed.raw_transaction)),
+                transaction_hash: signed.transaction_hash,
+                nonce: signed.nonce,
+            },
+        },
+        Err(error) => Out::Failed {
+            message: error.to_string(),
+        },
+    }
+}
+
+/// Docker engine `SignTreasuryPathUsd` arm: the Tempo `0x76` pathUSD transfer
+/// from the treasury to this lane's relayer (fee token pathUSD, tip 0).
+fn sign_treasury_path_usd(
+    context: &BatchContext<'_>,
+    chain_id: u64,
+    request: &core_execution::TempoTreasurySignRequest,
+) -> Out {
+    let Some(secret) = context.config.operator_secret.as_deref() else {
+        return Out::Failed {
+            message: "OPERATOR_SECRET is required for execution".into(),
+        };
+    };
+    let key = match vault::derive_treasury_secret_key(secret) {
+        Ok(key) => key,
+        Err(error) => {
+            return Out::Failed {
+                message: error.to_string(),
+            };
+        }
+    };
+    match vela_relay_core::signing::sign_tempo(
+        &key,
+        vela_relay_core::signing::TempoTransactionPlan {
+            chain_id,
+            nonce: request.nonce,
+            gas_limit: request.gas_limit,
+            max_fee_per_gas: request.max_fee_per_gas,
+            max_priority_fee_per_gas: 0,
+            fee_token: vela_relay_core::tempo::PATH_USD,
+            to: vela_relay_core::tempo::PATH_USD,
+            input: vela_relay_core::tempo::path_usd_transfer_calldata(
+                context.policy.relayer,
+                request.amount,
+            ),
         },
     ) {
         Ok(signed) => Out::Signed {
