@@ -104,6 +104,28 @@ declared in [contracts/platform-bindings.md](contracts/platform-bindings.md);
 observe a reconcile alarm pass and a receipt-check alarm against the emulator's
 clock.
 
+### Gate 4 as run (T021, anvil rig)
+
+Same rig as Gate 3 (fresh `.wrangler/state` — a stale prepared intent from a
+previous rig chain correctly refuses to clear without terminal proof, so the
+state must match the chain). Measured under `wrangler dev`:
+
+- **Full lifecycle with receipt confirmation**: send → `queued` → `submitted`
+  at T+6–8 s (funding + bundle) → **`included` at T+9–10 s** — the lane
+  reconcile alarm fetched the mined receipt, applied the per-member
+  `receipt_patch` (status/receipt/blockHash/blockNumber/event), and cleared
+  the intent. `eth_getUserOperationReceipt` then serves the real on-chain
+  event (`success: true`, `actualGasUsed` from the UserOperationEvent, full
+  receipt logs).
+- **Ladder timing**: a future-nonce op parked at attempt 1 re-drove at
+  +5 s → attempt 2, +10 s → attempt 3, +21 s → attempt 4 against the core's
+  5/10/20 s ladder — deviation ≤ 1 s, far inside max(30 s, 10%).
+- **Park → auto-execute arc**: with the parked op's nonce made current (its
+  predecessor included at T+9 s), the next ladder re-drive executed it with
+  no external traffic: parked → `submitted` at T+15 s → `included` at
+  T+17 s. The lane processed three operations back-to-back with no wedge —
+  the pre-US3 limitation recorded under Gate 3 is closed.
+
 ## Gate 5 — Load and isolation (SC-004/SC-007, pre-production)
 
 Deployed environment: sustained-rate submission/read load from three regions

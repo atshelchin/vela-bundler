@@ -24,6 +24,9 @@ pub struct CfConfig {
     /// Receipt-probe throttle interval (docker `receipt_poll_interval`,
     /// default 3 s).
     pub receipt_poll_ms: u64,
+    /// Delayed-payload retention floor (docker `attempt_ttl`, default 48 h;
+    /// the effective retention is `max(this, 14 d)` — queue-retention parity).
+    pub attempt_ttl_ms: u64,
     // Executor policy values — same names, defaults, and bounds as the docker
     // parser; injected into the core as data.
     pub max_bundle_operations: usize,
@@ -188,6 +191,8 @@ impl CfConfig {
             lease_ttl_ms: u64_var(env, "VELA_RELAY_EXECUTOR_LEASE_TTL_SECS", 30)?
                 .saturating_mul(1_000),
             receipt_poll_ms: u64_var(env, "VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS", 3)?
+                .saturating_mul(1_000),
+            attempt_ttl_ms: u64_var(env, "VELA_RELAY_EXECUTOR_ATTEMPT_TTL_SECS", 48 * 60 * 60)?
                 .saturating_mul(1_000),
             max_bundle_operations: usize_var(env, "VELA_RELAY_MAX_BUNDLE_OPERATIONS", 10)?,
             gas_buffer_bps: u64_var(env, "VELA_RELAY_EXECUTOR_GAS_BUFFER_BPS", 1_500)?,

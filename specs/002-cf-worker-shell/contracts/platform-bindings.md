@@ -49,13 +49,18 @@ Legend: RDO = RecordDO, LDO = LaneDO, TDO = TreasuryDO (see data-model.md).
 
 ## Time-driven behaviors
 
-| Behavior | docker mechanism | CF mechanism | Tolerance (declared) |
-|---|---|---|---|
-| Hold-ladder redelivery | Redis zset + claim readers | LDO alarm at min(due) | fire within max(30 s, 10%) of due |
-| Receipt confirmation checks | shell loop + record field | RDO alarm | same interval values; same tolerance class |
-| Prepared-bundle reconcile | shell timer | LDO alarm while intent exists | same interval values |
-| Record TTL expiry | Redis TTL | RDO alarm cleanup | ± one alarm granule; never early |
-| Funding retry cadence | in-batch + redelivery | queue retry delay + TDO state | core-owned values |
+| Behavior | docker mechanism | CF mechanism | Tolerance (declared) | Measured (Gate 4, wrangler dev) |
+|---|---|---|---|---|
+| Hold-ladder redelivery | Redis zset + claim readers | LDO alarm at min(due); due entries re-drive through the same batch entry; a transient failure climbs the same core ladder in place (claim fencing: a re-park during the batch invalidates the pass's snapshot) | fire within max(30 s, 10%) of due | attempts 1→4 re-driven at +5 s/+10 s/+21 s vs the core's 5/10/20 s ladder — deviation ≤ 1 s |
+| Receipt confirmation checks | shell reconciler loop (per prepared intent) | LDO reconcile alarm while an intent exists (as-built: receipts are bundle-scoped exactly as docker; RecordDO alarms remain TTL-only) | same interval values (`VELA_RELAY_EXECUTOR_RECEIPT_POLL_SECS`, 3 s); same tolerance class | submitted → `included` in 2–3 s after mining |
+| Prepared-bundle reconcile | shell timer | same LDO alarm (resume → receipt → per-member `receipt_patch` → clear); armed on save (covers the save-to-broadcast crash window) and on submit | same interval values | intent cleared with the receipt write; lane accepted follow-up work immediately |
+| Record TTL expiry | Redis TTL | RDO alarm cleanup | ± one alarm granule; never early | unchanged (T00x behavior) |
+| Funding retry cadence | in-batch + redelivery | queue retry delay + TDO state | core-owned values | Gate 3: four full cycles |
+
+Delayed-payload retention: `max(VELA_RELAY_EXECUTOR_ATTEMPT_TTL_SECS, 14 d)`
+sliding from the last park/retry write — the docker
+`attempt_ttl.max(USER_OPERATION_QUEUE_RETENTION)` PEXPIRE refresh, spelled as
+an `updated_ms` check at re-drive time.
 
 ## Explicitly absent on this shell
 

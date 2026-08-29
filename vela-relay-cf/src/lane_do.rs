@@ -46,6 +46,13 @@ const BROADCAST_RETRY_INTERVAL_MS: u64 = 30_000;
 const BINANCE_PRICE_TTL_MS: u64 = 60_000;
 /// Docker engine `ERC20_DECIMALS_SELECTOR` (`decimals()`).
 const ERC20_DECIMALS_SELECTOR: [u8; 4] = [0x31, 0x3c, 0xe5, 0x67];
+/// The lane's next reconcile deadline (armed while a prepared intent exists).
+const RECONCILE_DUE_KEY: &str = "reconcileDueMs";
+/// Docker `DELAYED_CLAIM_BATCH_SIZE`.
+const DELAYED_REDRIVE_BATCH: usize = 100;
+/// Docker `USER_OPERATION_QUEUE_RETENTION` (14 d): the delayed-payload
+/// retention is `max(attempt_ttl, this)` on both shells.
+const QUEUE_RETENTION_MS: u64 = 14 * 24 * 60 * 60 * 1_000;
 
 thread_local! {
     /// Per-isolate market price cache (docker: per-process map, same TTL).
@@ -119,6 +126,10 @@ struct DelayedEntry {
     attempts: u32,
     due_ms: u64,
     created_ms: u64,
+    /// Last write (park or retry); the retention window slides from here
+    /// (docker: the payload key's PEXPIRE refresh on every retry).
+    #[serde(default)]
+    updated_ms: u64,
 }
 
 #[durable_object]
@@ -147,10 +158,21 @@ impl DurableObject for LaneDo {
         }
     }
 
+    /// The lane's single packed alarm (earliest-of): the prepared-intent
+    /// reconcile step (docker `reconcile_prepared_bundles`, per this lane)
+    /// runs first, then due delayed-inbox entries re-drive through the same
+    /// batch entry (docker `reconcile_delayed_user_operations`) — the docker
+    /// reconciler's loop body, fired by the platform clock instead of an
+    /// interval task.
     async fn alarm(&self) -> Result<Response> {
-        // US3 (T019): re-drive due delayed operations through the same batch
-        // entry. Until then the alarm only reschedules for the earliest due.
-        self.schedule_delayed_alarm().await?;
+        let now = Date::now().as_millis();
+        if let Some(due) = self.reconcile_due().await
+            && now >= due
+        {
+            self.reconcile_intent().await;
+        }
+        self.redrive_due_delayed(now).await;
+        self.schedule_lane_alarm().await?;
         Response::empty()
     }
 }
@@ -390,7 +412,13 @@ impl LaneDo {
                     Out::Saved { saved: false }
                 } else {
                     match self.state.storage().put(INTENT_KEY, intent).await {
-                        Ok(()) => Out::Saved { saved: true },
+                        Ok(()) => {
+                            // Covers the crash window between save and
+                            // broadcast: the reconcile alarm resumes the
+                            // durable outbox even if this batch dies here.
+                            self.arm_reconcile().await;
+                            Out::Saved { saved: true }
+                        }
                         Err(_) => Out::Failed {
                             message: "could not persist prepared bundle intent".into(),
                         },
@@ -1313,6 +1341,7 @@ impl LaneDo {
             attempts,
             due_ms,
             created_ms: now,
+            updated_ms: now,
         };
         if self.state.storage().put(&key, &entry).await.is_err() {
             self.log_defer_failure(chain_id, &routed.user_operation_hash, cause);
@@ -1332,7 +1361,7 @@ impl LaneDo {
             index_list.push(routed.user_operation_hash.clone());
             let _ = self.state.storage().put("delayed_index", &index_list).await;
         }
-        let _ = self.schedule_delayed_alarm().await;
+        let _ = self.schedule_lane_alarm().await;
         self.log_defer_success(chain_id, &routed.user_operation_hash, attempts, cause);
         Out::Deferred { attempt: attempts }
     }
@@ -1345,7 +1374,11 @@ impl LaneDo {
         _gas_limit: u64,
     ) -> Out {
         match self.submit_bundle_members(chain_id, intent).await {
-            Ok(indexed) => Out::Indexed { indexed },
+            Ok(indexed) => {
+                // A submitted bundle now has a receipt to reconcile.
+                self.arm_reconcile().await;
+                Out::Indexed { indexed }
+            }
             Err(message) => Out::Failed { message },
         }
     }
@@ -1421,27 +1454,73 @@ impl LaneDo {
         }
     }
 
-    async fn schedule_delayed_alarm(&self) -> Result<()> {
-        let index_list: Vec<String> = self
-            .state
+    async fn delayed_index(&self) -> Vec<String> {
+        self.state
             .storage()
             .get("delayed_index")
             .await
             .ok()
             .flatten()
-            .unwrap_or_default();
+            .unwrap_or_default()
+    }
+
+    async fn delayed_entry(&self, hash: &str) -> Option<DelayedEntry> {
+        self.state
+            .storage()
+            .get(&format!("delayed:{hash}"))
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn remove_delayed_entry(&self, hash: &str) {
+        let _ = self
+            .state
+            .storage()
+            .delete(&format!("delayed:{hash}"))
+            .await;
+        let mut index_list = self.delayed_index().await;
+        index_list.retain(|entry| entry != hash);
+        let _ = self.state.storage().put("delayed_index", &index_list).await;
+    }
+
+    async fn reconcile_due(&self) -> Option<u64> {
+        self.state
+            .storage()
+            .get(RECONCILE_DUE_KEY)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Arms (or advances) the reconcile deadline to at most one poll interval
+    /// from now — the docker reconciler's tick, packed into the lane alarm.
+    async fn arm_reconcile(&self) {
+        let poll_ms = CfConfig::from_env(&self.env)
+            .map(|config| config.receipt_poll_ms)
+            .unwrap_or(3_000);
+        let due = Date::now().as_millis() + poll_ms;
+        let due = match self.reconcile_due().await {
+            Some(existing) if existing <= due => existing,
+            _ => due,
+        };
+        let _ = self.state.storage().put(RECONCILE_DUE_KEY, due).await;
+        let _ = self.schedule_lane_alarm().await;
+    }
+
+    /// The single packed alarm: earliest-of(delayed dues, reconcile-due while
+    /// an intent exists).
+    async fn schedule_lane_alarm(&self) -> Result<()> {
         let mut earliest: Option<u64> = None;
-        for hash in &index_list {
-            let entry: Option<DelayedEntry> = self
-                .state
-                .storage()
-                .get(&format!("delayed:{hash}"))
-                .await
-                .ok()
-                .flatten();
-            if let Some(entry) = entry {
+        for hash in &self.delayed_index().await {
+            if let Some(entry) = self.delayed_entry(hash).await {
                 earliest = Some(earliest.map_or(entry.due_ms, |due| due.min(entry.due_ms)));
             }
+        }
+        if self.intent().await.is_some()
+            && let Some(due) = self.reconcile_due().await
+        {
+            earliest = Some(earliest.map_or(due, |existing| existing.min(due)));
         }
         if let Some(due_ms) = earliest {
             let now = Date::now().as_millis();
@@ -1452,6 +1531,253 @@ impl LaneDo {
                 .await?;
         }
         Ok(())
+    }
+
+    /// One reconcile pass for this lane's prepared intent — the docker
+    /// `reconcile_prepared_bundles` body scoped to one lane: resume, then a
+    /// receipt check, then per-member confirmation and intent clearance. The
+    /// alarm cadence is the receipt-probe throttle (this DO is the lane's
+    /// only prober).
+    async fn reconcile_intent(&self) {
+        let Some(intent) = self.intent().await else {
+            let _ = self.state.storage().delete(RECONCILE_DUE_KEY).await;
+            return;
+        };
+        let Ok(config) = CfConfig::from_env(&self.env) else {
+            return;
+        };
+        let Ok(policy) = config.execution_policy(intent.chain_id, intent.lane) else {
+            return;
+        };
+        let trusted = TrustedRpcClient::new(&config, &self.env);
+        let context = BatchContext {
+            config: &config,
+            policy: &policy,
+            trusted: &trusted,
+            native_symbol: RefCell::new(None),
+            treasury_token: unique_token("treasury", intent.chain_id, intent.lane),
+        };
+
+        match self.resume_bundle_intent(&context, &intent).await {
+            Ok(BundleResumeDisposition::Confirmed) => {
+                if self.intent().await.is_some() {
+                    self.check_bundle_receipt(&context, &intent).await;
+                }
+            }
+            Ok(BundleResumeDisposition::Cleared) => {}
+            Ok(BundleResumeDisposition::Unknown) => {}
+            Err(message) => {
+                worker::console_warn!(
+                    "could not resume prepared bundle: chain_id={} lane={} transaction_hash={} error={message}",
+                    intent.chain_id,
+                    intent.lane,
+                    intent.transaction_hash
+                );
+            }
+        }
+
+        // Keep ticking while the intent survives; clear the deadline once it
+        // is gone.
+        if self.intent().await.is_some() {
+            let due = Date::now().as_millis() + config.receipt_poll_ms;
+            let _ = self.state.storage().put(RECONCILE_DUE_KEY, due).await;
+        } else {
+            let _ = self.state.storage().delete(RECONCILE_DUE_KEY).await;
+        }
+    }
+
+    /// Docker's receipt half of the reconciler: fetch the bundle receipt and
+    /// apply `mark_bundle_confirmed` / `mark_bundle_failed` through per-member
+    /// record patches (core `receipt` rules, frozen patch shape), then clear
+    /// the intent.
+    async fn check_bundle_receipt(
+        &self,
+        context: &BatchContext<'_>,
+        intent: &PreparedBundleIntent,
+    ) {
+        let receipt = match context
+            .trusted
+            .call(
+                intent.chain_id,
+                "eth_getTransactionReceipt",
+                json!([intent.transaction_hash]),
+            )
+            .await
+        {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                worker::console_warn!(
+                    "bundle receipt batch RPC failed: chain_id={} error={error}",
+                    intent.chain_id
+                );
+                return;
+            }
+        };
+        if receipt.is_null() {
+            return;
+        }
+        let members: Vec<String> = self
+            .state
+            .storage()
+            .get(&format!("bundle:{}", intent.transaction_hash))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        match vela_relay_core::receipt::receipt_succeeded(&receipt) {
+            None => {
+                worker::console_warn!(
+                    "bundle receipt has an invalid status: chain_id={} lane={} transaction_hash={}",
+                    intent.chain_id,
+                    intent.lane,
+                    intent.transaction_hash
+                );
+                return;
+            }
+            Some(false) => {
+                for hash in &members {
+                    let patch = receipt_patch("failed", &intent.transaction_hash, &receipt, None);
+                    if self
+                        .record(intent.chain_id, hash, &RecordCommand::Patch { patch })
+                        .await
+                        .is_err()
+                    {
+                        worker::console_warn!(
+                            "could not persist reconciled bundle receipt: chain_id={} lane={} transaction_hash={}",
+                            intent.chain_id,
+                            intent.lane,
+                            intent.transaction_hash
+                        );
+                        return;
+                    }
+                }
+            }
+            Some(true) => {
+                let Ok(entry_point) = intent.entry_point.parse::<Address>() else {
+                    worker::console_warn!(
+                        "prepared bundle EntryPoint is invalid: chain_id={} lane={} transaction_hash={}",
+                        intent.chain_id,
+                        intent.lane,
+                        intent.transaction_hash
+                    );
+                    return;
+                };
+                let events = vela_relay_core::receipt::user_operation_events(
+                    &receipt,
+                    entry_point,
+                    &members,
+                );
+                for hash in &members {
+                    let event = events
+                        .iter()
+                        .find(|event| event.user_operation_hash == *hash);
+                    let status = if event.is_some_and(|event| event.success) {
+                        "included"
+                    } else {
+                        "rejected"
+                    };
+                    let patch = receipt_patch(status, &intent.transaction_hash, &receipt, event);
+                    if self
+                        .record(intent.chain_id, hash, &RecordCommand::Patch { patch })
+                        .await
+                        .is_err()
+                    {
+                        worker::console_warn!(
+                            "could not persist reconciled bundle receipt: chain_id={} lane={} transaction_hash={}",
+                            intent.chain_id,
+                            intent.lane,
+                            intent.transaction_hash
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+        let _ = self.clear_intent_if_matches(&intent.transaction_hash).await;
+        self.forget_broadcast(&intent.transaction_hash).await;
+        let _ = self
+            .state
+            .storage()
+            .delete(&format!("bundle:{}", intent.transaction_hash))
+            .await;
+        worker::console_log!(
+            "reconciled bundle receipt: chain_id={} lane={} transaction_hash={} members={}",
+            intent.chain_id,
+            intent.lane,
+            intent.transaction_hash,
+            members.len()
+        );
+    }
+
+    /// Docker `reconcile_delayed_user_operations` for this lane: due entries
+    /// re-drive through the same batch entry; a durable outcome completes the
+    /// entry unless the batch re-parked it (the claim fencing — a re-park
+    /// rewrites the entry, which invalidates this pass's snapshot); a
+    /// transient outcome climbs the retry ladder in place.
+    async fn redrive_due_delayed(&self, now: u64) {
+        let retention_ms = CfConfig::from_env(&self.env)
+            .map(|config| config.attempt_ttl_ms)
+            .unwrap_or(0)
+            .max(QUEUE_RETENTION_MS);
+        let mut due = Vec::new();
+        for hash in self.delayed_index().await {
+            let Some(entry) = self.delayed_entry(&hash).await else {
+                self.remove_delayed_entry(&hash).await;
+                continue;
+            };
+            let touched = entry.updated_ms.max(entry.created_ms);
+            if now.saturating_sub(touched) > retention_ms {
+                worker::console_warn!(
+                    "dropping expired delayed UserOperation: chain_id={} user_operation_hash={hash}",
+                    entry.routed.chain_id
+                );
+                self.remove_delayed_entry(&hash).await;
+                continue;
+            }
+            if entry.due_ms <= now && due.len() < DELAYED_REDRIVE_BATCH {
+                due.push((hash, entry));
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
+        let snapshots: Vec<(String, u32, u64)> = due
+            .iter()
+            .map(|(hash, entry)| (hash.clone(), entry.attempts, entry.due_ms))
+            .collect();
+        let operations: Vec<RoutedUserOperation> =
+            due.into_iter().map(|(_, entry)| entry.routed).collect();
+        let resolutions = self.execute_batch(operations).await;
+        for ((hash, attempts, due_ms), resolution) in snapshots.into_iter().zip(resolutions) {
+            let Some(entry) = self.delayed_entry(&hash).await else {
+                continue;
+            };
+            if entry.attempts != attempts || entry.due_ms != due_ms {
+                // Re-parked during the batch (defer bumped the entry): the
+                // fresh schedule stands.
+                continue;
+            }
+            match resolution {
+                core_execution::ItemResolution::Durable => {
+                    self.remove_delayed_entry(&hash).await;
+                }
+                core_execution::ItemResolution::Failed { .. } => {
+                    let attempts = entry.attempts + 1;
+                    let retry = DelayedEntry {
+                        attempts,
+                        due_ms: Date::now().as_millis()
+                            + vela_relay_core::hold::retry_delay_ms(attempts),
+                        updated_ms: Date::now().as_millis(),
+                        ..entry
+                    };
+                    let _ = self
+                        .state
+                        .storage()
+                        .put(&format!("delayed:{hash}"), &retry)
+                        .await;
+                }
+            }
+        }
     }
 
     fn log_rejection_cause(
@@ -2130,6 +2456,29 @@ fn relayer_address_for_lane(context: &BatchContext<'_>, lane: u8) -> Option<Addr
         .ok()?
         .parse()
         .ok()
+}
+
+/// The docker store's `receipt_patch`, byte-identical field set: status,
+/// transactionHash, admitted, the full receipt, blockHash/blockNumber lifted
+/// from it, and the member's UserOperationEvent when one exists.
+fn receipt_patch(
+    status: &str,
+    transaction_hash: &str,
+    receipt: &Value,
+    event: Option<&vela_relay_core::task::UserOperationEvent>,
+) -> Value {
+    let mut patch = json!({
+        "status": status,
+        "transactionHash": transaction_hash,
+        "admitted": true,
+        "receipt": receipt,
+        "blockHash": receipt.get("blockHash"),
+        "blockNumber": receipt.get("blockNumber"),
+    });
+    if let Some(event) = event {
+        patch["event"] = serde_json::to_value(event).unwrap_or(Value::Null);
+    }
+    patch
 }
 
 fn tempo_chain_assets(config: &CfConfig) -> core_execution::ResolvedChainAssets {
