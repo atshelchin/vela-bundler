@@ -1553,4 +1553,213 @@ mod tests {
             &[native_only.as_slice(), stable.as_slice()]
         ));
     }
+
+    // ----- proof-of-payment guards (fund-safety: an unproven or misdirected
+    // payment must never be credited) -----
+
+    #[test]
+    fn verify_stable_transfer_logs_enforces_every_field_of_the_transfer_event() {
+        let call_data = safe_multisend(&[Entry::erc20(STABLECOIN, RECIPIENT, U256::from(100u8))]);
+        let reimbursement =
+            parse_reimbursement(&call_data, RECIPIENT, &BTreeSet::from([STABLECOIN])).unwrap();
+
+        // The exact, correct log proves payment.
+        let good = transfer_log(STABLECOIN, SENDER, RECIPIENT, U256::from(100u8));
+        assert!(verify_stable_transfer_logs(
+            &reimbursement,
+            SENDER,
+            RECIPIENT,
+            &[good.clone()]
+        ));
+
+        // Each single-field corruption must FAIL — otherwise a Transfer that
+        // did not actually pay the settlement recipient would be credited.
+        let wrong_token = address!("9999999999999999999999999999999999999999");
+        let outsider = address!("7777777777777777777777777777777777777777");
+
+        // (1) wrong emitting token contract
+        let mut log = good.clone();
+        log.address = wrong_token;
+        assert!(!verify_stable_transfer_logs(
+            &reimbursement,
+            SENDER,
+            RECIPIENT,
+            &[log]
+        ));
+
+        // (2) wrong recipient topic (paid to a third party)
+        let paid_elsewhere = transfer_log(STABLECOIN, SENDER, outsider, U256::from(100u8));
+        assert!(!verify_stable_transfer_logs(
+            &reimbursement,
+            SENDER,
+            RECIPIENT,
+            &[paid_elsewhere]
+        ));
+
+        // (3) wrong event signature (topic0)
+        let mut log = good.clone();
+        log.topics[0] = keccak256(b"Approval(address,address,uint256)");
+        assert!(!verify_stable_transfer_logs(
+            &reimbursement,
+            SENDER,
+            RECIPIENT,
+            &[log]
+        ));
+
+        // (4) wrong topic count (an anonymous or malformed event)
+        let mut log = good.clone();
+        log.topics.pop();
+        assert!(!verify_stable_transfer_logs(
+            &reimbursement,
+            SENDER,
+            RECIPIENT,
+            &[log]
+        ));
+
+        // (5) wrong data length (not a single uint256 amount)
+        let mut log = good.clone();
+        log.data = vec![0u8; 31].into();
+        assert!(!verify_stable_transfer_logs(
+            &reimbursement,
+            SENDER,
+            RECIPIENT,
+            &[log]
+        ));
+    }
+
+    #[test]
+    fn parse_reimbursement_ignores_transfers_to_a_different_recipient() {
+        let outsider = address!("7777777777777777777777777777777777777777");
+        // A correctly-shaped native transfer and ERC-20 transfer, both paying
+        // someone OTHER than the settlement recipient, must credit nothing.
+        let call_data = safe_multisend(&[
+            Entry::native(outsider, U256::from(1_000u64)),
+            Entry::erc20(STABLECOIN, outsider, U256::from(1_000u64)),
+        ]);
+        let reimbursement =
+            parse_reimbursement(&call_data, RECIPIENT, &BTreeSet::from([STABLECOIN])).unwrap();
+        assert!(reimbursement.native.is_zero());
+        assert!(reimbursement.stablecoins.is_empty());
+    }
+
+    #[test]
+    fn an_empty_reimbursement_is_rejected_as_insufficient_payment() {
+        // Valid calldata that parses cleanly but pays the recipient nothing
+        // (the transfer goes to a third party) must reject via the (false, 0)
+        // zero-payment branch of evaluate_one.
+        let outsider = address!("7777777777777777777777777777777777777777");
+        let call_data = safe_multisend(&[Entry::native(outsider, U256::from(5_000u64))]);
+        let result = evaluate_batch(
+            RECIPIENT,
+            &native_config(18),
+            &[SettlementInput {
+                call_data: &call_data,
+                gas_native_cost: U256::from(1_000u64),
+            }],
+            None,
+        )
+        .unwrap();
+        let evaluation = &result.operations[0];
+        assert!(evaluation.paid_amount.is_zero());
+        assert!(!evaluation.accepted());
+        assert_eq!(
+            evaluation.rejection,
+            Some(SettlementRejection::InsufficientPayment)
+        );
+    }
+
+    // ----- stablecoin decision path (the whole verdict table was native-only) -----
+
+    #[test]
+    fn decide_settlement_keeps_a_fully_funded_stablecoin_quote() {
+        use super::{SettlementDecision, decide_settlement};
+        // gas 1 × quoted 100 = cost 100; markup 1.4 → marked 140.
+        // At $2,000/ETH (2e11 in 8-dec) a 6-decimal stable requires
+        // ceil(140 · 2e11 · 1e6 / 1e26) = 1 unit, lifted to the 10_000 floor.
+        let paid = safe_multisend(&[Entry::erc20(STABLECOIN, RECIPIENT, U256::from(10_000u64))]);
+        let decision = decide_settlement(
+            RECIPIENT,
+            &config_with_stable(18, 6),
+            &[paid.as_slice()],
+            &[U256::from(1u64)],
+            Some(U256::from(200_000_000_000u64)),
+            &fees(100, 1, 0, 15_000),
+        )
+        .unwrap();
+        match decision {
+            SettlementDecision::KeepQuote { evaluation } => {
+                assert!(evaluation.all_accepted());
+                assert_eq!(evaluation.operations[0].payment_asset, Some(STABLECOIN));
+            }
+            other => panic!("expected KeepQuote, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stablecoin_below_the_floor_cannot_be_repriced_into_acceptance() {
+        use super::{SettlementDecision, decide_settlement};
+        // The payment (3_000) sits below the 10_000 stablecoin floor, so the
+        // required amount is pinned at the floor at EVERY fee — no reprice can
+        // drop it to what was paid. The safety net (decide_settlement:859) must
+        // keep the quote, never reprice-and-accept an underpaid operation.
+        let paid = safe_multisend(&[Entry::erc20(STABLECOIN, RECIPIENT, U256::from(3_000u64))]);
+        let decision = decide_settlement(
+            RECIPIENT,
+            &config_with_stable(18, 6),
+            &[paid.as_slice()],
+            &[U256::from(1u64)],
+            Some(U256::from(100_000_000u64)),
+            &fees(100, 1, 0, 15_000),
+        )
+        .unwrap();
+        match decision {
+            SettlementDecision::KeepQuote { evaluation } => {
+                assert!(!evaluation.all_accepted());
+                assert!(evaluation.operations[0].is_shortfall());
+            }
+            other => panic!("expected KeepQuote (safety net), got {other:?}"),
+        }
+    }
+
+    // ----- conversion / price guards (Tier 2) -----
+
+    #[test]
+    fn native_to_usd_stable_ceil_rejects_a_zero_price() {
+        use super::SettlementError;
+        assert_eq!(
+            native_to_usd_stable_ceil(U256::from(1_000u64), 18, U256::ZERO, 6),
+            Err(SettlementError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn a_stablecoin_operation_without_a_native_price_reports_the_missing_price() {
+        use super::SettlementError;
+        // A stablecoin-paying op needs the native/USD market price to size the
+        // requirement; evaluating it with `None` must error, not under-charge.
+        let paid = safe_multisend(&[Entry::erc20(STABLECOIN, RECIPIENT, U256::from(10_000u64))]);
+        let error = evaluate_batch(
+            RECIPIENT,
+            &config_with_stable(18, 6),
+            &[SettlementInput {
+                call_data: &paid,
+                gas_native_cost: U256::from(1_000u64),
+            }],
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, SettlementError::MissingNativeUsdPrice);
+    }
+
+    #[test]
+    fn marked_tempo_cost_rounds_up_on_a_non_even_markup() {
+        use super::marked_tempo_cost;
+        // 7_143 · 14_000 / 10_000 = 10_000.2 — the remainder must round UP to
+        // 10_001 (and stay above the $0.01 / 10_000-unit floor), never
+        // truncate down to 10_000 and under-charge.
+        assert_eq!(
+            marked_tempo_cost(U256::from(7_143u64), 14_000).unwrap(),
+            U256::from(10_001u64)
+        );
+    }
 }
