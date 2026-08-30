@@ -77,16 +77,61 @@ pinned at the floor at every fee) — a case now pinned by
 A client that pays *exactly* the relay's instantaneous requirement is doomed: the
 base fee at inclusion is almost always higher than at quote time, so the signed
 payment falls short and the op is rejected. **A client must over-pay at quote
-time to absorb the quote→inclusion gas drift.**
+time to absorb the quote→inclusion gas drift.** But it must also protect itself —
+a client that blindly paid whatever the relay quoted could be over-charged by a
+malicious or buggy quote. The vela-wallet client resolves both by keeping the
+relay quote in its proper place: a *floor reference and an audited input*, never
+the unquestioned anchor. All of this lives twice, held identical by
+`fee-policy-parity.test.ts`: `fee_policy.rs` (Rust/WASM, web) and
+`safe-transaction.ts` (TS twin, native).
 
-The vela-wallet client does this with a flat **3× markup on the network gas
-basis** (`INBAND_MARKUP = 3`), against the relay's quoted `networkFeePerGas`
-(where the relay's own quote applies `base_fee_multiplier = 120` → ~`1.2×base`),
-and pays the **same floors** (`0.00001` native / `$0.01` stable). It ignores the
-relay's `requiredAmount` field entirely and self-computes 3×. The signed amount
-is what the confirm screen displayed — it is **not** re-priced just before submit
-(a 30 s quote TTL is advisory, not enforced), so the whole buffer must live in
-that 3×.
+**Two gas numbers, distinct roles:**
+
+- **`C` — the client's own chain measurement.** `deriveChainGasPrice =
+  max(eth_gasPrice, base_fee + tip)`. Objective, independent of the relay.
+- **`R` — the relay's quoted `networkFeePerGas`** (the relay's quote applies
+  `base_fee_multiplier = 120` → ~`1.2×base`).
+
+The pricing pipeline, in order:
+
+```
+① reject:   if R > 3 × C   →  GasQuoteTooHigh (never signed)   (MAX_QUOTE_VS_CHAIN_MULTIPLE = 3)
+② anchor:   basis = max(C, R)
+③ pay:      payment = max( 3 × gas × basis ,  floor )          (INBAND_MARKUP = 3)
+```
+
+**① Reject an outrageous quote.** Before anything is signed, `R > 3 × C` is
+refused rather than paid. The denominator is the client's *own* measurement `C`,
+so the check cannot be fooled by the very quote it is auditing.
+
+**② Anchor on `max(C, R)`, not on `R` alone.** This never lets the 3× drift buffer
+ride on an unvetted quote, and it stops a relay *under-report* (`R < C`) from
+making the client underpay — the client already measured the true cost `C`. It
+still ignores the relay's `requiredAmount` field entirely and self-computes.
+
+**③ Over-pay 3× for drift.** The flat `3×` on `max(C, R)` (vs the relay's 1.4×
+requirement) is the quote→inclusion buffer. The signed amount is what the confirm
+screen displayed — it is **not** re-priced just before submit (a 30 s quote TTL is
+advisory, not enforced), so the whole buffer must live in that 3×. Because
+`max(C, R) = R` in the normal case (`R ≈ 1.2×base ≥ C`), the drift math below is
+unchanged from anchoring on `R`; when the relay under-reports, the client simply
+pays more.
+
+**Floors (client self-imposed).** The client harmonizes the native minimum with
+the stablecoin one — both **$0.01 of value**:
+
+- stablecoin payment: at least `$0.01` (unchanged);
+- native payment: at least **`$0.01` worth of native** when the coin is priced,
+  but never below the relay's `0.00001`-coin admission floor (on a coin dearer
+  than ~$1000, `$0.01` buys *less* than 0.00001 of it, and §1's floor must still
+  be met);
+- native payment with **no USD price**: a flat **`0.001`-coin** blind fallback
+  (nothing to value it against).
+
+These are the *client's* minimums; the relay still admits any op meeting its own
+`0.00001`-native / `$0.01`-stable floor (§1), so the client paying more only ever
+helps. All floors bind only on near-zero-gas ops — the normal 3× gas payment sits
+far above them.
 
 ### Headroom, worked out
 
@@ -114,10 +159,16 @@ band → reprice band → clean-reject) is fixed by the rule.
   quoted network fee (~1.2×base); the relay settles against `2×base'`. The 3×
   client markup and the repricing valve cover the gap, but a client that lowered
   its markup toward the relay's 1.4× would lose almost all drift tolerance.
-- **The floors are exactly equal**, so at the dust floor there is zero headroom:
-  a near-zero-gas op whose gas rises enough to lift `1.4×gas` above the floor,
-  while the client is still pinned at the floor, is a shortfall. Rare, and it
-  fails safe.
+- **The client's floors now sit at or above the relay's.** The client's native
+  minimum is `$0.01` of value (or a `0.001`-coin fallback when the coin is
+  unpriced), while the relay admits down to `0.00001` native — so at the dust
+  floor the client *over-*pays rather than pinning exactly at the relay minimum.
+  The old zero-headroom-at-the-floor shortfall (when the floors were equal) is
+  gone; a near-zero-gas op is cushioned there too.
+- **A quote far above the chain rate is rejected, not paid.** If `R > 3 × C` the
+  client fails closed (`GasQuoteTooHigh`) and the user retries with a fresh quote.
+  A genuine, sudden >3× mempool spike between the client's measurement and the
+  relay's quote is therefore a (rare) rejected send, never an over-charge.
 - **No client-side re-price before submit** (confirm-UI flow): the drift budget
   is entirely the 3× buffer. A user sitting on the confirm screen past the 30 s
   TTL spends that budget on think-time.
@@ -154,7 +205,15 @@ vela-relay", added after a real sub-floor deploy rejection).
   honest payment is repriced down to a fundable fee rather than rejected, down to
   the 1.5×base inclusion floor.
 - A client must pay above the relay minimum to survive gas drift; vela-wallet
-  pays a flat 3× the network basis, giving roughly a +70% base-fee-spike
-  tolerance before a clean, loss-free rejection.
+  pays a flat 3× on `max(C, R)` — its own chain measurement `C`, floored by the
+  relay quote `R` — giving roughly a +70% base-fee-spike tolerance before a clean,
+  loss-free rejection.
+- The client protects itself both ways: it rejects a quote `R > 3 × C`
+  (`GasQuoteTooHigh`) instead of paying it, and anchoring on `max(C, R)` stops a
+  relay under-report from making it underpay.
+- The client's own minimums are value-consistent — `$0.01` worth of native
+  (`0.001`-coin when unpriced) and `$0.01` stable — sitting at or above the
+  relay's `0.00001`-native / `$0.01`-stable admission floor, so paying them only
+  ever helps.
 - Stablecoin reimbursements are verified against the real on-chain Transfer
   event; a misdirected or wrong-token transfer is never credited.
